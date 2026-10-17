@@ -25,6 +25,9 @@ mono_crash.*.json
 # Local scratch files (temporary validation scenes/scripts)
 _tmp_*
 
+# Export build output
+/build/
+
 # macOS ignores
 .DS_Store
 
