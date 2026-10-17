@@ -19,8 +19,18 @@ mono_crash.*.json
 # Visual Studio Code ignores
 .vscode/
 
+# AI assistant workspace files
+.roo/
+
+# Local scratch files (temporary validation scenes/scripts)
+_tmp_*
+
 # macOS ignores
 .DS_Store
+
+# Windows ignores
+Thumbs.db
+desktop.ini
 
 # Android ignores
 android/
