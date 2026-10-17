@@ -44,6 +44,7 @@ Keychain="*uid://dgiia2xg7fsud"
 ExtensionsApi="*res://src/Autoload/ExtensionsApi.gd"
 Themes="*res://src/Autoload/Themes.gd"
 Applinks="*uid://bwxc40knpboql"
+_mcp_game_helper="*res://addons/godot_ai/runtime/game_helper.gd"
 
 [debug]
 
@@ -60,7 +61,7 @@ window/per_pixel_transparency/allowed.web=false
 
 [editor_plugins]
 
-enabled=PackedStringArray("res://addons/aimg_io/plugin.cfg", "res://addons/applinks/plugin.cfg", "res://addons/dockable_container/plugin.cfg", "res://addons/keychain/plugin.cfg")
+enabled=PackedStringArray("res://addons/aimg_io/plugin.cfg", "res://addons/applinks/plugin.cfg", "res://addons/dockable_container/plugin.cfg", "res://addons/godot_ai/plugin.cfg", "res://addons/keychain/plugin.cfg")
 
 [global_group]
 
