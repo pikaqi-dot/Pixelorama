@@ -7,7 +7,13 @@ signal new_palette_imported
 
 enum SortOptions {NEW_PALETTE, REVERSE, HUE, SATURATION, VALUE, LIGHTNESS, RED, GREEN, BLUE, ALPHA}
 ## Presets for creating a new palette
-enum NewPalettePresetType {EMPTY, FROM_CURRENT_PALETTE, FROM_CURRENT_SPRITE, FROM_CURRENT_SELECTION}
+enum NewPalettePresetType {
+	EMPTY,
+	FROM_CURRENT_PALETTE,
+	FROM_CURRENT_SPRITE,
+	FROM_CURRENT_SELECTION,
+	FROM_LOSPEC
+}
 ## Color options when user creates a new palette from current sprite or selection
 enum GetColorsFrom { CURRENT_FRAME, CURRENT_CEL, ALL_FRAMES }
 const DEFAULT_PALETTE_NAME := "Default"
@@ -186,7 +192,8 @@ func create_new_palette(
 	height: int,
 	add_alpha_colors: bool,
 	get_colors_from: int,
-	is_global: bool
+	is_global: bool,
+	lospec_colors: PackedColorArray = PackedColorArray()
 ) -> void:
 	if !is_global:
 		Global.current_project.undo_redo.create_action("Create new palette")
@@ -204,6 +211,8 @@ func create_new_palette(
 			_create_new_palette_from_current_selection(
 				palette_name, comment, width, height, add_alpha_colors, get_colors_from, is_global
 			)
+		NewPalettePresetType.FROM_LOSPEC:
+			_create_new_palette_from_colors(palette_name, comment, width, lospec_colors, is_global)
 	if !is_global:
 		Global.current_project.undo_redo.add_undo_method(Global.undo_or_redo.bind(true))
 		Global.current_project.undo_redo.add_do_method(Global.undo_or_redo.bind(false))
@@ -216,6 +225,21 @@ func _create_new_empty_palette(
 	palette_name: String, comment: String, width: int, height: int, is_global: bool
 ) -> void:
 	var new_palette := Palette.new(palette_name, width, height, comment)
+	undo_redo_add_palette(new_palette, is_global)
+
+
+## Creates a palette from an arbitrary list of colors, used by Lospec imports.
+func _create_new_palette_from_colors(
+	palette_name: String,
+	comment: String,
+	width: int,
+	colors: PackedColorArray,
+	is_global: bool
+) -> void:
+	if colors.is_empty():
+		_create_new_empty_palette(palette_name, comment, width, 1, is_global)
+		return
+	var new_palette := fill_imported_palette_with_colors(palette_name, colors, comment, width)
 	undo_redo_add_palette(new_palette, is_global)
 
 

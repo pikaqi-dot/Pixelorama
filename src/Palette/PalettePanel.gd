@@ -266,6 +266,7 @@ func _on_lock_grid_toggled(toggled_on: bool) -> void:
 	Global.config_cache.set_value("palettes", "palette_locked", toggled_on)
 
 
+## Forwards the dialog result, including colors downloaded from Lospec.
 func _on_create_palette_dialog_saved(
 	preset: int,
 	palette_name: String,
@@ -274,10 +275,19 @@ func _on_create_palette_dialog_saved(
 	height: int,
 	add_alpha_colors: bool,
 	colors_from: int,
-	is_global: bool
+	is_global: bool,
+	lospec_colors: PackedColorArray
 ) -> void:
 	Palettes.create_new_palette(
-		preset, palette_name, comment, width, height, add_alpha_colors, colors_from, is_global
+		preset,
+		palette_name,
+		comment,
+		width,
+		height,
+		add_alpha_colors,
+		colors_from,
+		is_global,
+		lospec_colors
 	)
 
 

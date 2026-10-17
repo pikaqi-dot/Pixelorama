@@ -1,12 +1,26 @@
 extends ConfirmationDialog
 
+const LospecBrowserScript := preload("res://src/Palette/LospecPaletteBrowser.gd")
+
 ## Emitted when user confirms their changes
-signal saved(preset, name, comment, width, height, add_alpha_colors, colors_from)
+signal saved(
+	preset,
+	name,
+	comment,
+	width,
+	height,
+	add_alpha_colors,
+	colors_from,
+	is_global,
+	lospec_colors: PackedColorArray
+)
 
 enum { GLOBAL_PALETTE, PROJECT_PALETTE }
 
 ## Reference to current palette stored when dialog opens
 var current_palette: Palette
+## Colors downloaded from Lospec, used by the FROM_LOSPEC preset
+var lospec_colors := PackedColorArray()
 
 @onready var preset_input := $VBoxContainer/PaletteMetadata/Preset as OptionButton
 @onready var name_input := $VBoxContainer/PaletteMetadata/Name as LineEdit
@@ -22,17 +36,32 @@ var current_palette: Palette
 @onready var already_exists_warning := $VBoxContainer/AlreadyExistsWarning as Label
 @onready var enter_name_warning := $VBoxContainer/EnterNameWarning as Label
 @onready var palette_type_option := $VBoxContainer/PaletteMetadata/PaletteTypeOption as OptionButton
+@onready var dialog_vbox := $VBoxContainer as VBoxContainer
+
+var lospec_browser
 
 
 func _ready() -> void:
 	palette_type_option.add_item("Global Palette", GLOBAL_PALETTE)
 	palette_type_option.add_item("Project Palette", PROJECT_PALETTE)
 
+	# The Lospec browser is hidden unless the "From Lospec" preset is selected
+	lospec_browser = LospecBrowserScript.new()
+	lospec_browser.name = "LospecBrowser"
+	dialog_vbox.add_child(lospec_browser)
+	dialog_vbox.move_child(lospec_browser, colors_settings.get_index() + 1)
+	lospec_browser.hide()
+	lospec_browser.palette_selected.connect(_on_lospec_palette_selected)
+
 
 ## Opens dialog
 func open(opened_current_palette: Palette) -> void:
 	# Only to fill dialog when preset is FROM_CURRENT_PALETTE
 	current_palette = opened_current_palette
+
+	lospec_colors.clear()
+	if is_instance_valid(lospec_browser):
+		lospec_browser.hide()
 
 	set_default_values()
 	preset_input.selected = Palettes.NewPalettePresetType.EMPTY
@@ -94,7 +123,8 @@ func _on_CreatePaletteDialog_confirmed() -> void:
 		height_input.value,
 		alpha_colors_input.button_pressed,
 		get_colors_from_input.selected,
-		true if palette_type_option.selected == GLOBAL_PALETTE else false
+		true if palette_type_option.selected == GLOBAL_PALETTE else false,
+		lospec_colors
 	)
 
 
@@ -104,6 +134,11 @@ func _on_Preset_item_selected(index: int) -> void:
 	height_input.editable = true
 	toggle_already_exists_warning(false)
 	toggle_ok_button_disability(true)
+
+	lospec_colors.clear()
+	lospec_browser.visible = index == Palettes.NewPalettePresetType.FROM_LOSPEC
+	if lospec_browser.visible:
+		lospec_browser.ensure_loaded()
 
 	match index:
 		Palettes.NewPalettePresetType.EMPTY:
@@ -127,6 +162,46 @@ func _on_Preset_item_selected(index: int) -> void:
 		Palettes.NewPalettePresetType.FROM_CURRENT_SELECTION:
 			colors_settings.show()
 			set_default_values()
+		Palettes.NewPalettePresetType.FROM_LOSPEC:
+			colors_settings.hide()
+			set_default_values()
+
+	# Resize the dialog after showing/hiding the Lospec browser or color settings
+	_refresh_dialog_size()
+
+
+## Fills the dialog metadata with the palette chosen in the Lospec browser
+func _on_lospec_palette_selected(palette_data: Dictionary) -> void:
+	var colors: Variant = palette_data.get("colors", PackedColorArray())
+	if colors is PackedColorArray:
+		lospec_colors = colors
+	else:
+		lospec_colors.clear()
+
+	var palette_title := str(palette_data.get("title", "Lospec Palette"))
+	name_input.text = palette_title
+
+	var color_count := lospec_colors.size()
+	var palette_width := clampi(color_count, 1, int(width_input.max_value))
+	width_input.value = palette_width
+	height_input.value = ceili(color_count / float(palette_width))
+
+	var comment := "Imported from Lospec"
+	var author := str(palette_data.get("author", ""))
+	if not author.is_empty():
+		comment += " (by %s)" % author
+	var slug := str(palette_data.get("slug", ""))
+	if not slug.is_empty():
+		comment += "\nhttps://lospec.com/palette-list/" + slug
+	comment_input.text = comment
+
+	_on_Name_text_changed(palette_title)
+
+
+## Resizes and recenters the dialog after a section is shown or hidden.
+func _refresh_dialog_size() -> void:
+	reset_size()
+	popup_centered_clamped()
 
 
 func _on_Name_text_changed(new_name: String) -> void:
