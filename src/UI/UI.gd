@@ -17,10 +17,15 @@ const HOLD_PICK_MOVE := 14.0
 const HOLD_PICK_RELEASE_GRACE := 0.2
 ## Size of the magnifier that follows the finger while picking, in pixels.
 const MAGNIFIER_SIZE := 130
-## How many canvas pixels the magnifier shows on each axis.
-const MAGNIFIER_SOURCE_PIXELS := 13
-## Magnification of the canvas pixels inside the magnifier.
-const MAGNIFIER_ZOOM := 10
+## Default number of canvas pixels shown on each axis, used before the canvas
+## zoom is known.
+const MAGNIFIER_DEFAULT_SOURCE_PIXELS := 13
+## How much larger than the on-screen canvas the magnifier looks. The number of
+## canvas pixels shown follows the canvas zoom, so zooming in also zooms the lens.
+const MAGNIFIER_SCREEN_FACTOR := 5.0
+## Bounds for the number of magnified canvas pixels, on each axis.
+const MAGNIFIER_MIN_SOURCE_PIXELS := 3
+const MAGNIFIER_MAX_SOURCE_PIXELS := 65
 ## Distance between the finger and the magnifier.
 const MAGNIFIER_OFFSET := 52.0
 ## Minimum delay between two magnifier texture updates, in milliseconds.
@@ -72,6 +77,7 @@ var _magnifier_clip: Panel
 var _magnifier_ring: Panel
 var _magnifier_preview: TextureRect
 var _magnifier_cell: Panel
+var _magnifier_cell_style: StyleBoxFlat
 var _magnifier_swatch: Panel
 var _magnifier_swatch_style: StyleBoxFlat
 var _magnifier_last_update := 0
@@ -343,15 +349,15 @@ func _ensure_magnifier() -> void:
 	_magnifier.add_child(_magnifier_ring)
 
 	# A small ring marks the exact pixel that will be picked.
-	var cell := float(MAGNIFIER_SIZE) / float(MAGNIFIER_SOURCE_PIXELS)
+	var cell := float(MAGNIFIER_SIZE) / float(MAGNIFIER_DEFAULT_SOURCE_PIXELS)
 	_magnifier_cell = Panel.new()
 	_magnifier_cell.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	var cell_style := StyleBoxFlat.new()
-	cell_style.bg_color = Color(0, 0, 0, 0)
-	cell_style.border_color = Color(1, 1, 1, 0.95)
-	cell_style.set_border_width_all(2)
-	cell_style.set_corner_radius_all(int(cell) / 2)
-	_magnifier_cell.add_theme_stylebox_override("panel", cell_style)
+	_magnifier_cell_style = StyleBoxFlat.new()
+	_magnifier_cell_style.bg_color = Color(0, 0, 0, 0)
+	_magnifier_cell_style.border_color = Color(1, 1, 1, 0.95)
+	_magnifier_cell_style.set_border_width_all(2)
+	_magnifier_cell_style.set_corner_radius_all(int(cell) / 2)
+	_magnifier_cell.add_theme_stylebox_override("panel", _magnifier_cell_style)
 	_magnifier_cell.anchor_left = 0.5
 	_magnifier_cell.anchor_right = 0.5
 	_magnifier_cell.anchor_top = 0.5
@@ -388,6 +394,8 @@ func _ensure_magnifier() -> void:
 func _update_magnifier(pixel: Vector2i) -> void:
 	_ensure_magnifier()
 	_magnifier_swatch_style.bg_color = _hold_pick_color
+	var source_pixels := _magnifier_source_pixels()
+	_update_magnifier_cell(source_pixels)
 	var ui_rect := get_global_rect()
 	var target := (
 		_hold_pick_position
@@ -403,28 +411,54 @@ func _update_magnifier(pixel: Vector2i) -> void:
 	if now - _magnifier_last_update < MAGNIFIER_MIN_INTERVAL_MSEC:
 		return
 	_magnifier_last_update = now
-	var texture := _make_magnifier_texture(pixel)
+	var texture := _make_magnifier_texture(pixel, source_pixels)
 	if texture != null:
 		_magnifier_preview.texture = texture
 
 
-## Crops the visible frame around [param pixel] and scales it up with no filtering,
-## so individual pixels stay readable.
-func _make_magnifier_texture(pixel: Vector2i) -> Texture2D:
-	var half := MAGNIFIER_SOURCE_PIXELS / 2
-	var region := Rect2i(
-		pixel - Vector2i(half, half), Vector2i(MAGNIFIER_SOURCE_PIXELS, MAGNIFIER_SOURCE_PIXELS)
-	)
+## How many canvas pixels fit on each axis of the magnifier. It follows the
+## canvas zoom, so zooming into the canvas also enlarges the pixels in the lens.
+func _magnifier_source_pixels() -> int:
+	var canvas_scale := 1.0
+	if is_instance_valid(Global.canvas):
+		# Includes the canvas transform and the camera zoom.
+		canvas_scale = absf(Global.canvas.get_global_transform_with_canvas().get_scale().x)
+	if canvas_scale <= 0.0001:
+		canvas_scale = 1.0
+	var count := int(round(MAGNIFIER_SIZE / (canvas_scale * MAGNIFIER_SCREEN_FACTOR)))
+	count = clampi(count, MAGNIFIER_MIN_SOURCE_PIXELS, MAGNIFIER_MAX_SOURCE_PIXELS)
+	# An odd count keeps the picked pixel exactly in the middle of the lens.
+	if count % 2 == 0:
+		count += 1
+	return count
+
+
+## Resizes the outline that marks the picked pixel, so it always covers one
+## canvas pixel no matter how many of them are visible.
+func _update_magnifier_cell(source_pixels: int) -> void:
+	if not is_instance_valid(_magnifier_cell) or not is_instance_valid(_magnifier_cell_style):
+		return
+	var cell := float(MAGNIFIER_SIZE) / float(maxi(source_pixels, 1))
+	_magnifier_cell.offset_left = -cell * 0.5
+	_magnifier_cell.offset_top = -cell * 0.5
+	_magnifier_cell.offset_right = cell * 0.5
+	_magnifier_cell.offset_bottom = cell * 0.5
+	var border := 2 if cell >= 9.0 else 1
+	_magnifier_cell_style.set_border_width_all(border)
+	_magnifier_cell_style.set_corner_radius_all(maxi(int(cell) / 2, 1))
+
+
+## Crops the canvas around [param pixel] with no filtering, so individual pixels
+## stay readable. The texture is stretched to the lens size by the preview.
+func _make_magnifier_texture(pixel: Vector2i, source_pixels: int) -> Texture2D:
+	var count := maxi(source_pixels, 1)
+	var half := count / 2
+	var region := Rect2i(pixel - Vector2i(half, half), Vector2i(count, count))
 	# The layers are composited on the CPU for this small region, so no viewport
 	# readback (which is slow on mobile) happens every frame.
 	var image := Tools.get_composited_region(region)
 	if image == null or image.is_empty():
 		return null
-	image.resize(
-		region.size.x * MAGNIFIER_ZOOM,
-		region.size.y * MAGNIFIER_ZOOM,
-		Image.INTERPOLATE_NEAREST
-	)
 	return ImageTexture.create_from_image(image)
 
 
