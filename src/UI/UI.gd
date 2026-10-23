@@ -538,8 +538,11 @@ func _lens_edge_color() -> Color:
 	return Color(color.r, color.g, color.b, 0.92)
 
 
-## Rotation of the canvas view, in radians.
+## Rotation of the canvas view, in radians. Taken from the canvas transform itself,
+## so it also follows the rotation of the canvas node, not only the camera's.
 func _view_rotation() -> float:
+	if is_instance_valid(Global.canvas):
+		return -Global.canvas.get_global_transform_with_canvas().get_rotation()
 	if is_instance_valid(Global.camera):
 		return Global.camera.camera_angle
 	return 0.0
