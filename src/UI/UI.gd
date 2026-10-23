@@ -78,6 +78,8 @@ var _magnifier_ring: Panel
 var _magnifier_preview: TextureRect
 var _magnifier_cell: Panel
 var _magnifier_cell_style: StyleBoxFlat
+## Pixel last read from the canvas, so an unmoved finger does not re-read layers.
+var _hold_pick_pixel := Vector2i(-1, -1)
 var _magnifier_swatch: Panel
 var _magnifier_swatch_style: StyleBoxFlat
 var _magnifier_last_update := 0
@@ -404,10 +406,17 @@ func _update_magnifier(pixel: Vector2i) -> void:
 	var source_pixels := _magnifier_source_pixels()
 	_update_magnifier_cell(source_pixels)
 	var ui_rect := get_global_rect()
-	var target := (
+	# Prefer the space above the finger, and flip below it when there is no room
+	# left, so the lens never ends up covering the pixel being picked.
+	var above := (
 		_hold_pick_position
 		- Vector2(MAGNIFIER_SIZE * 0.5, MAGNIFIER_SIZE + MAGNIFIER_OFFSET)
 	)
+	var below := (
+		_hold_pick_position
+		- Vector2(MAGNIFIER_SIZE * 0.5, -(MAGNIFIER_OFFSET * 0.4))
+	)
+	var target := above if above.y >= ui_rect.position.y else below
 	target.x = clampf(target.x, ui_rect.position.x, maxf(ui_rect.position.x, ui_rect.end.x - MAGNIFIER_SIZE))
 	target.y = clampf(target.y, ui_rect.position.y, maxf(ui_rect.position.y, ui_rect.end.y - MAGNIFIER_SIZE))
 	_magnifier.size = Vector2(MAGNIFIER_SIZE, MAGNIFIER_SIZE)
@@ -510,6 +519,7 @@ func _clear_hold_to_pick() -> void:
 	_hold_pick_stroke_seen = false
 	_hold_pick_active = false
 	_hold_pick_has_color = false
+	_hold_pick_pixel = Vector2i(-1, -1)
 	# Forces the next pick to rebuild the lens instead of reusing the old one.
 	_magnifier_last_pixel = Vector2i(-1, -1)
 	_magnifier_last_source = 0
@@ -529,6 +539,12 @@ func _sample_hold_to_pick() -> void:
 		_hold_pick_has_color = false
 		_update_magnifier(pixel)
 		return
+	if pixel == _hold_pick_pixel and _hold_pick_has_color:
+		# The finger did not leave the pixel, so the color cannot have changed;
+		# only the lens has to follow it.
+		_update_magnifier(pixel)
+		return
+	_hold_pick_pixel = pixel
 	var info := Tools.get_color_at(pixel)
 	if info.is_empty():
 		_hold_pick_has_color = false
