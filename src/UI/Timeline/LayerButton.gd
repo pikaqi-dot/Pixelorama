@@ -66,6 +66,9 @@ func _ready() -> void:
 		ancestor.ui_color_changed.connect(func(): layer_ui_color.color = layer.get_ui_color())
 	if layer is PixelLayer:
 		linked_button.visible = true
+		# Layers made by the node editor keep their graph, so they can be edited.
+		if layer.has_meta("shader_graph"):
+			_add_shader_edit_button(layer)
 	elif layer is GroupLayer:
 		expand_button.visible = true
 	elif layer is AudioLayer:
@@ -96,6 +99,27 @@ func _ready() -> void:
 	# Visualize how deep into the hierarchy the layer is
 	hierarchy_spacer.layer_index = layer_index
 	update_buttons()
+
+
+## Node layers get their own button, which reopens the node editor with the graph
+## that created them.
+func _add_shader_edit_button(layer: BaseLayer) -> void:
+	var edit_button := Button.new()
+	edit_button.name = "ShaderEditButton"
+	edit_button.text = "✎"
+	edit_button.tooltip_text = "编辑节点图层"
+	edit_button.focus_mode = Control.FOCUS_NONE
+	edit_button.custom_minimum_size = Vector2(22, 0)
+	edit_button.add_theme_font_size_override("font_size", 14)
+	edit_button.pressed.connect(
+		func() -> void:
+			var node: Node = self
+			while node != null and not node.has_method("open_shader_composer"):
+				node = node.get_parent()
+			if node != null:
+				node.call("open_shader_composer", layer)
+	)
+	add_child(edit_button)
 
 
 func _on_cel_switched() -> void:

@@ -972,11 +972,13 @@ func _on_main_canvas_visibility_changed() -> void:
 
 
 ## Opens the full screen node editor used to generate a layer from a graph.
-func open_shader_composer() -> void:
+## Passing a [param layer] that was made by it loads that layer's graph back, so
+## its nodes can be adjusted and the layer regenerated.
+func open_shader_composer(layer: BaseLayer = null) -> void:
 	if not is_instance_valid(_shader_composer):
 		_shader_composer = load("res://src/UI/ShaderComposer/ShaderComposerPage.gd").new()
 		add_child(_shader_composer)
-	_shader_composer.call("open_page")
+	_shader_composer.call("open_page", layer)
 
 
 func update_transparent_shader() -> void:

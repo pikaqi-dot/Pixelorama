@@ -14,6 +14,8 @@ const TOUCH_SIZE := 40
 const TOUCH_FONT_SIZE := 15
 ## Below this width the page stacks the graph above the parameters.
 const NARROW_WIDTH := 760
+## Frames per second of the looping preview.
+const PREVIEW_FPS := 8.0
 
 var graph: RefCounted
 var _graph_edit: GraphEdit
@@ -29,6 +31,11 @@ var _can_draw_before := true
 ## generates.
 var _phase: HSlider
 var _frame_count: SpinBox
+## Playback of the preview, and the layer being edited (when reopened from one).
+var _play_timer: Timer
+var _play_button: Button
+var _playhead := 0.0
+var _editing_layer: BaseLayer
 var _body: SplitContainer
 var _side: VBoxContainer
 ## Two finger pan and pinch inside the graph, because the system gestures that
@@ -54,9 +61,19 @@ func _ready() -> void:
 
 
 ## Shows the page and stops the canvas from receiving input meanwhile.
-func open_page() -> void:
+## Opens the page. When [param layer] is a layer made by this editor, its graph is
+## loaded back so the nodes can be adjusted again.
+func open_page(layer: BaseLayer = null) -> void:
 	_can_draw_before = Global.can_draw
 	Global.can_draw = false
+	_editing_layer = layer
+	if layer != null and layer.has_meta("shader_graph"):
+		graph.from_dict(layer.get_meta("shader_graph"))
+		if is_instance_valid(_frame_count):
+			_frame_count.value = int(layer.get_meta("shader_frames", _frame_count.value))
+		_selected_id = ""
+		_show_params("")
+		_refresh_graph()
 	show()
 	_apply_layout()
 	_refresh_preview()
@@ -65,6 +82,11 @@ func open_page() -> void:
 func close_page() -> void:
 	Global.can_draw = _can_draw_before
 	_preview_timer.stop()
+	if is_instance_valid(_play_timer):
+		_play_timer.stop()
+	if is_instance_valid(_play_button):
+		_play_button.text = "▶ 播放"
+	_editing_layer = null
 	_graph_fingers.clear()
 	_graph_gesture = false
 	hide()
@@ -125,6 +147,8 @@ func _build_ui() -> void:
 	toolbar.add_child(_make_button("删除选中", _on_delete_pressed))
 	toolbar.add_child(_make_button("刷新预览", _refresh_preview))
 	toolbar.add_child(_make_button("示例：像素海面", _on_ocean_preset_pressed))
+	_play_button = _make_button("▶ 播放", _on_play_pressed, "循环播放预览")
+	toolbar.add_child(_play_button)
 	var frames_label := Label.new()
 	frames_label.text = "帧数"
 	frames_label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
@@ -220,6 +244,11 @@ func _build_ui() -> void:
 	_preview_timer.wait_time = 0.15
 	_preview_timer.timeout.connect(_refresh_preview)
 	add_child(_preview_timer)
+
+	_play_timer = Timer.new()
+	_play_timer.wait_time = 1.0 / PREVIEW_FPS
+	_play_timer.timeout.connect(_advance_playback)
+	add_child(_play_timer)
 
 
 ## Rebuilds the graph view from the data, keeping where the user put each node.
@@ -533,6 +562,28 @@ func _refresh_preview() -> void:
 	]
 
 
+## Plays the preview on a loop, which is the quickest way to judge an animated
+## graph before committing it to frames.
+func _on_play_pressed() -> void:
+	if not is_instance_valid(_play_timer):
+		return
+	if _play_timer.is_stopped():
+		_play_timer.wait_time = 1.0 / maxf(PREVIEW_FPS, 1.0)
+		_play_timer.start()
+		_play_button.text = "⏸ 暂停"
+	else:
+		_play_timer.stop()
+		_play_button.text = "▶ 播放"
+
+
+func _advance_playback() -> void:
+	var frames := maxi(int(_frame_count.value) if is_instance_valid(_frame_count) else 1, 1)
+	_playhead = fmod(_playhead + 1.0 / float(frames), 1.0)
+	if is_instance_valid(_phase):
+		_phase.set_value_no_signal(_playhead)
+	_refresh_preview()
+
+
 ## Builds the ready made pixel sea, so a dynamic result is one click away.
 func _on_ocean_preset_pressed() -> void:
 	graph.build_ocean_preset()
@@ -557,18 +608,55 @@ func _on_add_layer_pressed() -> void:
 	else:
 		graph.time = 0.0
 		images.append(graph.generate(project.size))
-	_add_animated_layer(project, images, "Shader Layer")
-	Global.notification_label("Shader layer added")
+	if is_instance_valid(_editing_layer) and project.layers.has(_editing_layer):
+		_update_shader_layer(project, project.layers.find(_editing_layer), images)
+		_editing_layer.set_meta("shader_graph", graph.to_dict())
+		_editing_layer.set_meta("shader_frames", frames)
+		Global.notification_label("Shader layer updated")
+	else:
+		# The graph is attached before the layer is committed, because the timeline
+		# builds the layer row (and its edit button) while the action runs.
+		_add_animated_layer(
+			project,
+			images,
+			"Shader Layer",
+			{"shader_graph": graph.to_dict(), "shader_frames": frames}
+		)
+		Global.notification_label("Shader layer added")
 	close_page()
+
+
+## Rewrites the cels of an existing shader layer, undoable.
+static func _update_shader_layer(project: Project, layer_index: int, images: Array[Image]) -> void:
+	if images.is_empty() or layer_index < 0 or layer_index >= project.layers.size():
+		return
+	project.undo_redo.create_action("Update Shader Layer")
+	var count := mini(project.frames.size(), images.size())
+	for f in count:
+		var cel: BaseCel = project.frames[f].cels[layer_index]
+		if not (cel is PixelCel):
+			continue
+		var replaced: ImageExtended = (cel as PixelCel).image
+		var incoming := ImageExtended.create_from_image(images[f], project.is_indexed())
+		project.undo_redo.add_do_method(_set_cel_image.bind(cel, incoming))
+		project.undo_redo.add_undo_method(_set_cel_image.bind(cel, replaced))
+	project.undo_redo.add_do_method(Global.undo_or_redo.bind(false))
+	project.undo_redo.add_undo_method(Global.undo_or_redo.bind(true))
+	project.undo_redo.commit_action()
+
+
+static func _set_cel_image(cel: PixelCel, image: ImageExtended) -> void:
+	cel.image = image
+	cel.update_texture()
 
 
 ## Adds one cel per frame out of [param images], creating the missing frames when
 ## the graph is animated, all in a single undo step.
 static func _add_animated_layer(
-	project: Project, images: Array[Image], layer_name: String
-) -> void:
+	project: Project, images: Array[Image], layer_name: String, meta := {}
+) -> PixelLayer:
 	if images.is_empty():
-		return
+		return null
 	var current_frames := project.frames.size()
 	var missing := maxi(images.size() - current_frames, 0)
 	var new_frames: Array = []
@@ -579,6 +667,8 @@ static func _add_animated_layer(
 	var total_frames := current_frames + missing
 
 	var layer := PixelLayer.new(project, layer_name)
+	for key in meta:
+		layer.set_meta(str(key), meta[key])
 	var cels: Array = []
 	for f in total_frames:
 		cels.append(layer.new_empty_cel())
@@ -604,6 +694,7 @@ static func _add_animated_layer(
 	project.undo_redo.add_do_method(Global.undo_or_redo.bind(false))
 	project.undo_redo.add_undo_method(Global.undo_or_redo.bind(true))
 	project.undo_redo.commit_action()
+	return layer
 
 
 ## Finger sized button, so every action is easy to hit on a touchscreen.

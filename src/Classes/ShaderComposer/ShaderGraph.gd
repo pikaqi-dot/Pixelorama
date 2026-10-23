@@ -92,6 +92,31 @@ func get_node_by_id(id: String) -> Dictionary:
 	return {}
 
 
+## Snapshot of the whole graph, stored on the layers this graph created so they
+## can be edited again later.
+func to_dict() -> Dictionary:
+	return {"nodes": nodes.duplicate(true), "next_id": _next_id}
+
+
+## Restores a snapshot made by [method to_dict].
+func from_dict(data: Dictionary) -> void:
+	var stored: Array = data.get("nodes", [])
+	nodes.clear()
+	_noise_cache.clear()
+	_noise_signature.clear()
+	for entry in stored:
+		if entry is not Dictionary or not entry.has("id") or not entry.has("type"):
+			continue
+		nodes.append((entry as Dictionary).duplicate(true))
+	_next_id = maxi(int(data.get("next_id", 1)), 1)
+	# Keep ids unique even if the snapshot came from an older graph.
+	for node: Dictionary in nodes:
+		var id := str(node["id"])
+		var suffix := id.get_slice("_", -1)
+		if suffix.is_valid_int():
+			_next_id = maxi(_next_id, int(suffix) + 1)
+
+
 ## Connects [param from_id]'s output to input [param slot] of [param to_id].
 func connect_nodes(from_id: String, to_id: String, slot := 0) -> void:
 	var target := get_node_by_id(to_id)
