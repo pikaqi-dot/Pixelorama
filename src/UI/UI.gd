@@ -74,6 +74,13 @@ var _gesture_zoom_start := Vector2.ONE
 var _gesture_camera_angle_start := 0.0
 ## Canvas point that has to stay under the fingers while they move the view.
 var _gesture_anchor_canvas := Vector2.ZERO
+## True when finger movements are waiting to be turned into one view update, so a
+## frame with events from only one finger does not make the view wobble.
+var _transform_pending := false
+## Values of the last applied transform, used to skip updates that change nothing.
+var _applied_span := 0.0
+var _applied_turn := 0.0
+var _applied_midpoint := Vector2.ZERO
 ## True while a multi-finger gesture keeps the tools from receiving input.
 var _gesture_suppressed := false
 ## Identifies the pending hold-to-pick wait, so it can be cancelled.
@@ -137,6 +144,11 @@ var _lens_edge_cache := Color(-1, -1, -1, -1)
 
 
 func _process(_delta: float) -> void:
+	# Touch events arrive one finger at a time, so the view is updated once per
+	# frame with the latest positions of every finger instead of per event.
+	if _transform_pending:
+		_transform_pending = false
+		_update_touch_transform()
 	if _hold_pick_armed and Tools.active_button != -1:
 		_hold_pick_stroke_seen = true
 	# Keeps the preview alive even if no motion events are delivered while the
@@ -263,6 +275,12 @@ func _on_screen_touch(touch: InputEventScreenTouch) -> void:
 			_suppress_tool_input()
 		return
 
+	# The last position of a lifted finger may be newer than its last drag event,
+	# and the pending update has to see both fingers before they are forgotten.
+	_finger_positions[touch.index] = touch.position
+	if _transform_pending:
+		_transform_pending = false
+		_update_touch_transform()
 	_finger_starts.erase(touch.index)
 	_finger_positions.erase(touch.index)
 	if not _finger_starts.is_empty():
@@ -296,7 +314,7 @@ func _on_screen_drag(drag: InputEventScreenDrag) -> void:
 		# Even a small pinch changes the distance between the fingers.
 		if absf(_gesture_span() - _gesture_initial_span) > MULTI_FINGER_PINCH_MOVE:
 			_gesture_moved = true
-		_update_touch_transform()
+		_transform_pending = true
 
 
 ## Recognises a two-finger zoom, rotation or pan and applies it to the camera.
@@ -324,6 +342,16 @@ func _update_touch_transform() -> void:
 		_gesture_pan_zoom = true
 	if not Global.can_draw:
 		return
+	# Nothing to do when the fingers are back where the view already is.
+	if (
+		absf(span - _applied_span) < 0.01
+		and absf(turn - _applied_turn) < 0.0001
+		and midpoint.distance_to(_applied_midpoint) < 0.01
+	):
+		return
+	_applied_span = span
+	_applied_turn = turn
+	_applied_midpoint = midpoint
 	Global.camera.apply_touch_transform(
 		_gesture_zoom_start,
 		_gesture_camera_angle_start,
@@ -903,6 +931,10 @@ func _reset_touch_gesture() -> void:
 	_gesture_span_start = 0.0
 	_gesture_finger_angle_start = 0.0
 	_gesture_midpoint_start = Vector2.ZERO
+	_transform_pending = false
+	_applied_span = 0.0
+	_applied_turn = 0.0
+	_applied_midpoint = Vector2.ZERO
 
 
 func _on_cel_switched() -> void:

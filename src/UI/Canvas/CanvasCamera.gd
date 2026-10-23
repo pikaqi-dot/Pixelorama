@@ -140,9 +140,11 @@ func apply_touch_transform(
 func _keep_canvas_point_under(canvas_point: Vector2, screen_point: Vector2) -> void:
 	if not is_instance_valid(viewport):
 		return
-	for i in 3:
+	# One correction is exact for a translation of the view; the second one only
+	# covers rounding, so no more than two are ever needed.
+	for i in 2:
 		var error := screen_point - viewport.canvas_transform * canvas_point
-		if error.length() < 0.05:
+		if error.length() < 0.1:
 			return
 		offset -= error.rotated(camera_angle) / zoom
 
