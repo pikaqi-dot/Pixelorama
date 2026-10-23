@@ -36,6 +36,8 @@ var _play_timer: Timer
 var _play_button: Button
 var _playhead := 0.0
 var _editing_layer: BaseLayer
+## Header button, whose label changes when an existing layer is being edited.
+var _add_layer_button: Button
 var _body: SplitContainer
 var _side: VBoxContainer
 ## Two finger pan and pinch inside the graph, because the system gestures that
@@ -74,6 +76,10 @@ func open_page(layer: BaseLayer = null) -> void:
 		_selected_id = ""
 		_show_params("")
 		_refresh_graph()
+	if is_instance_valid(_add_layer_button):
+		_add_layer_button.text = (
+			"更新图层" if _editing_layer != null else "作为新图层添加"
+		)
 	show()
 	_apply_layout()
 	_refresh_preview()
@@ -131,7 +137,8 @@ func _build_ui() -> void:
 	title.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	title.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
 	header_row.add_child(title)
-	header_row.add_child(_make_button("作为新图层添加", _on_add_layer_pressed))
+	_add_layer_button = _make_button("作为新图层添加", _on_add_layer_pressed)
+	header_row.add_child(_add_layer_button)
 	header_row.add_child(_make_button("✕", close_page, "关闭", Vector2(48, TOUCH_SIZE)))
 
 	var toolbar := HFlowContainer.new()
