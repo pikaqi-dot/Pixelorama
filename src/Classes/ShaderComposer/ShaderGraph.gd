@@ -12,6 +12,8 @@ const NODE_TYPES := {
 	"gradient": {"label": "Gradient", "inputs": 0},
 	"radial": {"label": "Radial", "inputs": 0},
 	"checker": {"label": "Checker", "inputs": 0},
+	"time": {"label": "Time", "inputs": 0},
+	"wave": {"label": "Wave", "inputs": 1},
 	"math": {"label": "Math", "inputs": 1},
 	"blend": {"label": "Blend", "inputs": 2},
 	"output": {"label": "Output", "inputs": 1},
@@ -25,11 +27,15 @@ const NOISE_TYPE_VALUES := [
 	FastNoiseLite.TYPE_CELLULAR,
 	FastNoiseLite.TYPE_VALUE,
 ]
-const MATH_OPS := ["Add", "Subtract", "Multiply", "Min", "Max", "Step", "Posterize", "Invert"]
+const MATH_OPS := [
+	"Add", "Subtract", "Multiply", "Min", "Max", "Step", "Posterize", "Invert", "Sine"
+]
 const BLEND_OPS := ["Mix", "Add", "Multiply", "Screen", "Difference"]
 
 ## Nodes of the graph, as dictionaries: id, type, position, params, inputs.
 var nodes: Array[Dictionary] = []
+## Animation phase between 0 and 1, read by the [code]time[/code] node.
+var time := 0.0
 var _next_id := 1
 var _noise_cache := {}
 var _noise_signature := {}
@@ -152,9 +158,19 @@ static func default_params(type: String) -> Dictionary:
 		"noise":
 			return {"noise_type": 0, "scale": 16.0, "octaves": 3, "seed": 1, "gain": 0.5}
 		"gradient":
-			return {"angle": 0.0}
+			return {"angle": 0.0, "offset": 0.0}
 		"radial":
-			return {"center_x": 0.5, "center_y": 0.5, "radius": 0.5, "invert": false}
+			return {
+				"center_x": 0.5,
+				"center_y": 0.5,
+				"radius": 0.5,
+				"invert": false,
+				"falloff": 1.0,
+			}
+		"time":
+			return {}
+		"wave":
+			return {"frequency": 2.0, "angle": 0.0, "amplitude": 1.0}
 		"checker":
 			return {"cell": 8.0}
 		"math":
@@ -216,16 +232,30 @@ func _eval(node_id: String, x: int, y: int, size: Vector2i, depth: int) -> float
 		"gradient":
 			var direction := Vector2.from_angle(deg_to_rad(float(params["angle"])))
 			var normalized := (Vector2(x, y) / size_vec) - Vector2(0.5, 0.5)
-			return clampf(0.5 + normalized.dot(direction) * 1.414, 0.0, 1.0)
+			var shift := float(params.get("offset", 0.0))
+			return clampf(0.5 + normalized.dot(direction) * 1.414 + shift, 0.0, 1.0)
 		"radial":
 			var center := Vector2(float(params["center_x"]), float(params["center_y"]))
 			var distance := ((Vector2(x, y) / size_vec) - center).length()
 			var value := clampf(1.0 - distance / maxf(float(params["radius"]), 0.001), 0.0, 1.0)
+			value = pow(value, maxf(float(params.get("falloff", 1.0)), 0.05))
 			return 1.0 - value if bool(params["invert"]) else value
 		"checker":
 			var cell := maxf(float(params["cell"]), 1.0)
 			var odd := (floori(x / cell) + floori(y / cell)) % 2
 			return 1.0 if odd == 1 else 0.0
+		"time":
+			return clampf(time, 0.0, 1.0)
+		"wave":
+			# A travelling sine: the phase comes from a time node, the direction and
+			# frequency shape the crests, so the result reads as moving water.
+			var phase := clampf(_eval(_input_id(node, 0), x, y, size, depth + 1), 0.0, 1.0)
+			var travel := Vector2.from_angle(deg_to_rad(float(params["angle"])))
+			var position := Vector2(x, y) / size_vec
+			var wave := 0.5 + 0.5 * sin(
+				TAU * (position.dot(travel) * float(params["frequency"]) + phase)
+			)
+			return lerpf(0.5, wave, clampf(float(params["amplitude"]), 0.0, 1.0))
 		"math":
 			var source := clampf(_eval(_input_id(node, 0), x, y, size, depth + 1), 0.0, 1.0)
 			return _math_value(int(params["op"]), source, params)
@@ -266,6 +296,8 @@ func _math_value(op: int, source: float, params: Dictionary) -> float:
 			return maxf(source, amount)
 		"Step":
 			return 1.0 if source >= amount else 0.0
+		"Sine":
+			return 0.5 + 0.5 * sin(source * TAU * maxf(amount, 0.0))
 		"Posterize":
 			var steps := maxi(int(params["steps"]), 2)
 			return clampf(floorf(source * steps) / float(steps - 1), 0.0, 1.0)
@@ -313,6 +345,10 @@ static func describe(node: Dictionary) -> String:
 			return "r %.2f" % float(params["radius"])
 		"checker":
 			return "cell %d px" % int(params["cell"])
+		"time":
+			return "帧相位"
+		"wave":
+			return "%.1f 周期 · %d°" % [float(params["frequency"]), int(params["angle"])]
 		"math":
 			return MATH_OPS[int(params["op"])]
 		"blend":
@@ -320,3 +356,62 @@ static func describe(node: Dictionary) -> String:
 		"output":
 			return "%d steps" % int(params["steps"])
 	return ""
+
+
+## True when the graph changes over time, so generating a layer has to produce
+## one image per frame.
+func uses_time() -> bool:
+	for node: Dictionary in nodes:
+		if node["type"] == "time":
+			return true
+	return false
+
+
+## Replaces the graph with a ready made animated pixel sea: two travelling waves
+## added to some noise, posterized and mapped to a deep to light blue ramp.
+func build_ocean_preset() -> void:
+	nodes.clear()
+	_noise_cache.clear()
+	_noise_signature.clear()
+	var time_id := add_node("time", Vector2(20, 80))
+	# Crests run across the screen, so both waves travel along the vertical axis.
+	var wave_a := add_node("wave", Vector2(200, 20))
+	var wave_b := add_node("wave", Vector2(200, 170))
+	var depth := add_node("gradient", Vector2(200, 320))
+	var waves := add_node("blend", Vector2(420, 90))
+	var shaded := add_node("blend", Vector2(600, 150))
+	var noise := add_node("noise", Vector2(600, 320))
+	var foam := add_node("blend", Vector2(780, 200))
+	var post := add_node("math", Vector2(960, 200))
+	var out := add_node("output", Vector2(1120, 200))
+	connect_nodes(time_id, wave_a, 0)
+	connect_nodes(time_id, wave_b, 0)
+	connect_nodes(wave_a, waves, 0)
+	connect_nodes(wave_b, waves, 1)
+	connect_nodes(waves, shaded, 0)
+	connect_nodes(depth, shaded, 1)
+	connect_nodes(shaded, foam, 0)
+	connect_nodes(noise, foam, 1)
+	connect_nodes(foam, post, 0)
+	connect_nodes(post, out, 0)
+
+	get_node_by_id(wave_a)["params"].merge(
+		{"frequency": 1.6, "angle": 90.0, "amplitude": 1.0}, true
+	)
+	get_node_by_id(wave_b)["params"].merge(
+		{"frequency": 4.0, "angle": 96.0, "amplitude": 0.35}, true
+	)
+	get_node_by_id(depth)["params"].merge({"angle": 90.0, "offset": 0.0}, true)
+	get_node_by_id(waves)["params"].merge({"op": 0, "factor": 0.35}, true)
+	get_node_by_id(shaded)["params"].merge({"op": 0, "factor": 0.3}, true)
+	get_node_by_id(noise)["params"].merge({"scale": 4.0, "octaves": 2, "seed": 7}, true)
+	get_node_by_id(foam)["params"].merge({"op": 0, "factor": 0.16}, true)
+	get_node_by_id(post)["params"].merge({"op": 6, "steps": 5}, true)
+	get_node_by_id(out)["params"].merge(
+		{
+			"steps": 5,
+			"color_a": Color(0.04, 0.13, 0.32, 1.0),
+			"color_b": Color(0.56, 0.89, 0.96, 1.0),
+		},
+		true
+	)

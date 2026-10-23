@@ -25,6 +25,10 @@ var _add_type: OptionButton
 var _preview_timer: Timer
 var _selected_id := ""
 var _can_draw_before := true
+## Animation phase shown in the preview, and how many frames a dynamic graph
+## generates.
+var _phase: HSlider
+var _frame_count: SpinBox
 var _body: SplitContainer
 var _side: VBoxContainer
 ## Two finger pan and pinch inside the graph, because the system gestures that
@@ -120,6 +124,20 @@ func _build_ui() -> void:
 	toolbar.add_child(_make_button("添加节点", _on_add_pressed))
 	toolbar.add_child(_make_button("删除选中", _on_delete_pressed))
 	toolbar.add_child(_make_button("刷新预览", _refresh_preview))
+	toolbar.add_child(_make_button("示例：像素海面", _on_ocean_preset_pressed))
+	var frames_label := Label.new()
+	frames_label.text = "帧数"
+	frames_label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	frames_label.add_theme_font_size_override("font_size", 14)
+	toolbar.add_child(frames_label)
+	_frame_count = SpinBox.new()
+	_frame_count.min_value = 1
+	_frame_count.max_value = 60
+	_frame_count.step = 1
+	_frame_count.value = 8
+	_frame_count.custom_minimum_size = Vector2(90, TOUCH_SIZE)
+	_frame_count.add_theme_font_size_override("font_size", TOUCH_FONT_SIZE)
+	toolbar.add_child(_frame_count)
 	_status = Label.new()
 	_status.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	_status.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
@@ -163,6 +181,27 @@ func _build_ui() -> void:
 	_params_box = VBoxContainer.new()
 	_params_box.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	params_scroll.add_child(_params_box)
+
+	# Scrubbing the phase is how a dynamic graph is previewed frame by frame.
+	var phase_row := HBoxContainer.new()
+	var phase_label := Label.new()
+	phase_label.text = "相位"
+	phase_label.custom_minimum_size = Vector2(48, 0)
+	phase_label.add_theme_font_size_override("font_size", 14)
+	phase_row.add_child(phase_label)
+	_phase = HSlider.new()
+	_phase.min_value = 0.0
+	_phase.max_value = 1.0
+	_phase.step = 0.01
+	_phase.value = 0.0
+	_phase.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_phase.custom_minimum_size = Vector2(0, TOUCH_SIZE)
+	_phase.value_changed.connect(
+		func(_value: float) -> void:
+			_schedule_preview()
+	)
+	phase_row.add_child(_phase)
+	_side.add_child(phase_row)
 
 	var preview_label := Label.new()
 	preview_label.text = "预览"
@@ -211,12 +250,17 @@ func _make_graph_node(node: Dictionary) -> GraphNode:
 	graph_node.position_offset = node.get("position", Vector2.ZERO)
 	var input_count := int(ShaderGraphScript.NODE_TYPES[node["type"]]["inputs"])
 	graph_node.set_slot(0, input_count >= 1, 0, PORT_COLOR, true, 0, PORT_COLOR)
-	if input_count >= 2:
-		graph_node.set_slot(1, true, 0, PORT_COLOR, false, 0, PORT_COLOR)
 	var description := Label.new()
 	description.text = ShaderGraphScript.describe(node)
 	description.add_theme_font_size_override("font_size", 12)
 	graph_node.add_child(description)
+	if input_count >= 2:
+		# Every slot needs its own child, otherwise the second input port does not
+		# exist and connections to it are dropped.
+		graph_node.set_slot(1, true, 0, PORT_COLOR, false, 0, PORT_COLOR)
+		var spacing := Control.new()
+		spacing.custom_minimum_size = Vector2(0, 10)
+		graph_node.add_child(spacing)
 	return graph_node
 
 
@@ -295,13 +339,24 @@ func _show_params(id: String) -> void:
 			_add_slider("细节保持", 0.1, 0.9, 0.05, float(params["gain"]), params, "gain")
 		"gradient":
 			_add_slider("角度", 0.0, 360.0, 1.0, float(params["angle"]), params, "angle")
+			_add_slider("偏移", -1.0, 1.0, 0.01, float(params.get("offset", 0.0)), params, "offset")
 		"radial":
 			_add_slider("中心 X", 0.0, 1.0, 0.01, float(params["center_x"]), params, "center_x")
 			_add_slider("中心 Y", 0.0, 1.0, 0.01, float(params["center_y"]), params, "center_y")
 			_add_slider("半径", 0.05, 1.5, 0.01, float(params["radius"]), params, "radius")
+			_add_slider("过渡", 0.05, 4.0, 0.05, float(params.get("falloff", 1.0)), params, "falloff")
 			_add_check("反向", bool(params["invert"]), params, "invert")
 		"checker":
 			_add_slider("格子 (px)", 1.0, 64.0, 1.0, float(params["cell"]), params, "cell")
+		"time":
+			var hint := Label.new()
+			hint.text = "输出当前帧的相位（0…1）。接到 Wave 的输入口，生成时按帧数逐帧出图。"
+			hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+			_params_box.add_child(hint)
+		"wave":
+			_add_slider("频率", 0.5, 16.0, 0.1, float(params["frequency"]), params, "frequency")
+			_add_slider("角度", 0.0, 360.0, 1.0, float(params["angle"]), params, "angle")
+			_add_slider("振幅", 0.0, 1.0, 0.01, float(params["amplitude"]), params, "amplitude")
 		"math":
 			_add_option("运算", ShaderGraphScript.MATH_OPS, int(params["op"]), params, "op")
 			_add_slider("强度", 0.0, 1.0, 0.01, float(params["amount"]), params, "amount")
@@ -465,39 +520,83 @@ func _refresh_preview() -> void:
 	var preview_size := Vector2i(
 		mini(project.size.x, PREVIEW_LIMIT), mini(project.size.y, PREVIEW_LIMIT)
 	)
+	graph.time = _phase.value if is_instance_valid(_phase) else 0.0
 	var image: Image = graph.generate(preview_size)
 	_preview.texture = ImageTexture.create_from_image(image)
-	_status.text = "预览 %d×%d · 输出 %d×%d · 节点 %d" % [
-		preview_size.x, preview_size.y, project.size.x, project.size.y, graph.nodes.size()
+	_status.text = "预览 %d×%d · 输出 %d×%d · 节点 %d · %s" % [
+		preview_size.x,
+		preview_size.y,
+		project.size.x,
+		project.size.y,
+		graph.nodes.size(),
+		"动态" if graph.uses_time() else "静态",
 	]
 
 
-## Generates the image at the project size and adds it as a new layer.
+## Builds the ready made pixel sea, so a dynamic result is one click away.
+func _on_ocean_preset_pressed() -> void:
+	graph.build_ocean_preset()
+	_selected_id = ""
+	_show_params("")
+	_refresh_graph()
+	_refresh_preview()
+
+
+## Generates the image(s) at the project size and adds them as a new layer.
 func _on_add_layer_pressed() -> void:
 	var project := Global.current_project
 	if project == null:
 		return
-	var image: Image = graph.generate(project.size)
-	_add_image_layer(project, image, "Shader Layer")
+	var frames := maxi(int(_frame_count.value) if is_instance_valid(_frame_count) else 1, 1)
+	var images: Array[Image] = []
+	if graph.uses_time():
+		# One image per frame, so the layer animates along the timeline.
+		for i in frames:
+			graph.time = float(i) / float(frames)
+			images.append(graph.generate(project.size))
+	else:
+		graph.time = 0.0
+		images.append(graph.generate(project.size))
+	_add_animated_layer(project, images, "Shader Layer")
+	Global.notification_label("Shader layer added")
 	close_page()
 
 
-## Adds [param image] as a new pixel layer, undoable like the timeline does it.
-static func _add_image_layer(project: Project, image: Image, layer_name: String) -> void:
-	var cel_image := ImageExtended.create_from_image(image, project.is_indexed())
+## Adds one cel per frame out of [param images], creating the missing frames when
+## the graph is animated, all in a single undo step.
+static func _add_animated_layer(
+	project: Project, images: Array[Image], layer_name: String
+) -> void:
+	if images.is_empty():
+		return
+	var current_frames := project.frames.size()
+	var missing := maxi(images.size() - current_frames, 0)
+	var new_frames: Array = []
+	var frame_indices := PackedInt32Array()
+	for i in missing:
+		frame_indices.append(current_frames + i)
+		new_frames.append(project.new_empty_frame())
+	var total_frames := current_frames + missing
+
 	var layer := PixelLayer.new(project, layer_name)
 	var cels: Array = []
-	for frame in project.frames:
+	for f in total_frames:
 		cels.append(layer.new_empty_cel())
-	var first_cel: BaseCel = cels[0]
-	if first_cel is PixelCel:
-		(first_cel as PixelCel).image = cel_image
-		first_cel.update_texture()
+	for f in total_frames:
+		var cel: BaseCel = cels[f]
+		if not (cel is PixelCel):
+			continue
+		var image: Image = images[mini(f, images.size() - 1)]
+		(cel as PixelCel).image = ImageExtended.create_from_image(image, project.is_indexed())
+		cel.update_texture()
 
 	var current_layer: BaseLayer = project.layers[project.current_layer]
 	layer.parent = current_layer.parent
 	var new_layer_idx := project.current_layer + 1
 	project.undo_redo.create_action("Add Shader Layer")
+	if missing > 0:
+		project.undo_redo.add_do_method(project.add_frames.bind(new_frames, frame_indices))
+		project.undo_redo.add_undo_method(project.remove_frames.bind(frame_indices))
 	project.undo_redo.add_do_method(project.add_layers.bind([layer], [new_layer_idx], [cels]))
 	project.undo_redo.add_undo_method(project.remove_layers.bind([new_layer_idx]))
 	project.undo_redo.add_do_method(project.change_cel.bind(-1, new_layer_idx))
@@ -505,7 +604,6 @@ static func _add_image_layer(project: Project, image: Image, layer_name: String)
 	project.undo_redo.add_do_method(Global.undo_or_redo.bind(false))
 	project.undo_redo.add_undo_method(Global.undo_or_redo.bind(true))
 	project.undo_redo.commit_action()
-	Global.notification_label("Shader layer added")
 
 
 ## Finger sized button, so every action is easy to hit on a touchscreen.
