@@ -500,10 +500,16 @@ func _magnifier_visible_pixels() -> int:
 	return count
 
 
+## Rotation left after removing whole right angles. Only that part needs extra
+## sampled pixels, because right angles just swap the axes of the square.
+func _magnifier_skew_rotation() -> float:
+	return _magnifier_rotation - round(_magnifier_rotation / (PI / 2.0)) * (PI / 2.0)
+
+
 ## Pixels that are actually sampled. A rotated view needs a bigger square, because
 ## only the circle inscribed in the lens is visible.
 func _magnifier_source_pixels(visible_pixels: int) -> int:
-	if is_zero_approx(_magnifier_rotation):
+	if absf(_magnifier_skew_rotation()) < 0.01:
 		return visible_pixels
 	var count := int(ceil(visible_pixels * MAGNIFIER_ROTATION_SCALE))
 	count = clampi(count, MAGNIFIER_MIN_SOURCE_PIXELS, MAGNIFIER_MAX_SOURCE_PIXELS * 2)
@@ -649,10 +655,24 @@ func _build_magnifier_image(pixel: Vector2i, count: int) -> Image:
 ## Rotates the lens content so it matches the orientation of the canvas, which
 ## the camera can turn freely.
 func _rotate_magnifier_image(image: Image) -> Image:
-	var size := image.get_size()
+	var quarters := int(round(_magnifier_rotation / (PI / 2.0)))
+	var skew := _magnifier_rotation - quarters * (PI / 2.0)
+	# Whole right angles are handed to the engine, which is much faster than
+	# sampling every pixel here.
+	var turned: Image = image.duplicate()
+	match posmod(quarters, 4):
+		1:
+			turned.rotate_90(COUNTERCLOCKWISE)
+		2:
+			turned.rotate_180()
+		3:
+			turned.rotate_90(CLOCKWISE)
+	if absf(skew) < 0.01:
+		return turned
+	var size := turned.get_size()
 	var output := Tools.get_checker_image(size)
 	var center := Vector2(size) * 0.5
-	var angle := -_magnifier_rotation
+	var angle := -skew
 	var cos_a := cos(angle)
 	var sin_a := sin(angle)
 	for y in size.y:
@@ -668,7 +688,7 @@ func _rotate_magnifier_image(image: Image) -> Image:
 				or source_y >= size.y
 			):
 				continue
-			output.set_pixel(x, y, image.get_pixel(source_x, source_y))
+			output.set_pixel(x, y, turned.get_pixel(source_x, source_y))
 	return output
 
 
