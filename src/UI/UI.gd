@@ -81,6 +81,10 @@ var _magnifier_cell_style: StyleBoxFlat
 var _magnifier_swatch: Panel
 var _magnifier_swatch_style: StyleBoxFlat
 var _magnifier_last_update := 0
+## Reused texture, so holding a still finger does not allocate one every frame.
+var _magnifier_texture: ImageTexture
+var _magnifier_last_pixel := Vector2i(-1, -1)
+var _magnifier_last_source := 0
 
 @onready var dockable_container: DockableContainer = $DockableContainer
 @onready var main_canvas_container := find_child("Main Canvas") as Container
@@ -394,6 +398,9 @@ func _ensure_magnifier() -> void:
 func _update_magnifier(pixel: Vector2i) -> void:
 	_ensure_magnifier()
 	_magnifier_swatch_style.bg_color = _hold_pick_color
+	# Outside the canvas there is no color to preview, so the swatch is hidden
+	# instead of showing the color that was under the finger before.
+	_magnifier_swatch.visible = _hold_pick_has_color
 	var source_pixels := _magnifier_source_pixels()
 	_update_magnifier_cell(source_pixels)
 	var ui_rect := get_global_rect()
@@ -410,7 +417,11 @@ func _update_magnifier(pixel: Vector2i) -> void:
 	var now := Time.get_ticks_msec()
 	if now - _magnifier_last_update < MAGNIFIER_MIN_INTERVAL_MSEC:
 		return
+	if pixel == _magnifier_last_pixel and source_pixels == _magnifier_last_source:
+		return
 	_magnifier_last_update = now
+	_magnifier_last_pixel = pixel
+	_magnifier_last_source = source_pixels
 	var texture := _make_magnifier_texture(pixel, source_pixels)
 	if texture != null:
 		_magnifier_preview.texture = texture
@@ -459,7 +470,13 @@ func _make_magnifier_texture(pixel: Vector2i, source_pixels: int) -> Texture2D:
 	var image := Tools.get_composited_region(region)
 	if image == null or image.is_empty():
 		return null
-	return ImageTexture.create_from_image(image)
+	# Updating an existing texture avoids the per-frame allocation and upload of
+	# a brand new one while the finger moves.
+	if _magnifier_texture == null or _magnifier_texture.get_size() != Vector2(image.get_size()):
+		_magnifier_texture = ImageTexture.create_from_image(image)
+	else:
+		_magnifier_texture.update(image)
+	return _magnifier_texture
 
 
 ## Waits a short moment before ending the picker, because Android sometimes sends
@@ -493,6 +510,9 @@ func _clear_hold_to_pick() -> void:
 	_hold_pick_stroke_seen = false
 	_hold_pick_active = false
 	_hold_pick_has_color = false
+	# Forces the next pick to rebuild the lens instead of reusing the old one.
+	_magnifier_last_pixel = Vector2i(-1, -1)
+	_magnifier_last_source = 0
 	# The multi-finger gesture keeps the flag until every finger is lifted.
 	if not _gesture_suppressed:
 		Tools.hold_to_pick_active = false
@@ -504,9 +524,15 @@ func _clear_hold_to_pick() -> void:
 func _sample_hold_to_pick() -> void:
 	var pixel := _current_pick_pixel()
 	if not _is_pixel_inside_project(pixel):
+		# Outside the canvas: nothing can be picked, and the lens must follow the
+		# finger instead of freezing on the last pixel it saw.
+		_hold_pick_has_color = false
+		_update_magnifier(pixel)
 		return
 	var info := Tools.get_color_at(pixel)
 	if info.is_empty():
+		_hold_pick_has_color = false
+		_update_magnifier(pixel)
 		return
 	_hold_pick_color = info["color"]
 	_hold_pick_index = int(info["index"])
