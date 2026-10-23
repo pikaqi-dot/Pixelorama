@@ -9,6 +9,11 @@ const ShaderGraphScript := preload("res://src/Classes/ShaderComposer/ShaderGraph
 
 const PORT_COLOR := Color(0.55, 0.8, 1.0)
 const PREVIEW_LIMIT := 256
+## Minimum height of every interactive row, which keeps it usable with a finger.
+const TOUCH_SIZE := 40
+const TOUCH_FONT_SIZE := 15
+## Below this width the page stacks the graph above the parameters.
+const NARROW_WIDTH := 760
 
 var graph: RefCounted
 var _graph_edit: GraphEdit
@@ -20,6 +25,16 @@ var _add_type: OptionButton
 var _preview_timer: Timer
 var _selected_id := ""
 var _can_draw_before := true
+var _body: SplitContainer
+var _side: VBoxContainer
+## Two finger pan and pinch inside the graph, because the system gestures that
+## [GraphEdit] would normally rely on are disabled for the canvas.
+var _graph_fingers: Dictionary[int, Vector2] = {}
+var _graph_gesture := false
+var _graph_span := 1.0
+var _graph_midpoint := Vector2.ZERO
+var _graph_zoom := 1.0
+var _graph_scroll := Vector2.ZERO
 
 
 func _ready() -> void:
@@ -27,6 +42,8 @@ func _ready() -> void:
 	mouse_filter = Control.MOUSE_FILTER_STOP
 	graph = ShaderGraphScript.new()
 	_build_ui()
+	_apply_layout()
+	resized.connect(_apply_layout)
 	_refresh_graph()
 	_refresh_preview()
 	hide()
@@ -37,12 +54,15 @@ func open_page() -> void:
 	_can_draw_before = Global.can_draw
 	Global.can_draw = false
 	show()
+	_apply_layout()
 	_refresh_preview()
 
 
 func close_page() -> void:
 	Global.can_draw = _can_draw_before
 	_preview_timer.stop()
+	_graph_fingers.clear()
+	_graph_gesture = false
 	hide()
 
 
@@ -76,94 +96,85 @@ func _build_ui() -> void:
 	header_style.content_margin_bottom = 4
 	header.add_theme_stylebox_override("panel", header_style)
 	root.add_child(header)
-	var header_row := HBoxContainer.new()
+	# Buttons wrap instead of overflowing, and every row is finger sized.
+	var header_row := HFlowContainer.new()
 	header.add_child(header_row)
 	var title := Label.new()
 	title.text = "节点图层 · Shader Composer"
-	title.add_theme_font_size_override("font_size", 15)
+	title.add_theme_font_size_override("font_size", 16)
+	title.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	title.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
 	header_row.add_child(title)
-	var spacer := Control.new()
-	spacer.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	header_row.add_child(spacer)
-	var layer_button := Button.new()
-	layer_button.text = "作为新图层添加"
-	layer_button.pressed.connect(_on_add_layer_pressed)
-	header_row.add_child(layer_button)
-	var close_button := Button.new()
-	close_button.text = "✕"
-	close_button.tooltip_text = "关闭"
-	close_button.pressed.connect(close_page)
-	header_row.add_child(close_button)
+	header_row.add_child(_make_button("作为新图层添加", _on_add_layer_pressed))
+	header_row.add_child(_make_button("✕", close_page, "关闭", Vector2(48, TOUCH_SIZE)))
 
-	var toolbar := HBoxContainer.new()
+	var toolbar := HFlowContainer.new()
 	root.add_child(toolbar)
-	var add_label := Label.new()
-	add_label.text = "节点"
-	toolbar.add_child(add_label)
 	_add_type = OptionButton.new()
 	for type: String in ShaderGraphScript.NODE_TYPES.keys():
 		_add_type.add_item(ShaderGraphScript.NODE_TYPES[type]["label"])
 	_add_type.select(0)
+	_add_type.custom_minimum_size = Vector2(0, TOUCH_SIZE)
+	_add_type.add_theme_font_size_override("font_size", TOUCH_FONT_SIZE)
 	toolbar.add_child(_add_type)
-	var add_button := Button.new()
-	add_button.text = "添加"
-	add_button.pressed.connect(_on_add_pressed)
-	toolbar.add_child(add_button)
-	var delete_button := Button.new()
-	delete_button.text = "删除选中"
-	delete_button.pressed.connect(_on_delete_pressed)
-	toolbar.add_child(delete_button)
-	var generate_button := Button.new()
-	generate_button.text = "刷新预览"
-	generate_button.pressed.connect(_refresh_preview)
-	toolbar.add_child(generate_button)
+	toolbar.add_child(_make_button("添加节点", _on_add_pressed))
+	toolbar.add_child(_make_button("删除选中", _on_delete_pressed))
+	toolbar.add_child(_make_button("刷新预览", _refresh_preview))
 	_status = Label.new()
 	_status.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	_status.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
+	_status.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	_status.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	_status.add_theme_font_size_override("font_size", 13)
 	toolbar.add_child(_status)
 
-	var body := HSplitContainer.new()
-	body.size_flags_vertical = Control.SIZE_EXPAND_FILL
-	root.add_child(body)
+	# A single split switches between side by side and stacked, so the same page
+	# works on a portrait phone and on a desktop window.
+	_body = SplitContainer.new()
+	_body.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	root.add_child(_body)
 
 	_graph_edit = GraphEdit.new()
 	_graph_edit.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	_graph_edit.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	_graph_edit.minimap_enabled = false
+	# Bigger port hot zones, so connecting nodes works with a finger.
+	_graph_edit.add_theme_constant_override("port_hotzone_inner_extent", 26)
+	_graph_edit.add_theme_constant_override("port_hotzone_outer_extent", 18)
 	_graph_edit.connection_request.connect(_on_connection_request)
 	_graph_edit.disconnection_request.connect(_on_disconnection_request)
 	_graph_edit.delete_nodes_request.connect(_on_delete_nodes_request)
 	_graph_edit.node_selected.connect(_on_node_selected)
 	_graph_edit.node_deselected.connect(_on_node_deselected)
-	body.add_child(_graph_edit)
+	_body.add_child(_graph_edit)
 
-	var side := VBoxContainer.new()
-	side.custom_minimum_size = Vector2(300, 0)
-	body.add_child(side)
+	_side = VBoxContainer.new()
+	_body.add_child(_side)
 
 	_params_hint = Label.new()
 	_params_hint.text = "选择一个节点来编辑参数"
 	_params_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	side.add_child(_params_hint)
+	_params_hint.add_theme_font_size_override("font_size", TOUCH_FONT_SIZE)
+	_side.add_child(_params_hint)
 
 	var params_scroll := ScrollContainer.new()
 	params_scroll.size_flags_vertical = Control.SIZE_EXPAND_FILL
-	params_scroll.custom_minimum_size = Vector2(0, 220)
-	side.add_child(params_scroll)
+	params_scroll.custom_minimum_size = Vector2(0, 180)
+	_side.add_child(params_scroll)
 	_params_box = VBoxContainer.new()
 	_params_box.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	params_scroll.add_child(_params_box)
 
 	var preview_label := Label.new()
 	preview_label.text = "预览"
-	side.add_child(preview_label)
+	preview_label.add_theme_font_size_override("font_size", TOUCH_FONT_SIZE)
+	_side.add_child(preview_label)
 	_preview = TextureRect.new()
-	_preview.custom_minimum_size = Vector2(260, 260)
+	_preview.custom_minimum_size = Vector2(200, 180)
 	_preview.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	_preview.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
 	_preview.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
 	_preview.texture_filter = CanvasItem.TEXTURE_FILTER_NEAREST
-	side.add_child(_preview)
+	_side.add_child(_preview)
 
 	_preview_timer = Timer.new()
 	_preview_timer.one_shot = true
@@ -311,12 +322,15 @@ func _add_option(
 	var label := Label.new()
 	label.text = label_text
 	label.custom_minimum_size = Vector2(84, 0)
+	label.add_theme_font_size_override("font_size", 14)
 	row.add_child(label)
 	var option := OptionButton.new()
 	for item in items:
 		option.add_item(str(item))
 	option.select(clampi(selected, 0, items.size() - 1))
 	option.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	option.custom_minimum_size = Vector2(0, TOUCH_SIZE)
+	option.add_theme_font_size_override("font_size", TOUCH_FONT_SIZE)
 	option.item_selected.connect(
 		func(index: int) -> void:
 			params[key] = index
@@ -339,6 +353,7 @@ func _add_slider(
 	var label := Label.new()
 	label.text = label_text
 	label.custom_minimum_size = Vector2(84, 0)
+	label.add_theme_font_size_override("font_size", 14)
 	row.add_child(label)
 	var slider := HSlider.new()
 	slider.min_value = min_value
@@ -347,6 +362,7 @@ func _add_slider(
 	slider.value = value
 	slider.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	slider.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	slider.custom_minimum_size = Vector2(0, TOUCH_SIZE)
 	row.add_child(slider)
 	var display := Label.new()
 	display.text = _format_number(value, step)
@@ -375,6 +391,7 @@ func _add_number(
 	var label := Label.new()
 	label.text = label_text
 	label.custom_minimum_size = Vector2(84, 0)
+	label.add_theme_font_size_override("font_size", 14)
 	row.add_child(label)
 	var spin := SpinBox.new()
 	spin.min_value = min_value
@@ -382,6 +399,8 @@ func _add_number(
 	spin.step = step
 	spin.value = value
 	spin.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	spin.custom_minimum_size = Vector2(0, TOUCH_SIZE)
+	spin.add_theme_font_size_override("font_size", TOUCH_FONT_SIZE)
 	spin.value_changed.connect(
 		func(new_value: float) -> void:
 			params[key] = int(new_value)
@@ -397,6 +416,8 @@ func _add_check(
 	var check := CheckBox.new()
 	check.text = label_text
 	check.button_pressed = value
+	check.custom_minimum_size = Vector2(0, TOUCH_SIZE)
+	check.add_theme_font_size_override("font_size", TOUCH_FONT_SIZE)
 	check.toggled.connect(
 		func(pressed: bool) -> void:
 			params[key] = pressed
@@ -413,7 +434,7 @@ func _add_color(label_text: String, value: Color, params: Dictionary, key: Strin
 	row.add_child(label)
 	var picker := ColorPickerButton.new()
 	picker.color = value
-	picker.custom_minimum_size = Vector2(0, 26)
+	picker.custom_minimum_size = Vector2(0, TOUCH_SIZE)
 	picker.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	picker.color_changed.connect(
 		func(color: Color) -> void:
@@ -485,3 +506,96 @@ static func _add_image_layer(project: Project, image: Image, layer_name: String)
 	project.undo_redo.add_undo_method(Global.undo_or_redo.bind(true))
 	project.undo_redo.commit_action()
 	Global.notification_label("Shader layer added")
+
+
+## Finger sized button, so every action is easy to hit on a touchscreen.
+func _make_button(
+	text: String, callback: Callable, tooltip := "", min_size := Vector2(0, TOUCH_SIZE)
+) -> Button:
+	var button := Button.new()
+	button.text = text
+	button.tooltip_text = tooltip
+	button.custom_minimum_size = min_size
+	button.add_theme_font_size_override("font_size", TOUCH_FONT_SIZE)
+	button.pressed.connect(callback)
+	return button
+
+
+## Puts the parameters beside the graph when there is room, and below it on a
+## narrow screen, so the page stays usable on a phone in portrait.
+func _apply_layout() -> void:
+	if not is_instance_valid(_body) or not is_instance_valid(_graph_edit):
+		return
+	var narrow := size.x < NARROW_WIDTH
+	_body.vertical = narrow
+	if narrow:
+		_graph_edit.custom_minimum_size = Vector2(0, 220)
+		_side.custom_minimum_size = Vector2(0, 260)
+	else:
+		_graph_edit.custom_minimum_size = Vector2(320, 0)
+		_side.custom_minimum_size = Vector2(300, 0)
+
+
+## Two finger pan and pinch for the graph itself. Only events over the graph are
+## used, and they are consumed so the node under the fingers is not also dragged.
+func _input(event: InputEvent) -> void:
+	if not visible or not is_instance_valid(_graph_edit):
+		return
+	if event is InputEventScreenTouch:
+		var touch := event as InputEventScreenTouch
+		if touch.pressed:
+			_graph_fingers[touch.index] = touch.position
+			if _graph_fingers.size() == 2 and _inside_graph(touch.position):
+				_begin_graph_gesture()
+		else:
+			_graph_fingers.erase(touch.index)
+			_graph_gesture = false
+		return
+	if not (event is InputEventScreenDrag):
+		return
+	var drag := event as InputEventScreenDrag
+	if not _graph_fingers.has(drag.index):
+		return
+	_graph_fingers[drag.index] = drag.position
+	if _graph_fingers.size() != 2:
+		return
+	if not _graph_gesture:
+		if not _inside_graph(drag.position):
+			return
+		_begin_graph_gesture()
+	_apply_graph_gesture()
+	get_viewport().set_input_as_handled()
+
+
+func _inside_graph(point: Vector2) -> bool:
+	return _graph_edit.get_global_rect().has_point(point)
+
+
+func _begin_graph_gesture() -> void:
+	_graph_gesture = true
+	_graph_span = maxf(_graph_finger_span(), 1.0)
+	_graph_midpoint = _graph_finger_midpoint()
+	_graph_zoom = _graph_edit.zoom
+	_graph_scroll = _graph_edit.scroll_offset
+
+
+func _apply_graph_gesture() -> void:
+	var span := maxf(_graph_finger_span(), 1.0)
+	_graph_edit.zoom = clampf(_graph_zoom * span / _graph_span, 0.25, 2.5)
+	# The graph content stays under the fingers while they also move.
+	var midpoint := _graph_finger_midpoint()
+	_graph_edit.scroll_offset = _graph_scroll - (midpoint - _graph_midpoint) / _graph_edit.zoom
+
+
+func _graph_finger_span() -> float:
+	var positions := _graph_fingers.values()
+	if positions.size() < 2:
+		return 0.0
+	return (positions[0] as Vector2).distance_to(positions[1] as Vector2)
+
+
+func _graph_finger_midpoint() -> Vector2:
+	var positions := _graph_fingers.values()
+	if positions.size() < 2:
+		return Vector2.ZERO
+	return ((positions[0] as Vector2) + (positions[1] as Vector2)) * 0.5
