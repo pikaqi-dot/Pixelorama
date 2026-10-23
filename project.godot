@@ -1207,7 +1207,7 @@ lock_guides={
 [input_devices]
 
 pointing/android/enable_long_press_as_right_click=true
-pointing/android/enable_pan_and_scale_gestures=true
+pointing/android/enable_pan_and_scale_gestures=false
 joypads/ignore_joypad_on_unfocused_application=true
 
 [internationalization]

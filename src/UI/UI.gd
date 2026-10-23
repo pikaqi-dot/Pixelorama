@@ -7,6 +7,13 @@ const MULTI_FINGER_TAP_MSEC := 750
 const MULTI_FINGER_TAP_MOVE := 24.0
 ## Change of the distance between two fingers that counts as a pinch.
 const MULTI_FINGER_PINCH_MOVE := 18.0
+## Relative change of the distance between the fingers that starts a zoom.
+const MULTI_FINGER_SCALE_START := 0.06
+## Rotation of the line between the fingers that starts turning the view, in
+## radians (about four degrees).
+const MULTI_FINGER_ROTATE_START := 0.07
+## Movement of the fingers' midpoint that starts panning the view.
+const MULTI_FINGER_PAN_START := 14.0
 ## How long a single finger has to rest on the canvas before the color picker
 ## takes over, in seconds.
 const HOLD_PICK_DELAY := 0.35
@@ -55,6 +62,18 @@ var _gesture_started_msec := 0
 var _gesture_pan_zoom := false
 ## Distance between the first two fingers when the second one landed.
 var _gesture_initial_span := 0.0
+## True once the two-finger gesture has been recognised as a view transform, so
+## it no longer counts as a tap for undo/redo.
+var _gesture_transform := false
+## Fingers' span, angle and midpoint when the second finger landed.
+var _gesture_span_start := 0.0
+var _gesture_finger_angle_start := 0.0
+var _gesture_midpoint_start := Vector2.ZERO
+## Camera state when the second finger landed.
+var _gesture_zoom_start := Vector2.ONE
+var _gesture_camera_angle_start := 0.0
+## Canvas point that has to stay under the fingers while they move the view.
+var _gesture_anchor_canvas := Vector2.ZERO
 ## True while a multi-finger gesture keeps the tools from receiving input.
 var _gesture_suppressed := false
 ## Identifies the pending hold-to-pick wait, so it can be cancelled.
@@ -229,6 +248,14 @@ func _on_screen_touch(touch: InputEventScreenTouch) -> void:
 			_gesture_started_msec = Time.get_ticks_msec()
 		if _finger_starts.size() == 2:
 			_gesture_initial_span = _gesture_span()
+			_gesture_span_start = _gesture_initial_span
+			_gesture_finger_angle_start = _gesture_angle()
+			_gesture_midpoint_start = _gesture_midpoint()
+			if is_instance_valid(Global.camera):
+				_gesture_zoom_start = Global.camera.zoom
+				_gesture_camera_angle_start = Global.camera.camera_angle
+			_gesture_anchor_canvas = _canvas_point_at(_to_viewport(_gesture_midpoint_start))
+			_gesture_transform = false
 		if _finger_starts.size() > 1:
 			# Multi-finger gestures must not draw: revert the stroke the first
 			# finger started and ignore tool input until every finger is lifted.
@@ -269,6 +296,59 @@ func _on_screen_drag(drag: InputEventScreenDrag) -> void:
 		# Even a small pinch changes the distance between the fingers.
 		if absf(_gesture_span() - _gesture_initial_span) > MULTI_FINGER_PINCH_MOVE:
 			_gesture_moved = true
+		_update_touch_transform()
+
+
+## Recognises a two-finger zoom, rotation or pan and applies it to the camera.
+## Nothing is applied before the movement is clearly a view gesture, so a
+## two-finger tap still counts as a tap and keeps undoing instead of nudging the
+## view. The values are always measured from the start of the gesture, so touch
+## events that arrive one finger at a time cannot make the view drift away.
+func _update_touch_transform() -> void:
+	var span := _gesture_span()
+	if span <= 0.0 or not is_instance_valid(Global.camera):
+		return
+	var finger_angle := _gesture_angle()
+	var midpoint := _gesture_midpoint()
+	var span_change := absf(span / maxf(_gesture_span_start, 1.0) - 1.0)
+	var turn := wrapf(finger_angle - _gesture_finger_angle_start, -PI, PI)
+	if not _gesture_transform:
+		if (
+			span_change < MULTI_FINGER_SCALE_START
+			and absf(turn) < MULTI_FINGER_ROTATE_START
+			and midpoint.distance_to(_gesture_midpoint_start) < MULTI_FINGER_PAN_START
+		):
+			return
+		# A recognised view gesture never counts as a tap for undo/redo.
+		_gesture_transform = true
+		_gesture_pan_zoom = true
+	if not Global.can_draw:
+		return
+	Global.camera.apply_touch_transform(
+		_gesture_zoom_start,
+		_gesture_camera_angle_start,
+		span / maxf(_gesture_span_start, 1.0),
+		turn,
+		_to_viewport(midpoint),
+		_gesture_anchor_canvas
+	)
+
+
+## Converts a window position into the coordinates of the canvas viewport.
+func _to_viewport(point: Vector2) -> Vector2:
+	if not is_instance_valid(Global.camera):
+		return point
+	var container := Global.camera.viewport_container
+	if not is_instance_valid(container):
+		return point
+	return container.get_global_transform().affine_inverse() * point
+
+
+## Canvas point that is drawn under [param viewport_point] right now.
+func _canvas_point_at(viewport_point: Vector2) -> Vector2:
+	if not is_instance_valid(Global.camera):
+		return Vector2.ZERO
+	return Global.camera.viewport.canvas_transform.affine_inverse() * viewport_point
 
 
 ## Distance between the first two fingers that are on screen.
@@ -277,6 +357,23 @@ func _gesture_span() -> float:
 	if positions.size() < 2:
 		return 0.0
 	return (positions[0] as Vector2).distance_to(positions[1] as Vector2)
+
+
+## Angle of the line between the first two fingers, in radians. It grows clockwise
+## on screen, which is the direction the canvas turns with the fingers.
+func _gesture_angle() -> float:
+	var positions := _finger_positions.values()
+	if positions.size() < 2:
+		return 0.0
+	return ((positions[1] as Vector2) - (positions[0] as Vector2)).angle()
+
+
+## Midpoint between the first two fingers, in window coordinates.
+func _gesture_midpoint() -> Vector2:
+	var positions := _finger_positions.values()
+	if positions.size() < 2:
+		return Vector2.ZERO
+	return ((positions[0] as Vector2) + (positions[1] as Vector2)) * 0.5
 
 
 func _suppress_tool_input() -> void:
@@ -802,6 +899,10 @@ func _reset_touch_gesture() -> void:
 	_gesture_started_msec = 0
 	_gesture_pan_zoom = false
 	_gesture_initial_span = 0.0
+	_gesture_transform = false
+	_gesture_span_start = 0.0
+	_gesture_finger_angle_start = 0.0
+	_gesture_midpoint_start = Vector2.ZERO
 
 
 func _on_cel_switched() -> void:

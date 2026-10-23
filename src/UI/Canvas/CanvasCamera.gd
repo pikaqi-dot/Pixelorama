@@ -109,6 +109,44 @@ func rotate_camera(dir: float) -> void:
 	camera_angle += PI / 180 * dir
 
 
+## Applies a two-finger gesture. The values are absolute, measured from the state
+## the gesture started in ([param base_zoom], [param base_angle]), so touch events
+## arriving one finger at a time cannot accumulate into a drift. The canvas point
+## that was grabbed is kept under the fingers' midpoint.
+func apply_touch_transform(
+	base_zoom: Vector2,
+	base_angle: float,
+	scale_factor: float,
+	angle_delta: float,
+	screen_target: Vector2,
+	canvas_anchor: Vector2
+) -> void:
+	if not is_instance_valid(viewport):
+		return
+	if scale_factor > 0.0:
+		zoom = Vector2(
+			clampf(base_zoom.x * scale_factor, zoom_out_max.x, zoom_in_max.x),
+			clampf(base_zoom.y * scale_factor, zoom_out_max.y, zoom_in_max.y)
+		)
+	# The view is drawn turned by -camera_angle, so the fingers turning clockwise
+	# has to decrease it.
+	camera_angle = base_angle - angle_delta
+	_keep_canvas_point_under(canvas_anchor, screen_target)
+
+
+## Moves the view so [param canvas_point] ends up under [param screen_point].
+## Iterates because the offset is applied in canvas units, but the correction is
+## measured in screen pixels.
+func _keep_canvas_point_under(canvas_point: Vector2, screen_point: Vector2) -> void:
+	if not is_instance_valid(viewport):
+		return
+	for i in 3:
+		var error := screen_point - viewport.canvas_transform * canvas_point
+		if error.length() < 0.05:
+			return
+		offset -= error.rotated(camera_angle) / zoom
+
+
 func zoom_camera(dir: float, event_pos := mouse_pos) -> void:
 	var viewport_size := viewport_container.size
 	if Global.smooth_zoom:
