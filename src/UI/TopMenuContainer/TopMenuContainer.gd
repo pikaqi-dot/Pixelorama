@@ -55,7 +55,6 @@ var gradient_map_dialog := Dialog.new("res://src/UI/Dialogs/ImageEffects/Gradien
 var palettize_dialog := Dialog.new("res://src/UI/Dialogs/ImageEffects/PalettizeDialog.tscn")
 var pixelize_dialog := Dialog.new("res://src/UI/Dialogs/ImageEffects/PixelizeDialog.tscn")
 var posterize_dialog := Dialog.new("res://src/UI/Dialogs/ImageEffects/Posterize.tscn")
-var shader_composer_dialog: Window
 var loaded_effect_dialogs: Array[Dialog] = []
 var last_applied_effect: Window
 var window_opacity_dialog := Dialog.new("res://src/UI/Dialogs/WindowOpacityDialog.tscn")
@@ -577,7 +576,6 @@ func _setup_effects_menu() -> void:
 	_set_menu_shortcut(&"outline", effects_procedural_submenu, 0, "Outline")
 	_set_menu_shortcut(&"drop_shadow", effects_procedural_submenu, 1, "Drop Shadow")
 	_set_menu_shortcut(&"gradient", effects_procedural_submenu, 2, "Gradient")
-	_set_menu_shortcut(&"", effects_procedural_submenu, 3, "Shader Composer")
 	effects_procedural_submenu.id_pressed.connect(_on_effects_procedural_submenu_id_pressed)
 	effects_menu.add_child(effects_procedural_submenu)
 	effects_menu.add_submenu_node_item("Procedural", effects_procedural_submenu)
@@ -1223,18 +1221,6 @@ func _on_effects_procedural_submenu_id_pressed(id: int) -> void:
 			drop_shadow_dialog.popup()
 		2:
 			gradient_dialog.popup()
-		3:
-			_open_shader_composer()
-
-
-## Opens the node based generator, creating it the first time it is needed.
-func _open_shader_composer() -> void:
-	if not is_instance_valid(shader_composer_dialog):
-		shader_composer_dialog = load(
-			"res://src/UI/ShaderComposer/ShaderComposerDialog.gd"
-		).new()
-		Global.control.add_child(shader_composer_dialog)
-	shader_composer_dialog.popup_centered()
 
 
 func _on_effects_blur_submenu_id_pressed(id: int) -> void:

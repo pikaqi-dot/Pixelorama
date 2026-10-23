@@ -1,11 +1,14 @@
-extends Window
-## Node based generator. Procedural nodes (noise, gradients, maths) are turned into
-## a pixel image, which can be added to the project as a new layer.
+extends Panel
+## Full screen node editor. Procedural nodes (noise, gradients, maths) are turned
+## into a pixel image, which is added to the project as a new layer.
+##
+## The page is embedded in the interface instead of being a separate window, and
+## it blocks drawing while it is open.
 
 const ShaderGraphScript := preload("res://src/Classes/ShaderComposer/ShaderGraph.gd")
 
 const PORT_COLOR := Color(0.55, 0.8, 1.0)
-const PREVIEW_LIMIT := 160
+const PREVIEW_LIMIT := 256
 
 var graph: RefCounted
 var _graph_edit: GraphEdit
@@ -16,32 +19,81 @@ var _status: Label
 var _add_type: OptionButton
 var _preview_timer: Timer
 var _selected_id := ""
+var _can_draw_before := true
 
 
 func _ready() -> void:
-	title = "Shader Composer"
-	min_size = Vector2i(860, 600)
-	# Unowned windows need the interface theme explicitly.
-	if is_instance_valid(Global.control) and Global.control.theme != null:
-		theme = Global.control.theme
-	close_requested.connect(hide)
+	set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	mouse_filter = Control.MOUSE_FILTER_STOP
 	graph = ShaderGraphScript.new()
 	_build_ui()
 	_refresh_graph()
 	_refresh_preview()
+	hide()
+
+
+## Shows the page and stops the canvas from receiving input meanwhile.
+func open_page() -> void:
+	_can_draw_before = Global.can_draw
+	Global.can_draw = false
+	show()
+	_refresh_preview()
+
+
+func close_page() -> void:
+	Global.can_draw = _can_draw_before
+	_preview_timer.stop()
+	hide()
+
+
+func is_open() -> bool:
+	return visible
 
 
 func _build_ui() -> void:
+	var background := StyleBoxFlat.new()
+	background.bg_color = Color(0.11, 0.11, 0.13)
+	add_theme_stylebox_override("panel", background)
+
 	var margin := MarginContainer.new()
 	margin.set_anchors_preset(Control.PRESET_FULL_RECT)
-	margin.add_theme_constant_override("margin_left", 8)
+	margin.add_theme_constant_override("margin_left", 10)
 	margin.add_theme_constant_override("margin_top", 8)
-	margin.add_theme_constant_override("margin_right", 8)
+	margin.add_theme_constant_override("margin_right", 10)
 	margin.add_theme_constant_override("margin_bottom", 8)
 	add_child(margin)
 	var root := VBoxContainer.new()
-	root.set_anchors_preset(Control.PRESET_FULL_RECT)
 	margin.add_child(root)
+
+	# Tab style header, so the page reads as a tab of the main area.
+	var header := PanelContainer.new()
+	var header_style := StyleBoxFlat.new()
+	header_style.bg_color = Color(0.17, 0.17, 0.2)
+	header_style.set_corner_radius_all(4)
+	header_style.content_margin_left = 10
+	header_style.content_margin_right = 6
+	header_style.content_margin_top = 4
+	header_style.content_margin_bottom = 4
+	header.add_theme_stylebox_override("panel", header_style)
+	root.add_child(header)
+	var header_row := HBoxContainer.new()
+	header.add_child(header_row)
+	var title := Label.new()
+	title.text = "节点图层 · Shader Composer"
+	title.add_theme_font_size_override("font_size", 15)
+	header_row.add_child(title)
+	var spacer := Control.new()
+	spacer.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	header_row.add_child(spacer)
+	var layer_button := Button.new()
+	layer_button.text = "作为新图层添加"
+	layer_button.pressed.connect(_on_add_layer_pressed)
+	header_row.add_child(layer_button)
+	var close_button := Button.new()
+	close_button.text = "✕"
+	close_button.tooltip_text = "关闭"
+	close_button.pressed.connect(close_page)
+	header_row.add_child(close_button)
 
 	var toolbar := HBoxContainer.new()
 	root.add_child(toolbar)
@@ -65,10 +117,6 @@ func _build_ui() -> void:
 	generate_button.text = "刷新预览"
 	generate_button.pressed.connect(_refresh_preview)
 	toolbar.add_child(generate_button)
-	var layer_button := Button.new()
-	layer_button.text = "作为新图层添加"
-	layer_button.pressed.connect(_on_add_layer_pressed)
-	toolbar.add_child(layer_button)
 	_status = Label.new()
 	_status.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	_status.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
@@ -90,7 +138,7 @@ func _build_ui() -> void:
 	body.add_child(_graph_edit)
 
 	var side := VBoxContainer.new()
-	side.custom_minimum_size = Vector2(280, 0)
+	side.custom_minimum_size = Vector2(300, 0)
 	body.add_child(side)
 
 	_params_hint = Label.new()
@@ -110,7 +158,8 @@ func _build_ui() -> void:
 	preview_label.text = "预览"
 	side.add_child(preview_label)
 	_preview = TextureRect.new()
-	_preview.custom_minimum_size = Vector2(240, 240)
+	_preview.custom_minimum_size = Vector2(260, 260)
+	_preview.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	_preview.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
 	_preview.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
 	_preview.texture_filter = CanvasItem.TEXTURE_FILTER_NEAREST
@@ -408,8 +457,14 @@ func _on_add_layer_pressed() -> void:
 	if project == null:
 		return
 	var image: Image = graph.generate(project.size)
+	_add_image_layer(project, image, "Shader Layer")
+	close_page()
+
+
+## Adds [param image] as a new pixel layer, undoable like the timeline does it.
+static func _add_image_layer(project: Project, image: Image, layer_name: String) -> void:
 	var cel_image := ImageExtended.create_from_image(image, project.is_indexed())
-	var layer := PixelLayer.new(project, "Shader Layer")
+	var layer := PixelLayer.new(project, layer_name)
 	var cels: Array = []
 	for frame in project.frames:
 		cels.append(layer.new_empty_cel())
@@ -430,4 +485,3 @@ func _on_add_layer_pressed() -> void:
 	project.undo_redo.add_undo_method(Global.undo_or_redo.bind(true))
 	project.undo_redo.commit_action()
 	Global.notification_label("Shader layer added")
-	hide()

@@ -133,6 +133,8 @@ var _magnifier_image_origin := Vector2i.ZERO
 var _magnifier_rotation := 0.0
 ## When the current pick started, used as a hard limit for a still finger.
 var _hold_pick_started_msec := 0
+## Full screen node editor, created the first time it is opened.
+var _shader_composer: Control
 ## Last theme color applied to the lens, so it is only restyled when it changes.
 var _lens_edge_cache := Color(-1, -1, -1, -1)
 
@@ -192,6 +194,9 @@ func _ready() -> void:
 
 func _input(event: InputEvent) -> void:
 	if not DisplayServer.is_touchscreen_available():
+		return
+	# The node editor covers the canvas, so its gestures must not reach the view.
+	if is_instance_valid(_shader_composer) and _shader_composer.call("is_open"):
 		return
 	# A recognized pan/zoom means these touches are not a multi-finger tap.
 	if event is InputEventMagnifyGesture or event is InputEventPanGesture:
@@ -964,6 +969,14 @@ func _on_main_canvas_item_rect_changed() -> void:
 
 func _on_main_canvas_visibility_changed() -> void:
 	update_transparent_shader()
+
+
+## Opens the full screen node editor used to generate a layer from a graph.
+func open_shader_composer() -> void:
+	if not is_instance_valid(_shader_composer):
+		_shader_composer = load("res://src/UI/ShaderComposer/ShaderComposerPage.gd").new()
+		add_child(_shader_composer)
+	_shader_composer.call("open_page")
 
 
 func update_transparent_shader() -> void:

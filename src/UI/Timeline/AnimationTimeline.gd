@@ -999,7 +999,20 @@ func _on_add_layer_pressed() -> void:
 	add_layer(layer, project)
 
 
+## Menu id of the node layer entry, which is not a layer type of its own.
+const ADD_NODE_LAYER_ID := 5
+
+
 func on_add_layer_list_id_pressed(id: int) -> void:
+	if id == ADD_NODE_LAYER_ID:
+		# Opens the full screen node editor; the layer is created from its own
+		# "add as new layer" button. The UI node is an ancestor of the timeline.
+		var node: Node = self
+		while node != null and not node.has_method("open_shader_composer"):
+			node = node.get_parent()
+		if node != null:
+			node.call("open_shader_composer")
+		return
 	if id == Global.LayerTypes.TILEMAP:
 		new_tile_map_layer_dialog.popup_centered_clamped()
 	else:
