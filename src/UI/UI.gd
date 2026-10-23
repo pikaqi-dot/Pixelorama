@@ -15,6 +15,12 @@ const HOLD_PICK_MOVE := 14.0
 ## Grace period before a released finger actually ends the picker, in seconds.
 ## Android can send spurious touch releases while the finger is still down.
 const HOLD_PICK_RELEASE_GRACE := 0.2
+## How long the picker waits without any mouse event before assuming the release
+## was lost, in milliseconds.
+const HOLD_PICK_STALE_MSEC := 3000
+## Hard limit for a finger that never sends events, so a lost release cannot
+## leave the picker stuck, in milliseconds.
+const HOLD_PICK_MAX_MSEC := 15000
 ## Size of the magnifier that follows the finger while picking, in pixels.
 const MAGNIFIER_SIZE := 130
 ## Default number of canvas pixels shown on each axis, used before the canvas
@@ -99,6 +105,10 @@ var _magnifier_image: Image
 var _magnifier_image_origin := Vector2i.ZERO
 ## Rotation of the canvas view, in radians. The lens content follows it.
 var _magnifier_rotation := 0.0
+## When the current pick started, used as a hard limit for a still finger.
+var _hold_pick_started_msec := 0
+## Last theme color applied to the lens, so it is only restyled when it changes.
+var _lens_edge_cache := Color(-1, -1, -1, -1)
 
 @onready var dockable_container: DockableContainer = $DockableContainer
 @onready var main_canvas_container := find_child("Main Canvas") as Container
@@ -115,13 +125,18 @@ func _process(_delta: float) -> void:
 	if not _hold_pick_active:
 		return
 	var now := Time.get_ticks_msec()
-	if now - _hold_pick_last_event_msec > 3000:
-		# No events for a long time: a release event was probably lost, so end
-		# the picker instead of leaving it stuck.
-		_pressed_buttons.clear()
-		_hold_pick_pointer_down = false
-		_finish_hold_to_pick()
-		return
+	if now - _hold_pick_last_event_msec > HOLD_PICK_STALE_MSEC:
+		# Touch events still say a finger is on the screen, so the silence only
+		# means it is resting still: keep the lens alive instead of ending the pick.
+		if not _finger_starts.is_empty() and now - _hold_pick_started_msec < HOLD_PICK_MAX_MSEC:
+			_hold_pick_last_event_msec = now
+		else:
+			# No finger is on the screen, so a release event was lost. End the
+			# picker instead of leaving it stuck.
+			_pressed_buttons.clear()
+			_hold_pick_pointer_down = false
+			_finish_hold_to_pick()
+			return
 	if now - _hold_pick_last_sample < 50:
 		return
 	_hold_pick_last_sample = now
@@ -234,11 +249,15 @@ func _on_screen_touch(touch: InputEventScreenTouch) -> void:
 	if moved or duration > MULTI_FINGER_TAP_MSEC:
 		return
 	if fingers == 2:
-		_vibrate(20)
+		var undo_version := Global.current_project.undo_redo.get_version()
 		Global.current_project.commit_undo()
+		if Global.current_project.undo_redo.get_version() != undo_version:
+			_vibrate(20)
 	elif fingers == 3:
-		_vibrate(20)
+		var redo_version := Global.current_project.undo_redo.get_version()
 		Global.current_project.commit_redo()
+		if Global.current_project.undo_redo.get_version() != redo_version:
+			_vibrate(20)
 
 
 func _on_screen_drag(drag: InputEventScreenDrag) -> void:
@@ -298,6 +317,7 @@ func _start_hold_to_pick(position: Vector2) -> void:
 	Tools.cancel_active_tool()
 	_hold_pick_armed = false
 	_hold_pick_active = true
+	_hold_pick_started_msec = Time.get_ticks_msec()
 	Tools.hold_to_pick_active = true
 	_vibrate(25)
 	_sample_hold_to_pick()
@@ -432,14 +452,10 @@ func _ensure_magnifier() -> void:
 
 func _update_magnifier(pixel: Vector2i) -> void:
 	_ensure_magnifier()
-	# The lens follows the interface theme, so it stays readable on light themes.
-	var edge := _lens_edge_color()
-	_magnifier_clip_style.bg_color = _lens_back_color()
-	_magnifier_ring_style.border_color = edge
-	_magnifier_cell_style.border_color = edge
-	_magnifier_swatch_style.border_color = edge
-	_magnifier_label.add_theme_color_override("font_color", edge)
-	_magnifier_label.text = _picked_color_text()
+	_refresh_magnifier_theme()
+	var text := _picked_color_text()
+	if _magnifier_label.text != text:
+		_magnifier_label.text = text
 	_magnifier_swatch_style.bg_color = _hold_pick_color
 	# Outside the canvas there is no color to preview, so the swatch is hidden
 	# instead of showing the color that was under the finger before.
@@ -564,6 +580,20 @@ func _update_magnifier_preview(visible_pixels: int, source_pixels: int) -> void:
 	_magnifier_preview.offset_bottom = inset + side
 	_magnifier_preview.pivot_offset = Vector2(side, side) * 0.5
 	_magnifier_preview.rotation = -_magnifier_rotation
+
+
+## Applies the interface colors to the lens, but only when they change, so a
+## resting finger does not restyle the lens on every sample.
+func _refresh_magnifier_theme() -> void:
+	var edge := _lens_edge_color()
+	if edge == _lens_edge_cache:
+		return
+	_lens_edge_cache = edge
+	_magnifier_clip_style.bg_color = _lens_back_color()
+	_magnifier_ring_style.border_color = edge
+	_magnifier_cell_style.border_color = edge
+	_magnifier_swatch_style.border_color = edge
+	_magnifier_label.add_theme_color_override("font_color", edge)
 
 
 ## Background of the lens: a darker version of the interface panel color.
