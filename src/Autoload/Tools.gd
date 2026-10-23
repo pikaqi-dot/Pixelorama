@@ -752,36 +752,41 @@ func pick_color_at(pos: Vector2i, button: int = MOUSE_BUTTON_LEFT) -> bool:
 	return true
 
 
-## Checkerboard images, keyed by size, so the magnifier does not rebuild the
-## pattern pixel by pixel on every sample.
-var _checker_images: Dictionary[Vector2i, Image] = {}
+## Checkerboard images, keyed by size and pattern offset, so the magnifier does
+## not rebuild the pattern pixel by pixel on every sample.
+var _checker_images: Dictionary = {}
 
 
 ## Returns a fresh copy of an opaque checkerboard, matching the look of the
-## canvas transparency checker.
-func _checker_image(size: Vector2i) -> Image:
-	var cached: Image = _checker_images.get(size, null)
+## canvas transparency checker. [param phase] is the canvas coordinate of the
+## top-left pixel, so a strip that is composited on its own lines up with the
+## image it gets pasted into. The pattern repeats every 4 pixels.
+func get_checker_image(size: Vector2i, phase := Vector2i.ZERO) -> Image:
+	var offset := Vector2i(posmod(phase.x, 4), posmod(phase.y, 4))
+	var key := "%dx%d:%d%d" % [size.x, size.y, offset.x, offset.y]
+	var cached: Image = _checker_images.get(key, null)
 	if cached == null:
 		cached = Image.create_empty(size.x, size.y, false, Image.FORMAT_RGBA8)
 		var checker_light := Color(0.42, 0.42, 0.42)
 		var checker_dark := Color(0.32, 0.32, 0.32)
 		for y in size.y:
 			for x in size.x:
-				var light := ((x >> 1) + (y >> 1)) % 2 == 0
+				var light := (((x + offset.x) >> 1) + ((y + offset.y) >> 1)) % 2 == 0
 				cached.set_pixel(x, y, checker_light if light else checker_dark)
-		if _checker_images.size() >= 24:
+		if _checker_images.size() >= 32:
 			_checker_images.clear()
-		_checker_images[size] = cached
+		_checker_images[key] = cached
 	return cached.duplicate()
 
 
 ## Composites the visible layers inside [param region] (in canvas pixels) into a
 ## small RGBA image. Used by the touch color picker magnifier, so no viewport
-## readback is needed.
-func get_composited_region(region: Rect2i) -> Image:
+## readback is needed. [param phase] aligns the checkerboard when the region is a
+## strip of a larger image.
+func get_composited_region(region: Rect2i, phase := Vector2i.ZERO) -> Image:
 	# An opaque checkerboard base, like the canvas transparent checker, so
 	# transparent pixels do not look like a dark haze in the magnifier.
-	var output := _checker_image(region.size)
+	var output := get_checker_image(region.size, phase)
 	var project := Global.current_project
 	var frame := project.frames[project.current_frame]
 	for idx in project.layers.size():

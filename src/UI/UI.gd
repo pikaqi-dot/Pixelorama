@@ -2,7 +2,7 @@ extends Panel
 
 const UI_TRANSPARENCY_SHADER := preload("uid://bwtsxcdoe2ps1")
 ## Maximum duration of a multi-finger tap, in milliseconds.
-const MULTI_FINGER_TAP_MSEC := 600
+const MULTI_FINGER_TAP_MSEC := 750
 ## Movement that turns a multi-finger tap into a pan/zoom gesture.
 const MULTI_FINGER_TAP_MOVE := 24.0
 ## Change of the distance between two fingers that counts as a pinch.
@@ -30,6 +30,9 @@ const MAGNIFIER_MAX_SOURCE_PIXELS := 65
 const MAGNIFIER_OFFSET := 52.0
 ## Minimum delay between two magnifier texture updates, in milliseconds.
 const MAGNIFIER_MIN_INTERVAL_MSEC := 40
+## How much larger the sampled square gets when the view is rotated, because only
+## the inscribed circle of the lens is visible.
+const MAGNIFIER_ROTATION_SCALE := 1.42
 
 var shader_disabled := false
 var transparency_material: ShaderMaterial
@@ -87,6 +90,15 @@ var _magnifier_last_update := 0
 var _magnifier_texture: ImageTexture
 var _magnifier_last_pixel := Vector2i(-1, -1)
 var _magnifier_last_source := 0
+var _magnifier_label: Label
+var _magnifier_clip_style: StyleBoxFlat
+var _magnifier_ring_style: StyleBoxFlat
+## Last composited lens image, so only the strips that scroll into view are
+## composited again while the finger moves.
+var _magnifier_image: Image
+var _magnifier_image_origin := Vector2i.ZERO
+## Rotation of the canvas view, in radians. The lens content follows it.
+var _magnifier_rotation := 0.0
 
 @onready var dockable_container: DockableContainer = $DockableContainer
 @onready var main_canvas_container := find_child("Main Canvas") as Container
@@ -222,8 +234,10 @@ func _on_screen_touch(touch: InputEventScreenTouch) -> void:
 	if moved or duration > MULTI_FINGER_TAP_MSEC:
 		return
 	if fingers == 2:
+		_vibrate(20)
 		Global.current_project.commit_undo()
 	elif fingers == 3:
+		_vibrate(20)
 		Global.current_project.commit_redo()
 
 
@@ -285,6 +299,7 @@ func _start_hold_to_pick(position: Vector2) -> void:
 	_hold_pick_armed = false
 	_hold_pick_active = true
 	Tools.hold_to_pick_active = true
+	_vibrate(25)
 	_sample_hold_to_pick()
 
 
@@ -328,10 +343,10 @@ func _ensure_magnifier() -> void:
 	_magnifier_clip = Panel.new()
 	_magnifier_clip.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	_magnifier_clip.set_anchors_preset(Control.PRESET_FULL_RECT)
-	var clip_style := StyleBoxFlat.new()
-	clip_style.bg_color = Color(0.08, 0.08, 0.09)
-	clip_style.set_corner_radius_all(radius)
-	_magnifier_clip.add_theme_stylebox_override("panel", clip_style)
+	_magnifier_clip_style = StyleBoxFlat.new()
+	_magnifier_clip_style.bg_color = _lens_back_color()
+	_magnifier_clip_style.set_corner_radius_all(radius)
+	_magnifier_clip.add_theme_stylebox_override("panel", _magnifier_clip_style)
 	_magnifier_clip.clip_children = CanvasItem.CLIP_CHILDREN_AND_DRAW
 	_magnifier.add_child(_magnifier_clip)
 
@@ -346,12 +361,12 @@ func _ensure_magnifier() -> void:
 	_magnifier_ring = Panel.new()
 	_magnifier_ring.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	_magnifier_ring.set_anchors_preset(Control.PRESET_FULL_RECT)
-	var ring_style := StyleBoxFlat.new()
-	ring_style.bg_color = Color(0, 0, 0, 0)
-	ring_style.border_color = Color(1, 1, 1, 0.92)
-	ring_style.set_border_width_all(3)
-	ring_style.set_corner_radius_all(radius)
-	_magnifier_ring.add_theme_stylebox_override("panel", ring_style)
+	_magnifier_ring_style = StyleBoxFlat.new()
+	_magnifier_ring_style.bg_color = Color(0, 0, 0, 0)
+	_magnifier_ring_style.border_color = _lens_edge_color()
+	_magnifier_ring_style.set_border_width_all(3)
+	_magnifier_ring_style.set_corner_radius_all(radius)
+	_magnifier_ring.add_theme_stylebox_override("panel", _magnifier_ring_style)
 	_magnifier.add_child(_magnifier_ring)
 
 	# A small ring marks the exact pixel that will be picked.
@@ -360,7 +375,7 @@ func _ensure_magnifier() -> void:
 	_magnifier_cell.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	_magnifier_cell_style = StyleBoxFlat.new()
 	_magnifier_cell_style.bg_color = Color(0, 0, 0, 0)
-	_magnifier_cell_style.border_color = Color(1, 1, 1, 0.95)
+	_magnifier_cell_style.border_color = _lens_edge_color()
 	_magnifier_cell_style.set_border_width_all(2)
 	_magnifier_cell_style.set_corner_radius_all(int(cell) / 2)
 	_magnifier_cell.add_theme_stylebox_override("panel", _magnifier_cell_style)
@@ -379,7 +394,7 @@ func _ensure_magnifier() -> void:
 	_magnifier_swatch.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	_magnifier_swatch_style = StyleBoxFlat.new()
 	_magnifier_swatch_style.bg_color = Color(1, 0, 1)
-	_magnifier_swatch_style.border_color = Color(1, 1, 1, 0.95)
+	_magnifier_swatch_style.border_color = _lens_edge_color()
 	_magnifier_swatch_style.set_border_width_all(2)
 	_magnifier_swatch_style.set_corner_radius_all(13)
 	_magnifier_swatch.add_theme_stylebox_override("panel", _magnifier_swatch_style)
@@ -393,18 +408,50 @@ func _ensure_magnifier() -> void:
 	_magnifier_swatch.offset_bottom = -6
 	_magnifier.add_child(_magnifier_swatch)
 
+	# Hex value of the picked color, so the lens also tells what it picked.
+	_magnifier_label = Label.new()
+	_magnifier_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_magnifier_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	_magnifier_label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	_magnifier_label.add_theme_font_size_override("font_size", 12)
+	_magnifier_label.add_theme_color_override("font_outline_color", Color(0, 0, 0, 0.9))
+	_magnifier_label.add_theme_constant_override("outline_size", 4)
+	_magnifier_label.anchor_left = 0.5
+	_magnifier_label.anchor_right = 0.5
+	_magnifier_label.anchor_top = 1.0
+	_magnifier_label.anchor_bottom = 1.0
+	_magnifier_label.offset_left = -52
+	_magnifier_label.offset_right = 52
+	_magnifier_label.offset_top = -38
+	_magnifier_label.offset_bottom = -14
+	_magnifier.add_child(_magnifier_label)
+
 	add_child(_magnifier)
 	_magnifier.hide()
 
 
 func _update_magnifier(pixel: Vector2i) -> void:
 	_ensure_magnifier()
+	# The lens follows the interface theme, so it stays readable on light themes.
+	var edge := _lens_edge_color()
+	_magnifier_clip_style.bg_color = _lens_back_color()
+	_magnifier_ring_style.border_color = edge
+	_magnifier_cell_style.border_color = edge
+	_magnifier_swatch_style.border_color = edge
+	_magnifier_label.add_theme_color_override("font_color", edge)
+	_magnifier_label.text = _picked_color_text()
 	_magnifier_swatch_style.bg_color = _hold_pick_color
 	# Outside the canvas there is no color to preview, so the swatch is hidden
 	# instead of showing the color that was under the finger before.
 	_magnifier_swatch.visible = _hold_pick_has_color
-	var source_pixels := _magnifier_source_pixels()
-	_update_magnifier_cell(source_pixels)
+	# The content follows the view, which the camera can also rotate.
+	var rotation := _view_rotation()
+	if not is_equal_approx(rotation, _magnifier_rotation):
+		_magnifier_rotation = rotation
+		_magnifier_last_pixel = Vector2i(-1, -1)
+	var visible_pixels := _magnifier_visible_pixels()
+	var source_pixels := _magnifier_source_pixels(visible_pixels)
+	_update_magnifier_cell(visible_pixels)
 	var ui_rect := get_global_rect()
 	# Prefer the space above the finger, and flip below it when there is no room
 	# left, so the lens never ends up covering the pixel being picked.
@@ -436,9 +483,9 @@ func _update_magnifier(pixel: Vector2i) -> void:
 		_magnifier_preview.texture = texture
 
 
-## How many canvas pixels fit on each axis of the magnifier. It follows the
+## How many canvas pixels are visible on each axis of the lens. It follows the
 ## canvas zoom, so zooming into the canvas also enlarges the pixels in the lens.
-func _magnifier_source_pixels() -> int:
+func _magnifier_visible_pixels() -> int:
 	var canvas_scale := 1.0
 	if is_instance_valid(Global.canvas):
 		# Includes the canvas transform and the camera zoom.
@@ -451,6 +498,63 @@ func _magnifier_source_pixels() -> int:
 	if count % 2 == 0:
 		count += 1
 	return count
+
+
+## Pixels that are actually sampled. A rotated view needs a bigger square, because
+## only the circle inscribed in the lens is visible.
+func _magnifier_source_pixels(visible_pixels: int) -> int:
+	if is_zero_approx(_magnifier_rotation):
+		return visible_pixels
+	var count := int(ceil(visible_pixels * MAGNIFIER_ROTATION_SCALE))
+	count = clampi(count, MAGNIFIER_MIN_SOURCE_PIXELS, MAGNIFIER_MAX_SOURCE_PIXELS * 2)
+	if count % 2 == 0:
+		count += 1
+	return count
+
+
+## Background of the lens: a darker version of the interface panel color.
+func _lens_back_color() -> Color:
+	var panel := get_theme_stylebox("panel", "Panel")
+	if panel is StyleBoxFlat:
+		var base: Color = (panel as StyleBoxFlat).bg_color
+		if base.get_luminance() > 0.45:
+			return base.darkened(0.55)
+		return base.lightened(0.05)
+	return Color(0.08, 0.08, 0.09)
+
+
+## Outline of the lens, taken from the interface text color so it contrasts with
+## both light and dark themes.
+func _lens_edge_color() -> Color:
+	var color := get_theme_color("font_color", "Label")
+	if color.a < 0.1:
+		return Color(1, 1, 1, 0.92)
+	return Color(color.r, color.g, color.b, 0.92)
+
+
+## Rotation of the canvas view, in radians.
+func _view_rotation() -> float:
+	if is_instance_valid(Global.camera):
+		return Global.camera.camera_angle
+	return 0.0
+
+
+## Text shown inside the lens: the hex value, plus the palette index when the
+## picked pixel comes from the indexed palette.
+func _picked_color_text() -> String:
+	if not _hold_pick_has_color:
+		return "—"
+	var text := "#" + _hold_pick_color.to_html(_hold_pick_color.a < 0.999).to_upper()
+	if _hold_pick_index >= 0:
+		text += " · %d" % (_hold_pick_index + 1)
+	return text
+
+
+## Short vibration for touch feedback, ignored on devices without one.
+func _vibrate(duration_ms: int) -> void:
+	if not OS.has_feature("android") and not OS.has_feature("ios"):
+		return
+	Input.vibrate_handheld(duration_ms)
 
 
 ## Resizes the outline that marks the picked pixel, so it always covers one
@@ -468,17 +572,15 @@ func _update_magnifier_cell(source_pixels: int) -> void:
 	_magnifier_cell_style.set_corner_radius_all(maxi(int(cell) / 2, 1))
 
 
-## Crops the canvas around [param pixel] with no filtering, so individual pixels
+## Builds the texture shown by the lens with no filtering, so individual pixels
 ## stay readable. The texture is stretched to the lens size by the preview.
 func _make_magnifier_texture(pixel: Vector2i, source_pixels: int) -> Texture2D:
 	var count := maxi(source_pixels, 1)
-	var half := count / 2
-	var region := Rect2i(pixel - Vector2i(half, half), Vector2i(count, count))
-	# The layers are composited on the CPU for this small region, so no viewport
-	# readback (which is slow on mobile) happens every frame.
-	var image := Tools.get_composited_region(region)
+	var image := _build_magnifier_image(pixel, count)
 	if image == null or image.is_empty():
 		return null
+	if not is_zero_approx(_magnifier_rotation):
+		image = _rotate_magnifier_image(image)
 	# Updating an existing texture avoids the per-frame allocation and upload of
 	# a brand new one while the finger moves.
 	if _magnifier_texture == null or _magnifier_texture.get_size() != Vector2(image.get_size()):
@@ -486,6 +588,88 @@ func _make_magnifier_texture(pixel: Vector2i, source_pixels: int) -> Texture2D:
 	else:
 		_magnifier_texture.update(image)
 	return _magnifier_texture
+
+
+## Composites the canvas around [param pixel]. The previous result is reused and
+## only the strips that scrolled into view are composited again, which keeps the
+## cost of moving the lens low on mobile.
+func _build_magnifier_image(pixel: Vector2i, count: int) -> Image:
+	var origin := pixel - Vector2i(count / 2, count / 2)
+	var size := Vector2i(count, count)
+	var region := Rect2i(origin, size)
+	# The checkerboard is aligned to the canvas, like the transparency checker of
+	# the viewport, so it scrolls together with the pixels.
+	if _magnifier_image == null or _magnifier_image.get_size() != size:
+		# The layers are composited on the CPU for this small region, so no
+		# viewport readback (which is slow on mobile) happens every frame.
+		_magnifier_image = Tools.get_composited_region(region, region.position)
+		_magnifier_image_origin = origin
+		return _magnifier_image
+	var delta := origin - _magnifier_image_origin
+	if delta == Vector2i.ZERO:
+		return _magnifier_image
+	if absi(delta.x) >= count or absi(delta.y) >= count:
+		_magnifier_image = Tools.get_composited_region(region, region.position)
+		_magnifier_image_origin = origin
+		return _magnifier_image
+
+	var shifted := Tools.get_checker_image(size, origin)
+	var overlap_start := Vector2i(maxi(-delta.x, 0), maxi(-delta.y, 0))
+	var overlap_size := Vector2i(count - absi(delta.x), count - absi(delta.y))
+	shifted.blit_rect(
+		_magnifier_image, Rect2i(overlap_start + delta, overlap_size), overlap_start
+	)
+	# Columns that just appeared at the sides.
+	var column_start := count - delta.x if delta.x > 0 else 0
+	var column_count := absi(delta.x)
+	if column_count > 0:
+		var columns_rect := Rect2i(
+			origin + Vector2i(column_start, 0), Vector2i(column_count, count)
+		)
+		var columns := Tools.get_composited_region(columns_rect, columns_rect.position)
+		shifted.blit_rect(
+			columns, Rect2i(Vector2i.ZERO, columns.get_size()), Vector2i(column_start, 0)
+		)
+	# Rows that just appeared, limited to the columns the step above kept.
+	var row_start := count - delta.y if delta.y > 0 else 0
+	var row_count := absi(delta.y)
+	if row_count > 0:
+		var rows_rect := Rect2i(
+			origin + Vector2i(overlap_start.x, row_start), Vector2i(overlap_size.x, row_count)
+		)
+		var rows := Tools.get_composited_region(rows_rect, rows_rect.position)
+		shifted.blit_rect(
+			rows, Rect2i(Vector2i.ZERO, rows.get_size()), Vector2i(overlap_start.x, row_start)
+		)
+	_magnifier_image = shifted
+	_magnifier_image_origin = origin
+	return _magnifier_image
+
+
+## Rotates the lens content so it matches the orientation of the canvas, which
+## the camera can turn freely.
+func _rotate_magnifier_image(image: Image) -> Image:
+	var size := image.get_size()
+	var output := Tools.get_checker_image(size)
+	var center := Vector2(size) * 0.5
+	var angle := -_magnifier_rotation
+	var cos_a := cos(angle)
+	var sin_a := sin(angle)
+	for y in size.y:
+		for x in size.x:
+			var dx := x + 0.5 - center.x
+			var dy := y + 0.5 - center.y
+			var source_x := int(floor(center.x + dx * cos_a + dy * sin_a))
+			var source_y := int(floor(center.y - dx * sin_a + dy * cos_a))
+			if (
+				source_x < 0
+				or source_y < 0
+				or source_x >= size.x
+				or source_y >= size.y
+			):
+				continue
+			output.set_pixel(x, y, image.get_pixel(source_x, source_y))
+	return output
 
 
 ## Waits a short moment before ending the picker, because Android sometimes sends
@@ -505,6 +689,7 @@ func _finish_hold_to_pick() -> void:
 		if _hold_pick_has_color:
 			# Only now, when the finger is lifted, the color is actually selected.
 			Tools.assign_color(_hold_pick_color, MOUSE_BUTTON_LEFT, false, _hold_pick_index)
+			_vibrate(12)
 	_clear_hold_to_pick()
 
 
@@ -523,6 +708,8 @@ func _clear_hold_to_pick() -> void:
 	# Forces the next pick to rebuild the lens instead of reusing the old one.
 	_magnifier_last_pixel = Vector2i(-1, -1)
 	_magnifier_last_source = 0
+	_magnifier_image = null
+	_magnifier_image_origin = Vector2i.ZERO
 	# The multi-finger gesture keeps the flag until every finger is lifted.
 	if not _gesture_suppressed:
 		Tools.hold_to_pick_active = false
