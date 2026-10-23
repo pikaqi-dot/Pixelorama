@@ -12,13 +12,22 @@ const PALETTE_PAGE_URL := "https://lospec.com/palette-list/%s"
 const CDN_URL := "https://cdn.lospec.com/"
 const USER_AGENT := "Pixelorama Lospec Browser"
 const SORT_VALUES: Array[String] = ["default", "alphabetical", "downloads", "newest"]
+const COLOR_FILTER_VALUES: Array[String] = ["any", "max", "min", "exact"]
 const MAX_PREVIEW_SWATCHES := 40  # Maximum drawn swatches per list item
+const MAX_EXAMPLE_IMAGES := 6  # Maximum example images downloaded per palette
+const SWIPE_THRESHOLD := 48.0  # Horizontal drag in pixels needed to switch example images
+const DOUBLE_CLICK_MSEC := 400  # Maximum gap between two taps to count as a double click
+const DOUBLE_CLICK_DISTANCE := 24.0  # Maximum finger movement between the two taps
+const SCROLL_LOAD_MARGIN := 240.0  # Distance from the bottom that requests the next page
 
 enum Mode { BROWSE, SEARCH }
 
 var _search_input: LineEdit
 var _tag_input: LineEdit
 var _sort_option: OptionButton
+var _color_mode_option: OptionButton
+var _color_count_input: SpinBox
+var _filter_timer: Timer
 var _status_label: Label
 var _search_button: Button
 var _refresh_button: Button
@@ -37,11 +46,19 @@ var _total_count := 0
 var _last_search_query := ""
 var _pending_detail_requests := 0
 var _detail_buffer: Array[Dictionary] = []
+## True while the user drags inside the palette list to scroll it.
+var _drag_scrolling := false
 
 
 func _ready() -> void:
 	custom_minimum_size = Vector2(0, 260)
 	size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	# Debounces the color count spin box, so typing 16 does not request twice.
+	_filter_timer = Timer.new()
+	_filter_timer.one_shot = true
+	_filter_timer.wait_time = 0.35
+	_filter_timer.timeout.connect(_reload_browse)
+	add_child(_filter_timer)
 	_build_ui()
 
 	_list_request = HTTPRequest.new()
@@ -67,11 +84,16 @@ func ensure_loaded() -> void:
 func refresh() -> void:
 	_search_input.text = ""
 	_tag_input.text = ""
+	_color_mode_option.select(0)
+	_color_count_input.set_value_no_signal(8)
+	_update_color_filter_state()
 	_reload_browse()
 
 
 ## Reloads the first page while keeping the current sort/tag filters.
 func _reload_browse() -> void:
+	if _filter_timer != null:
+		_filter_timer.stop()
 	_mode = Mode.BROWSE
 	_page = 0
 	_total_count = 0
@@ -127,6 +149,30 @@ func _build_ui() -> void:
 	_sort_option.item_selected.connect(_on_sort_selected)
 	filter_row.add_child(_sort_option)
 
+	# Mirrors the "Number of colors" filter of lospec.com/palette-list.
+	var colors_label := Label.new()
+	colors_label.text = "Colors:"
+	filter_row.add_child(colors_label)
+
+	_color_mode_option = OptionButton.new()
+	_color_mode_option.add_item("Any")
+	_color_mode_option.add_item("Max")
+	_color_mode_option.add_item("Min")
+	_color_mode_option.add_item("Exact")
+	_color_mode_option.tooltip_text = "Filter palettes by their number of colors"
+	_color_mode_option.item_selected.connect(_on_color_filter_selected)
+	filter_row.add_child(_color_mode_option)
+
+	_color_count_input = SpinBox.new()
+	_color_count_input.min_value = 2
+	_color_count_input.max_value = 256
+	_color_count_input.step = 1
+	_color_count_input.set_value_no_signal(8)
+	_color_count_input.custom_minimum_size = Vector2(72, 0)
+	_color_count_input.value_changed.connect(_on_color_count_changed)
+	filter_row.add_child(_color_count_input)
+	_update_color_filter_state()
+
 	var tag_label := Label.new()
 	tag_label.text = "Tag:"
 	filter_row.add_child(tag_label)
@@ -146,9 +192,12 @@ func _build_ui() -> void:
 	_status_label.text = "Select this preset to load palettes from Lospec."
 	status_row.add_child(_status_label)
 
+	# Pages load automatically when the list is scrolled to the bottom; this
+	# button only appears as a retry when a page request failed.
 	_load_more_button = Button.new()
-	_load_more_button.text = "Load More"
+	_load_more_button.text = "Retry"
 	_load_more_button.disabled = true
+	_load_more_button.visible = false
 	_load_more_button.pressed.connect(_on_load_more_pressed)
 	status_row.add_child(_load_more_button)
 
@@ -156,11 +205,19 @@ func _build_ui() -> void:
 	_scroll.custom_minimum_size = Vector2(0, 230)
 	_scroll.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	_scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+	# Touch drags have to travel a few pixels before the list scrolls, so a tap
+	# on "Use Palette" does not scroll by accident.
+	_scroll.scroll_deadzone = 10
+	_scroll.follow_focus = true
+	_scroll.get_v_scroll_bar().value_changed.connect(_on_scroll_value_changed)
 	add_child(_scroll)
 
 	_results_box = VBoxContainer.new()
 	_results_box.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	_results_box.add_theme_constant_override("separation", 4)
+	# Receive drags that start in the empty space between list items.
+	_results_box.mouse_filter = Control.MOUSE_FILTER_STOP
+	_results_box.gui_input.connect(_on_list_drag_input)
 	_scroll.add_child(_results_box)
 
 
@@ -172,14 +229,30 @@ func _set_loading(value: bool) -> void:
 	_is_loading = value
 	_search_button.disabled = value
 	_refresh_button.disabled = value
-	_load_more_button.disabled = value
 	if value:
+		_hide_retry_button()
 		_status_label.text = "Loading palettes from Lospec..."
 
 
 func _clear_results() -> void:
 	for child in _results_box.get_children():
 		child.queue_free()
+	_hide_retry_button()
+	_scroll.scroll_vertical = 0
+
+
+## Builds the palette list request for the current filters and sorting.
+func _build_list_url(page: int) -> String:
+	var tag := _tag_input.text.strip_edges().uri_encode()
+	var sort_index := clampi(_sort_option.selected, 0, SORT_VALUES.size() - 1)
+	var color_mode := COLOR_FILTER_VALUES[
+		clampi(_color_mode_option.selected, 0, COLOR_FILTER_VALUES.size() - 1)
+	]
+	var color_count := int(_color_count_input.value)
+	return (
+		"%s?colorNumberFilterType=%s&colorNumber=%d&page=%d&tag=%s&sortingType=%s"
+		% [LIST_URL, color_mode, color_count, page, tag, SORT_VALUES[sort_index]]
+	)
 
 
 func _request_page(page: int) -> void:
@@ -187,16 +260,12 @@ func _request_page(page: int) -> void:
 	_requested_page = page
 	_set_loading(true)
 
-	var tag := _tag_input.text.strip_edges().uri_encode()
-	var sort_index := clampi(_sort_option.selected, 0, SORT_VALUES.size() - 1)
-	var url := (
-		"%s?colorNumberFilterType=any&colorNumber=8&page=%d&tag=%s&sortingType=%s"
-		% [LIST_URL, page, tag, SORT_VALUES[sort_index]]
-	)
+	var url: String = _build_list_url(page)
 	var err := _list_request.request(url, _default_headers())
 	if err != OK:
 		_set_loading(false)
 		_status_label.text = "Failed to contact Lospec (error %d)." % err
+		_show_retry_button()
 
 
 func _on_list_request_completed(
@@ -205,16 +274,19 @@ func _on_list_request_completed(
 	if result != HTTPRequest.RESULT_SUCCESS:
 		_set_loading(false)
 		_status_label.text = "Network error while loading Lospec palettes."
+		_show_retry_button()
 		return
 	if response_code != 200:
 		_set_loading(false)
 		_status_label.text = "Lospec returned HTTP %d." % response_code
+		_show_retry_button()
 		return
 
 	var parsed: Variant = JSON.parse_string(body.get_string_from_utf8())
 	if typeof(parsed) != TYPE_DICTIONARY or not parsed.has("palettes"):
 		_set_loading(false)
 		_status_label.text = "Could not parse the Lospec response."
+		_show_retry_button()
 		return
 
 	var palettes: Array = parsed.get("palettes", [])
@@ -228,24 +300,108 @@ func _on_list_request_completed(
 			_add_palette_item(_normalize_palette(palette_data))
 
 	_set_loading(false)
-	var has_more := _results_box.get_child_count() < _total_count and not palettes.is_empty()
-	_load_more_button.disabled = not has_more
+	var summary: String = _color_filter_summary()
 	if _results_box.get_child_count() == 0:
 		_status_label.text = "No palettes found."
+		if not summary.is_empty():
+			_status_label.text += " (%s)" % summary
 	else:
-		_status_label.text = (
+		var status := (
 			"Showing %d of %d palettes" % [_results_box.get_child_count(), _total_count]
 		)
+		if not summary.is_empty():
+			status += " • %s" % summary
+		_status_label.text = status
+	_ensure_viewport_filled()
+
+
+## True while the browse list still has pages left to download.
+func _has_more_palettes() -> bool:
+	return (
+		_mode == Mode.BROWSE
+		and not _is_loading
+		and _results_box.get_child_count() > 0
+		and _results_box.get_child_count() < _total_count
+	)
+
+
+## Loads the next page as soon as the list is scrolled near its bottom.
+func _on_scroll_value_changed(value: float) -> void:
+	if not _has_more_palettes():
+		return
+	var bar := _scroll.get_v_scroll_bar()
+	var limit := bar.max_value - bar.page
+	if limit <= 0.0:
+		return
+	if value >= limit - SCROLL_LOAD_MARGIN:
+		_request_page(_page + 1)
+
+
+## Keeps requesting pages while the loaded list does not fill the viewport yet.
+func _ensure_viewport_filled() -> void:
+	await get_tree().process_frame
+	await get_tree().process_frame
+	if not _has_more_palettes():
+		return
+	var bar := _scroll.get_v_scroll_bar()
+	if bar.max_value <= bar.page + 8.0:
+		_request_page(_page + 1)
+
+
+func _show_retry_button() -> void:
+	_load_more_button.visible = true
+	_load_more_button.disabled = false
+
+
+func _hide_retry_button() -> void:
+	_load_more_button.visible = false
+	_load_more_button.disabled = true
 
 
 func _on_load_more_pressed() -> void:
 	if _mode != Mode.BROWSE or _is_loading:
+		return
+	if _results_box.get_child_count() == 0:
+		_reload_browse()
 		return
 	_request_page(_page + 1)
 
 
 func _on_sort_selected(_index: int) -> void:
 	_reload_browse()
+
+
+func _on_color_filter_selected(_index: int) -> void:
+	_update_color_filter_state()
+	_reload_browse()
+
+
+func _on_color_count_changed(_value: float) -> void:
+	if _filter_timer != null:
+		_filter_timer.start()
+
+
+## Only the value next to a non-"Any" mode can be edited.
+func _update_color_filter_state() -> void:
+	if _color_count_input == null or _color_mode_option == null:
+		return
+	_color_count_input.editable = _color_mode_option.selected != 0
+
+
+## Describes the active color count filter for the status label.
+func _color_filter_summary() -> String:
+	if _color_mode_option == null or _color_count_input == null:
+		return ""
+	var count := int(_color_count_input.value)
+	match _color_mode_option.selected:
+		1:
+			return "up to %d colors" % count
+		2:
+			return "at least %d colors" % count
+		3:
+			return "exactly %d colors" % count
+		_:
+			return ""
 
 
 func _on_tag_text_submitted(_text: String) -> void:
@@ -272,7 +428,6 @@ func _on_search_pressed() -> void:
 	_detail_buffer.clear()
 	_clear_results()
 	_set_loading(true)
-	_load_more_button.disabled = true
 
 	var err := _suggest_request.request(SUGGEST_URL + query.uri_encode(), _default_headers())
 	if err != OK:
@@ -352,7 +507,6 @@ func _one_detail_finished() -> void:
 		return
 
 	_set_loading(false)
-	_load_more_button.disabled = true
 	_detail_buffer.sort_custom(
 		func(a: Dictionary, b: Dictionary) -> bool:
 			return int(a.get("_order", 0)) < int(b.get("_order", 0))
@@ -396,12 +550,18 @@ func _normalize_palette(data: Dictionary) -> Dictionary:
 	if author.is_empty():
 		author = str(data.get("author", ""))
 
-	var example_url := ""
+	var example_urls := PackedStringArray()
 	var examples: Variant = data.get("examples", [])
-	if typeof(examples) == TYPE_ARRAY and not examples.is_empty():
-		var example: Variant = examples[0]
-		if typeof(example) == TYPE_DICTIONARY and example.has("image"):
-			example_url = CDN_URL + str(example["image"])
+	if typeof(examples) == TYPE_ARRAY:
+		for example in examples:
+			if typeof(example) != TYPE_DICTIONARY:
+				continue
+			var image_path := str(example.get("image", ""))
+			if image_path.is_empty():
+				continue
+			example_urls.append(CDN_URL + image_path)
+			if example_urls.size() >= MAX_EXAMPLE_IMAGES:
+				break
 
 	var color_count := colors.size()
 	var reported_count: Variant = data.get("numberOfColors", 0)
@@ -417,13 +577,16 @@ func _normalize_palette(data: Dictionary) -> Dictionary:
 		"description": str(data.get("description", "")),
 		"downloads": str(data.get("downloads", "")),
 		"tags": data.get("tags", []),
-		"example_url": example_url,
+		"example_urls": example_urls,
 	}
 
 
 func _add_palette_item(palette: Dictionary) -> void:
 	var panel := PanelContainer.new()
 	panel.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	# The whole row is draggable, so the list can be scrolled from anywhere.
+	panel.mouse_filter = Control.MOUSE_FILTER_STOP
+	panel.gui_input.connect(_on_list_drag_input)
 	_results_box.add_child(panel)
 
 	var margin := MarginContainer.new()
@@ -431,24 +594,51 @@ func _add_palette_item(palette: Dictionary) -> void:
 	margin.add_theme_constant_override("margin_top", 6)
 	margin.add_theme_constant_override("margin_right", 6)
 	margin.add_theme_constant_override("margin_bottom", 6)
+	margin.mouse_filter = Control.MOUSE_FILTER_PASS
 	panel.add_child(margin)
 
 	var row := HBoxContainer.new()
 	row.add_theme_constant_override("separation", 8)
+	row.mouse_filter = Control.MOUSE_FILTER_PASS
 	margin.add_child(row)
 
 	var colors: PackedColorArray = palette.get("colors", PackedColorArray())
+	var example_urls: PackedStringArray = palette.get("example_urls", PackedStringArray())
+	var preview_box := VBoxContainer.new()
+	preview_box.add_theme_constant_override("separation", 2)
+	preview_box.mouse_filter = Control.MOUSE_FILTER_PASS
+	row.add_child(preview_box)
+
 	var preview := TextureRect.new()
 	preview.custom_minimum_size = Vector2(96, 64)
 	preview.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
 	preview.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
 	preview.texture_filter = CanvasItem.TEXTURE_FILTER_NEAREST
 	preview.texture = _make_color_strip_texture(colors)
-	row.add_child(preview)
+	preview_box.add_child(preview)
+
+	if not example_urls.is_empty():
+		# Shared by the image requests, the navigation buttons and the swipe
+		# gesture of this list item.
+		var carousel := {
+			"textures": [],
+			"index": 0,
+			"drag_accum": 0.0,
+		}
+		carousel["textures"].resize(example_urls.size())
+		if example_urls.size() > 1:
+			# Touches that start on the thumbnail switch images instead of
+			# scrolling the list.
+			preview.mouse_filter = Control.MOUSE_FILTER_STOP
+			preview.gui_input.connect(_on_preview_gui_input.bind(preview, carousel))
+			preview_box.add_child(_make_example_nav(preview, carousel))
+		for i in example_urls.size():
+			_load_example_image(example_urls[i], preview, carousel, i)
 
 	var info := VBoxContainer.new()
 	info.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	info.add_theme_constant_override("separation", 2)
+	info.mouse_filter = Control.MOUSE_FILTER_PASS
 	row.add_child(info)
 
 	# The title links to the palette detail page on lospec.com, like on the website.
@@ -458,11 +648,17 @@ func _add_palette_item(palette: Dictionary) -> void:
 	title_label.clip_text = true
 	var slug := str(palette.get("slug", ""))
 	if not slug.is_empty():
-		title_label.mouse_filter = Control.MOUSE_FILTER_STOP
+		# On touch screens let vertical swipes starting on the title scroll the
+		# list; the title still receives taps.
+		title_label.mouse_filter = (
+			Control.MOUSE_FILTER_PASS
+			if DisplayServer.is_touchscreen_available()
+			else Control.MOUSE_FILTER_STOP
+		)
 		title_label.mouse_default_cursor_shape = Control.CURSOR_POINTING_HAND
-		title_label.tooltip_text = "Open this palette on lospec.com"
+		title_label.tooltip_text = "Double-click to open this palette on lospec.com"
 		title_label.add_theme_color_override("font_color", Color(0.55, 0.75, 1.0))
-		title_label.gui_input.connect(_on_palette_title_input.bind(slug))
+		title_label.gui_input.connect(_on_palette_title_input.bind(title_label, slug))
 	info.add_child(title_label)
 
 	var details := PackedStringArray()
@@ -478,6 +674,7 @@ func _add_palette_item(palette: Dictionary) -> void:
 	details_label.add_theme_color_override("font_color", Color(0.72, 0.72, 0.72))
 	details_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	details_label.clip_text = true
+	details_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	info.add_child(details_label)
 
 	info.add_child(_make_swatch_strip(colors))
@@ -489,17 +686,18 @@ func _add_palette_item(palette: Dictionary) -> void:
 	var use_button := Button.new()
 	use_button.text = "Use Palette"
 	use_button.pressed.connect(_on_use_palette_pressed.bind(palette))
+	if DisplayServer.is_touchscreen_available():
+		# Let swipes that start on the button scroll the list.
+		use_button.mouse_filter = Control.MOUSE_FILTER_PASS
 	row.add_child(use_button)
 
-	var example_url := str(palette.get("example_url", ""))
-	if not example_url.is_empty():
-		_load_preview_image(example_url, preview)
 
 
 func _make_swatch_strip(colors: PackedColorArray) -> HBoxContainer:
 	var strip := HBoxContainer.new()
 	strip.add_theme_constant_override("separation", 0)
 	strip.custom_minimum_size = Vector2(0, 10)
+	strip.mouse_filter = Control.MOUSE_FILTER_PASS
 
 	var shown := mini(colors.size(), MAX_PREVIEW_SWATCHES)
 	for i in shown:
@@ -507,11 +705,13 @@ func _make_swatch_strip(colors: PackedColorArray) -> HBoxContainer:
 		swatch.color = colors[i]
 		swatch.custom_minimum_size = Vector2(6, 10)
 		swatch.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		swatch.mouse_filter = Control.MOUSE_FILTER_IGNORE
 		strip.add_child(swatch)
 
 	if colors.size() > shown:
 		var more := Label.new()
 		more.text = " +%d" % (colors.size() - shown)
+		more.mouse_filter = Control.MOUSE_FILTER_IGNORE
 		strip.add_child(more)
 
 	return strip
@@ -531,20 +731,63 @@ func _make_color_strip_texture(colors: PackedColorArray) -> Texture2D:
 	return ImageTexture.create_from_image(image)
 
 
-func _load_preview_image(url: String, target: TextureRect) -> void:
+## Builds the previous/next controls shown under a multi-image preview.
+func _make_example_nav(preview: TextureRect, carousel: Dictionary) -> HBoxContainer:
+	var nav := HBoxContainer.new()
+	nav.add_theme_constant_override("separation", 2)
+	nav.mouse_filter = Control.MOUSE_FILTER_PASS
+
+	var prev_button := Button.new()
+	prev_button.text = "‹"
+	prev_button.tooltip_text = "Previous example image"
+	prev_button.focus_mode = Control.FOCUS_NONE
+	prev_button.custom_minimum_size = Vector2(18, 0)
+	nav.add_child(prev_button)
+
+	var counter := Label.new()
+	counter.text = "1/%d" % carousel["textures"].size()
+	counter.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	counter.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	counter.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	counter.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	nav.add_child(counter)
+
+	var next_button := Button.new()
+	next_button.text = "›"
+	next_button.tooltip_text = "Next example image"
+	next_button.focus_mode = Control.FOCUS_NONE
+	next_button.custom_minimum_size = Vector2(18, 0)
+	nav.add_child(next_button)
+
+	carousel["counter"] = counter
+	prev_button.pressed.connect(_show_example.bind(preview, carousel, -1))
+	next_button.pressed.connect(_show_example.bind(preview, carousel, 1))
+	if DisplayServer.is_touchscreen_available():
+		prev_button.mouse_filter = Control.MOUSE_FILTER_PASS
+		next_button.mouse_filter = Control.MOUSE_FILTER_PASS
+	return nav
+
+
+## Starts downloading one example image. Loaded textures are kept in the shared
+## carousel dictionary, so the list item can switch between them.
+func _load_example_image(
+	url: String, preview: TextureRect, carousel: Dictionary, index: int
+) -> void:
 	var http := HTTPRequest.new()
 	http.timeout = 25.0
 	# Store a weak reference, so a request finishing after the list item was freed
 	# does not pass a dangling node as a bound callable argument.
-	http.set_meta("preview_target", weakref(target))
+	http.set_meta("preview_target", weakref(preview))
+	http.set_meta("carousel", carousel)
+	http.set_meta("example_index", index)
 	add_child(http)
-	http.request_completed.connect(_on_preview_request_completed.bind(http))
+	http.request_completed.connect(_on_example_request_completed.bind(http))
 	var err := http.request(url, PackedStringArray(["User-Agent: " + USER_AGENT]))
 	if err != OK:
 		http.queue_free()
 
 
-func _on_preview_request_completed(
+func _on_example_request_completed(
 	result: int,
 	response_code: int,
 	_headers: PackedStringArray,
@@ -552,6 +795,8 @@ func _on_preview_request_completed(
 	http: HTTPRequest
 ) -> void:
 	var target_ref: WeakRef = http.get_meta("preview_target", null)
+	var carousel: Dictionary = http.get_meta("carousel", {})
+	var index: int = int(http.get_meta("example_index", -1))
 	http.queue_free()
 	if target_ref == null:
 		return
@@ -567,15 +812,150 @@ func _on_preview_request_completed(
 	if image.get_width() > 256:
 		var height := int(256.0 * image.get_height() / image.get_width())
 		image.resize(256, maxi(height, 1), Image.INTERPOLATE_NEAREST)
-	target.texture = ImageTexture.create_from_image(image)
+	var textures: Array = carousel.get("textures", [])
+	if index < 0 or index >= textures.size():
+		return
+	textures[index] = ImageTexture.create_from_image(image)
+	var current := int(carousel.get("index", 0))
+	# Show this image if it is the selected one, or if nothing has loaded yet.
+	if current == index or textures[current] == null:
+		target.texture = textures[index]
 
 
-## Opens the Lospec palette detail page when its title is clicked.
-func _on_palette_title_input(event: InputEvent, slug: String) -> void:
+## Scrolls the list when the user drags anywhere over it. ScrollContainer's own
+## touch scrolling is not reliable when a touch is emulated as a mouse event,
+## so the drag is handled explicitly here.
+func _on_list_drag_input(event: InputEvent) -> void:
+	if event is InputEventMouseButton:
+		var mouse_button := event as InputEventMouseButton
+		if mouse_button.button_index == MOUSE_BUTTON_LEFT:
+			_drag_scrolling = mouse_button.pressed
+			accept_event()
+			return
+		# The row panels stop mouse events from reaching the ScrollContainer,
+		# so the mouse wheel is forwarded manually.
+		if (
+			mouse_button.pressed
+			and mouse_button.button_index in [MOUSE_BUTTON_WHEEL_UP, MOUSE_BUTTON_WHEEL_DOWN]
+		):
+			var direction := -1 if mouse_button.button_index == MOUSE_BUTTON_WHEEL_UP else 1
+			_scroll.scroll_vertical += direction * int(40.0 * mouse_button.factor)
+			accept_event()
+		return
+
+	if event is InputEventMouseMotion and _drag_scrolling:
+		var motion := event as InputEventMouseMotion
+		if motion.button_mask & MOUSE_BUTTON_MASK_LEFT:
+			_scroll.scroll_vertical -= int(motion.relative.y)
+			accept_event()
+		else:
+			_drag_scrolling = false
+		return
+
+	# Native touch events, for platforms that do not emulate them as mouse input.
+	if event is InputEventScreenTouch:
+		_drag_scrolling = (event as InputEventScreenTouch).pressed
+		accept_event()
+		return
+
+	if event is InputEventScreenDrag:
+		_scroll.scroll_vertical -= int((event as InputEventScreenDrag).relative.y)
+		accept_event()
+
+
+## Lets the example thumbnail be swiped left/right to change images.
+func _on_preview_gui_input(
+	event: InputEvent, preview: TextureRect, carousel: Dictionary
+) -> void:
+	if event is InputEventScreenTouch:
+		if (event as InputEventScreenTouch).pressed:
+			carousel["drag_accum"] = 0.0
+		return
+
+	if event is InputEventScreenDrag:
+		_swipe_example(preview, carousel, (event as InputEventScreenDrag).relative.x)
+		return
+
+	# Desktop, and platforms that emulate touches as mouse input.
+	if event is InputEventMouseButton:
+		var mouse_button := event as InputEventMouseButton
+		if mouse_button.button_index == MOUSE_BUTTON_LEFT and mouse_button.pressed:
+			carousel["drag_accum"] = 0.0
+		return
+
+	if event is InputEventMouseMotion:
+		var mouse_motion := event as InputEventMouseMotion
+		if mouse_motion.button_mask & MOUSE_BUTTON_MASK_LEFT:
+			_swipe_example(preview, carousel, mouse_motion.relative.x)
+
+
+func _swipe_example(preview: TextureRect, carousel: Dictionary, relative_x: float) -> void:
+	var accum := float(carousel.get("drag_accum", 0.0)) + relative_x
+	if absf(accum) < SWIPE_THRESHOLD:
+		carousel["drag_accum"] = accum
+		return
+	carousel["drag_accum"] = 0.0
+	# Swiping left shows the next image, swiping right shows the previous one.
+	_show_example(preview, carousel, 1 if accum < 0.0 else -1)
+
+
+## Switches the preview to another example image, wrapping around at the ends.
+func _show_example(preview: TextureRect, carousel: Dictionary, delta: int) -> void:
+	if not is_instance_valid(preview):
+		return
+	var textures: Array = carousel.get("textures", [])
+	var count := textures.size()
+	if count <= 1:
+		return
+	var index := posmod(int(carousel.get("index", 0)) + delta, count)
+	carousel["index"] = index
+	var counter: Label = carousel.get("counter", null)
+	if is_instance_valid(counter):
+		counter.text = "%d/%d" % [index + 1, count]
+	var texture: Texture2D = textures[index]
+	if texture != null:
+		preview.texture = texture
+
+
+## Opens the Lospec palette detail page when the title is double-clicked or
+## double-tapped, so single taps and drags do not open the browser by accident.
+func _on_palette_title_input(event: InputEvent, label: Label, slug: String) -> void:
 	if event is InputEventMouseButton:
 		var mouse_event := event as InputEventMouseButton
-		if mouse_event.button_index == MOUSE_BUTTON_LEFT and mouse_event.pressed:
-			OS.shell_open(PALETTE_PAGE_URL % slug)
+		if mouse_event.button_index == MOUSE_BUTTON_LEFT and mouse_event.double_click:
+			_open_palette_page(label, slug)
+		return
+
+	if event is InputEventScreenTouch:
+		# Touch screens without mouse emulation only send screen touch events,
+		# so the double tap is detected manually.
+		var touch := event as InputEventScreenTouch
+		if touch.pressed and _is_double_tap(label, touch.position):
+			_open_palette_page(label, slug)
+
+
+## Records a tap and returns true when it completes a double tap.
+func _is_double_tap(label: Label, position: Vector2) -> bool:
+	var now := Time.get_ticks_msec()
+	var last_msec := int(label.get_meta("last_tap_msec", 0))
+	var last_position: Vector2 = label.get_meta("last_tap_position", Vector2.ZERO)
+	var double_tap := (
+		now - last_msec <= DOUBLE_CLICK_MSEC
+		and position.distance_to(last_position) <= DOUBLE_CLICK_DISTANCE
+	)
+	# Reset after a double tap, so a third tap starts a new pair.
+	label.set_meta("last_tap_msec", 0 if double_tap else now)
+	label.set_meta("last_tap_position", position)
+	return double_tap
+
+
+func _open_palette_page(label: Label, slug: String) -> void:
+	# A double tap can also produce a double-click mouse event, so debounce it.
+	var now := Time.get_ticks_msec()
+	if now - int(label.get_meta("opened_msec", 0)) < DOUBLE_CLICK_MSEC * 2:
+		return
+	label.set_meta("opened_msec", now)
+	OS.shell_open(PALETTE_PAGE_URL % slug)
 
 
 func _on_use_palette_pressed(palette: Dictionary) -> void:
