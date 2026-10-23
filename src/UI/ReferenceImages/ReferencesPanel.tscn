@@ -45,6 +45,29 @@ layout_mode = 2
 theme_type_variation = &"HeaderSmall"
 text = "Reference Images"
 
+[node name="Spacer" type="Control" parent="ScrollContainer/Container/Header" unique_id=1910121873]
+layout_mode = 2
+size_flags_horizontal = 3
+
+[node name="ImportButton" type="Button" parent="ScrollContainer/Container/Header" unique_id=1910121875 groups=["UIButtons"]]
+custom_minimum_size = Vector2(31, 31)
+layout_mode = 2
+tooltip_text = "Import local images as reference images"
+focus_mode = 0
+mouse_default_cursor_shape = 2
+
+[node name="TextureRect" type="TextureRect" parent="ScrollContainer/Container/Header/ImportButton" unique_id=1910121876]
+layout_mode = 0
+anchor_left = 0.5
+anchor_top = 0.5
+anchor_right = 0.5
+anchor_bottom = 0.5
+offset_left = -7.5
+offset_top = -5.5
+offset_right = 7.5
+offset_bottom = 5.5
+texture = ExtResource("2_uqbp6")
+
 [node name="Tip" type="Label" parent="ScrollContainer/Container" unique_id=1667876678]
 custom_minimum_size = Vector2(10, 0)
 layout_mode = 2
@@ -395,6 +418,7 @@ dialog_autowrap = true
 [node name="DragHighlight" type="ColorRect" parent="Overlay" unique_id=1311141168]
 color = Color(0, 0.741176, 1, 0.501961)
 
+[connection signal="pressed" from="ScrollContainer/Container/Header/ImportButton" to="." method="_on_ImportButton_pressed"]
 [connection signal="pressed" from="ScrollContainer/Container/Tools/MoveImageLeftBtn" to="." method="_on_move_image_left_pressed"]
 [connection signal="pressed" from="ScrollContainer/Container/Tools/MoveImageRightBtn" to="." method="_on_move_image_right_pressed"]
 [connection signal="pressed" from="ScrollContainer/Container/ReferenceEdit/Remove" to="ScrollContainer/Container/ReferenceEdit" method="_on_Remove_pressed"]

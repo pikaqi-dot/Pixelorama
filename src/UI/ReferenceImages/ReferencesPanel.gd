@@ -3,9 +3,13 @@ extends PanelContainer
 ## Panel for reference image management
 
 const REFERENCE_IMAGE_BUTTON := preload("res://src/UI/ReferenceImages/ReferenceImageButton.tscn")
+## Section and key of the config file entry that remembers the last import folder.
+const IMPORT_DIR_SECTION := "reference_images"
+const IMPORT_DIR_KEY := "import_dir"
 
 var list_btn_group := ButtonGroup.new()
 var transform_button_group: ButtonGroup
+var _import_dialog: FileDialog
 
 @onready var list := %List as HFlowContainer
 @onready var drag_highlight := $Overlay/DragHighlight as ColorRect
@@ -40,6 +44,122 @@ func _notification(what: int) -> void:
 
 func _on_transform_tool_button_group_pressed(button: Button) -> void:
 	Global.canvas.reference_image_container.mode = button.get_index()
+
+
+## Lets the user pick local image files and imports them as reference images.
+func _on_ImportButton_pressed() -> void:
+	var dialog := _ensure_import_dialog()
+	dialog.current_dir = _import_start_dir()
+	dialog.popup_centered_ratio(0.7)
+
+
+func _ensure_import_dialog() -> FileDialog:
+	if is_instance_valid(_import_dialog):
+		return _import_dialog
+
+	var dialog := FileDialog.new()
+	dialog.title = tr("Import Reference Images")
+	dialog.file_mode = FileDialog.FILE_MODE_OPEN_FILES
+	dialog.access = FileDialog.ACCESS_FILESYSTEM
+	# Android's scoped storage hides the shared folders from Godot's own file
+	# dialog, so the system picker, which can browse Downloads, is used there.
+	dialog.use_native_dialog = Global.use_native_file_dialogs or OS.has_feature("android")
+	dialog.add_to_group(&"FileDialogs")
+	dialog.filters = _import_filters()
+	dialog.files_selected.connect(_on_import_files_selected)
+	add_child(dialog)
+	_import_dialog = dialog
+	return dialog
+
+
+func _import_filters() -> PackedStringArray:
+	var filters := PackedStringArray()
+	for extension in Global.SUPPORTED_IMAGE_TYPES:
+		filters.append("*.%s;" % extension)
+	return filters
+
+
+func _on_import_files_selected(paths: PackedStringArray) -> void:
+	var imported := 0
+	for path in paths:
+		var image := _load_image_from_path(path)
+		if image == null:
+			continue
+		OpenSave.import_reference_image_from_image(image)
+		imported += 1
+	if imported == 0:
+		Global.popup_error(tr("The selected file(s) could not be imported as images."))
+		return
+	_remember_import_dir(paths[0])
+
+
+## Loads a picked file, which may live outside of res:// on Android.
+func _load_image_from_path(path: String) -> Image:
+	var bytes := FileAccess.get_file_as_bytes(path)
+	var image := Image.new()
+	if not bytes.is_empty():
+		if image.load_png_from_buffer(bytes) == OK:
+			return image
+		if image.load_jpg_from_buffer(bytes) == OK:
+			return image
+		if image.load_webp_from_buffer(bytes) == OK:
+			return image
+		if image.load_bmp_from_buffer(bytes) == OK:
+			return image
+		if image.load_tga_from_buffer(bytes) == OK:
+			return image
+		if image.load_svg_from_buffer(bytes) == OK:
+			return image
+	image = Image.new()
+	if image.load(path) == OK:
+		return image
+	return null
+
+
+## The folder the dialog starts in: the last one used, else the Desktop on
+## desktop platforms and the Downloads folder on Android.
+func _import_start_dir() -> String:
+	var remembered := str(
+		Global.config_cache.get_value(IMPORT_DIR_SECTION, IMPORT_DIR_KEY, "")
+	)
+	if not remembered.is_empty() and DirAccess.dir_exists_absolute(remembered):
+		return remembered
+	if OS.has_feature("android"):
+		return _android_downloads_dir()
+	var desktop := OS.get_system_dir(OS.SYSTEM_DIR_DESKTOP)
+	if not desktop.is_empty():
+		return desktop
+	return OS.get_system_dir(OS.SYSTEM_DIR_DOCUMENTS)
+
+
+## Android exposes the shared storage at a fixed path; only the folders the app
+## is allowed to read are returned, so the picker can start there.
+func _android_downloads_dir() -> String:
+	var system_dir := OS.get_system_dir(OS.SYSTEM_DIR_DOWNLOADS)
+	if not system_dir.is_empty() and DirAccess.dir_exists_absolute(system_dir):
+		return system_dir
+	for candidate in [
+		"/storage/emulated/0/Download",
+		"/storage/emulated/0/Downloads",
+		"/sdcard/Download",
+		"/sdcard/Downloads",
+	]:
+		if DirAccess.dir_exists_absolute(candidate):
+			return candidate
+	return "/storage/emulated/0/Download"
+
+
+## Remembers the folder of the picked file for the next time the dialog opens.
+func _remember_import_dir(file_path: String) -> void:
+	var directory := file_path.get_base_dir()
+	if directory.is_empty() or not DirAccess.dir_exists_absolute(directory):
+		return
+	# The system picker on Android may hand back a temporary copy, which would
+	# point at app-private storage instead of the folder the user browsed.
+	if directory.begins_with(ProjectSettings.globalize_path("user://")):
+		return
+	Global.config_cache.set_value(IMPORT_DIR_SECTION, IMPORT_DIR_KEY, directory)
+	Global.config_cache.save(Global.CONFIG_PATH)
 
 
 func _on_move_image_left_pressed() -> void:
