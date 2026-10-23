@@ -30,9 +30,6 @@ const MAGNIFIER_MAX_SOURCE_PIXELS := 65
 const MAGNIFIER_OFFSET := 52.0
 ## Minimum delay between two magnifier texture updates, in milliseconds.
 const MAGNIFIER_MIN_INTERVAL_MSEC := 40
-## How much larger the sampled square gets when the view is rotated, so the lens
-## can crop back to the same field of view after turning it.
-const MAGNIFIER_ROTATION_SCALE := 1.45
 
 var shader_disabled := false
 var transparency_material: ShaderMaterial
@@ -97,8 +94,6 @@ var _magnifier_ring_style: StyleBoxFlat
 ## composited again while the finger moves.
 var _magnifier_image: Image
 var _magnifier_image_origin := Vector2i.ZERO
-## Rotation of the canvas view, in radians. The lens content follows it.
-var _magnifier_rotation := 0.0
 
 @onready var dockable_container: DockableContainer = $DockableContainer
 @onready var main_canvas_container := find_child("Main Canvas") as Container
@@ -444,13 +439,7 @@ func _update_magnifier(pixel: Vector2i) -> void:
 	# Outside the canvas there is no color to preview, so the swatch is hidden
 	# instead of showing the color that was under the finger before.
 	_magnifier_swatch.visible = _hold_pick_has_color
-	# The content follows the view, which the camera can also rotate.
-	var rotation := _view_rotation()
-	if not is_equal_approx(rotation, _magnifier_rotation):
-		_magnifier_rotation = rotation
-		_magnifier_last_pixel = Vector2i(-1, -1)
 	var visible_pixels := _magnifier_visible_pixels()
-	var source_pixels := _magnifier_source_pixels(visible_pixels)
 	_update_magnifier_cell(visible_pixels)
 	var ui_rect := get_global_rect()
 	# Prefer the space above the finger, and flip below it when there is no room
@@ -473,12 +462,12 @@ func _update_magnifier(pixel: Vector2i) -> void:
 	var now := Time.get_ticks_msec()
 	if now - _magnifier_last_update < MAGNIFIER_MIN_INTERVAL_MSEC:
 		return
-	if pixel == _magnifier_last_pixel and source_pixels == _magnifier_last_source:
+	if pixel == _magnifier_last_pixel and visible_pixels == _magnifier_last_source:
 		return
 	_magnifier_last_update = now
 	_magnifier_last_pixel = pixel
-	_magnifier_last_source = source_pixels
-	var texture := _make_magnifier_texture(pixel, source_pixels, visible_pixels)
+	_magnifier_last_source = visible_pixels
+	var texture := _make_magnifier_texture(pixel, visible_pixels)
 	if texture != null:
 		_magnifier_preview.texture = texture
 
@@ -495,24 +484,6 @@ func _magnifier_visible_pixels() -> int:
 	var count := int(round(MAGNIFIER_SIZE / (canvas_scale * MAGNIFIER_SCREEN_FACTOR)))
 	count = clampi(count, MAGNIFIER_MIN_SOURCE_PIXELS, MAGNIFIER_MAX_SOURCE_PIXELS)
 	# An odd count keeps the picked pixel exactly in the middle of the lens.
-	if count % 2 == 0:
-		count += 1
-	return count
-
-
-## Rotation left after removing whole right angles. Only that part needs extra
-## sampled pixels, because right angles just swap the axes of the square.
-func _magnifier_skew_rotation() -> float:
-	return _magnifier_rotation - round(_magnifier_rotation / (PI / 2.0)) * (PI / 2.0)
-
-
-## Pixels that are actually sampled. A rotated view needs a bigger square, because
-## only the circle inscribed in the lens is visible.
-func _magnifier_source_pixels(visible_pixels: int) -> int:
-	if absf(_magnifier_skew_rotation()) < 0.01:
-		return visible_pixels
-	var count := int(ceil(visible_pixels * MAGNIFIER_ROTATION_SCALE))
-	count = clampi(count, MAGNIFIER_MIN_SOURCE_PIXELS, MAGNIFIER_MAX_SOURCE_PIXELS * 2)
 	if count % 2 == 0:
 		count += 1
 	return count
@@ -536,16 +507,6 @@ func _lens_edge_color() -> Color:
 	if color.a < 0.1:
 		return Color(1, 1, 1, 0.92)
 	return Color(color.r, color.g, color.b, 0.92)
-
-
-## Rotation of the canvas view, in radians. Taken from the canvas transform itself,
-## so it also follows the rotation of the canvas node, not only the camera's.
-func _view_rotation() -> float:
-	if is_instance_valid(Global.canvas):
-		return -Global.canvas.get_global_transform_with_canvas().get_rotation()
-	if is_instance_valid(Global.camera):
-		return Global.camera.camera_angle
-	return 0.0
 
 
 ## Text shown inside the lens: the hex value, plus the palette index when the
@@ -576,9 +537,6 @@ func _update_magnifier_cell(source_pixels: int) -> void:
 	_magnifier_cell.offset_top = -cell * 0.5
 	_magnifier_cell.offset_right = cell * 0.5
 	_magnifier_cell.offset_bottom = cell * 0.5
-	# The marker turns with the canvas, so it keeps covering the same pixel.
-	_magnifier_cell.pivot_offset = Vector2(cell, cell) * 0.5
-	_magnifier_cell.rotation = -_magnifier_rotation
 	var border := 2 if cell >= 9.0 else 1
 	_magnifier_cell_style.set_border_width_all(border)
 	_magnifier_cell_style.set_corner_radius_all(maxi(int(cell) / 2, 1))
@@ -586,22 +544,10 @@ func _update_magnifier_cell(source_pixels: int) -> void:
 
 ## Builds the texture shown by the lens with no filtering, so individual pixels
 ## stay readable. The texture is stretched to the lens size by the preview.
-func _make_magnifier_texture(
-	pixel: Vector2i, source_pixels: int, visible_pixels: int
-) -> Texture2D:
-	var count := maxi(source_pixels, 1)
-	var image := _build_magnifier_image(pixel, count)
+func _make_magnifier_texture(pixel: Vector2i, visible_pixels: int) -> Texture2D:
+	var image := _build_magnifier_image(pixel, maxi(visible_pixels, 1))
 	if image == null or image.is_empty():
 		return null
-	if not is_zero_approx(_magnifier_rotation):
-		image = _rotate_magnifier_image(image)
-		# The extra pixels are only there so the turned square still covers the
-		# lens; cropping the middle keeps the same zoom the lens had before.
-		var visible := mini(visible_pixels, count)
-		if visible < count:
-			var inset := (count - visible) / 2
-			var middle := Rect2i(Vector2i(inset, inset), Vector2i(visible, visible))
-			image = image.get_region(middle)
 	# Updating an existing texture avoids the per-frame allocation and upload of
 	# a brand new one while the finger moves.
 	if _magnifier_texture == null or _magnifier_texture.get_size() != Vector2(image.get_size()):
@@ -665,46 +611,6 @@ func _build_magnifier_image(pixel: Vector2i, count: int) -> Image:
 	_magnifier_image = shifted
 	_magnifier_image_origin = origin
 	return _magnifier_image
-
-
-## Rotates the lens content so it matches the orientation of the canvas, which
-## the camera can turn freely.
-func _rotate_magnifier_image(image: Image) -> Image:
-	var quarters := int(round(_magnifier_rotation / (PI / 2.0)))
-	var skew := _magnifier_rotation - quarters * (PI / 2.0)
-	# Whole right angles are handed to the engine, which is much faster than
-	# sampling every pixel here.
-	var turned: Image = image.duplicate()
-	match posmod(quarters, 4):
-		1:
-			turned.rotate_90(COUNTERCLOCKWISE)
-		2:
-			turned.rotate_180()
-		3:
-			turned.rotate_90(CLOCKWISE)
-	if absf(skew) < 0.01:
-		return turned
-	var size := turned.get_size()
-	var output := Tools.get_checker_image(size)
-	var center := Vector2(size) * 0.5
-	var angle := -skew
-	var cos_a := cos(angle)
-	var sin_a := sin(angle)
-	for y in size.y:
-		for x in size.x:
-			var dx := x + 0.5 - center.x
-			var dy := y + 0.5 - center.y
-			var source_x := int(floor(center.x + dx * cos_a + dy * sin_a))
-			var source_y := int(floor(center.y - dx * sin_a + dy * cos_a))
-			if (
-				source_x < 0
-				or source_y < 0
-				or source_x >= size.x
-				or source_y >= size.y
-			):
-				continue
-			output.set_pixel(x, y, turned.get_pixel(source_x, source_y))
-	return output
 
 
 ## Waits a short moment before ending the picker, because Android sometimes sends
