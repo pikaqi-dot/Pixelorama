@@ -30,9 +30,9 @@ const MAGNIFIER_MAX_SOURCE_PIXELS := 65
 const MAGNIFIER_OFFSET := 52.0
 ## Minimum delay between two magnifier texture updates, in milliseconds.
 const MAGNIFIER_MIN_INTERVAL_MSEC := 40
-## How much larger the sampled square gets when the view is rotated, because only
-## the inscribed circle of the lens is visible.
-const MAGNIFIER_ROTATION_SCALE := 1.42
+## How much larger the sampled square gets when the view is rotated, so the lens
+## can crop back to the same field of view after turning it.
+const MAGNIFIER_ROTATION_SCALE := 1.45
 
 var shader_disabled := false
 var transparency_material: ShaderMaterial
@@ -478,7 +478,7 @@ func _update_magnifier(pixel: Vector2i) -> void:
 	_magnifier_last_update = now
 	_magnifier_last_pixel = pixel
 	_magnifier_last_source = source_pixels
-	var texture := _make_magnifier_texture(pixel, source_pixels)
+	var texture := _make_magnifier_texture(pixel, source_pixels, visible_pixels)
 	if texture != null:
 		_magnifier_preview.texture = texture
 
@@ -573,6 +573,9 @@ func _update_magnifier_cell(source_pixels: int) -> void:
 	_magnifier_cell.offset_top = -cell * 0.5
 	_magnifier_cell.offset_right = cell * 0.5
 	_magnifier_cell.offset_bottom = cell * 0.5
+	# The marker turns with the canvas, so it keeps covering the same pixel.
+	_magnifier_cell.pivot_offset = Vector2(cell, cell) * 0.5
+	_magnifier_cell.rotation = -_magnifier_rotation
 	var border := 2 if cell >= 9.0 else 1
 	_magnifier_cell_style.set_border_width_all(border)
 	_magnifier_cell_style.set_corner_radius_all(maxi(int(cell) / 2, 1))
@@ -580,13 +583,22 @@ func _update_magnifier_cell(source_pixels: int) -> void:
 
 ## Builds the texture shown by the lens with no filtering, so individual pixels
 ## stay readable. The texture is stretched to the lens size by the preview.
-func _make_magnifier_texture(pixel: Vector2i, source_pixels: int) -> Texture2D:
+func _make_magnifier_texture(
+	pixel: Vector2i, source_pixels: int, visible_pixels: int
+) -> Texture2D:
 	var count := maxi(source_pixels, 1)
 	var image := _build_magnifier_image(pixel, count)
 	if image == null or image.is_empty():
 		return null
 	if not is_zero_approx(_magnifier_rotation):
 		image = _rotate_magnifier_image(image)
+		# The extra pixels are only there so the turned square still covers the
+		# lens; cropping the middle keeps the same zoom the lens had before.
+		var visible := mini(visible_pixels, count)
+		if visible < count:
+			var inset := (count - visible) / 2
+			var middle := Rect2i(Vector2i(inset, inset), Vector2i(visible, visible))
+			image = image.get_region(middle)
 	# Updating an existing texture avoids the per-frame allocation and upload of
 	# a brand new one while the finger moves.
 	if _magnifier_texture == null or _magnifier_texture.get_size() != Vector2(image.get_size()):
