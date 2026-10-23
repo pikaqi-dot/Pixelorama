@@ -18,7 +18,20 @@ const X_MINUS_Y_LINE := Vector2(0.70710677, 0.70710677)
 var active_multi_state_tools := 0:
 	set(value):
 		active_multi_state_tools = clamp(value, 0, 2)
+## Delay before a touch press starts a stroke, so a multi-finger gesture that
+## begins a moment later leaves no mark behind.
+const TOUCH_PRESS_DELAY := 0.06
+
 var active_button := -1
+## True while the touch "hold to pick color" gesture owns the input, so the
+## emulated mouse events of that finger do not draw anything.
+var hold_to_pick_active := false
+## Press waiting for the delay above before it turns into a stroke.
+var _pending_press_button := -1
+var _pending_press_pos := Vector2i.ZERO
+var _pending_press_msec := 0
+## Presses are deferred on touch screens so gestures cannot leave a mark.
+var defer_tool_presses := DisplayServer.is_touchscreen_available()
 var picking_color_for := MOUSE_BUTTON_LEFT
 var horizontal_mirror := false
 var vertical_mirror := false
@@ -387,6 +400,48 @@ class Slot:
 		kname = name.replace(" ", "_").to_lower()
 
 
+func _process(_delta: float) -> void:
+	if _pending_press_button == -1:
+		return
+	if hold_to_pick_active:
+		_pending_press_button = -1
+		return
+	if Time.get_ticks_msec() - _pending_press_msec < int(TOUCH_PRESS_DELAY * 1000.0):
+		return
+	var button := _pending_press_button
+	var pos := _pending_press_pos
+	_pending_press_button = -1
+	_start_stroke(button, pos)
+
+
+## Forgets a press that has not started a stroke yet.
+func cancel_pending_press() -> void:
+	_pending_press_button = -1
+
+
+func _begin_press(button: int, pos: Vector2i) -> void:
+	if defer_tool_presses:
+		# Wait a moment, so a second finger landing right after this one can
+		# cancel the press before anything is drawn.
+		_pending_press_button = button
+		_pending_press_pos = pos
+		_pending_press_msec = Time.get_ticks_msec()
+		return
+	_start_stroke(button, pos)
+
+
+func _start_stroke(button: int, pos: Vector2i) -> void:
+	active_button = button
+	_slots[button].tool_node.draw_start(pos)
+
+
+func _end_stroke(pos: Vector2i) -> void:
+	if active_button == -1:
+		return
+	_slots[active_button].tool_node.draw_end(pos)
+	active_button = -1
+
+
 func _ready() -> void:
 	options_reset.connect(reset_options)
 	Global.cel_switched.connect(_cel_switched)
@@ -639,6 +694,103 @@ func get_assigned_color(button: int) -> Color:
 	return _slots[button].color
 
 
+## Cancels and reverts the stroke that is currently being drawn, if any.
+## Used by the touch "hold to pick color" gesture so it leaves no trace.
+func cancel_active_tool() -> void:
+	if active_button == -1:
+		return
+	var slot: Slot = _slots.get(active_button, null)
+	if slot != null and is_instance_valid(slot.tool_node):
+		slot.tool_node.cancel_tool()
+	active_button = -1
+
+
+## Reads the color of the top-most visible pixel at [param pos], without assigning
+## it. Returns a dictionary with [code]color[/code] and [code]index[/code] keys, or
+## an empty dictionary when [param pos] is outside the canvas.
+func get_color_at(pos: Vector2i) -> Dictionary:
+	var project := Global.current_project
+	pos = project.tiles.get_canon_position(pos)
+	if pos.x < 0 or pos.y < 0 or pos.x > project.size.x - 1 or pos.y > project.size.y - 1:
+		return {}
+	if is_placing_tiles():
+		return {}
+	var color := Color(0, 0, 0, 0)
+	var palette_index := -1
+	var curr_frame := project.frames[project.current_frame]
+	for layer in project.layers.size():
+		var idx := (project.layers.size() - 1) - layer
+		if not project.layers[idx].is_visible_in_hierarchy():
+			continue
+		var cel := curr_frame.cels[idx]
+		if cel == null:
+			continue
+		var image: ImageExtended
+		if cel.get_image() is ImageExtended:
+			image = cel.get_image()
+		else:
+			image = ImageExtended.create_from_image(cel.get_image(), project.is_indexed())
+		var final_pos := pos - cel.offset
+		if not image.pos_inside_image(final_pos):
+			continue
+		color = image.get_pixelv(final_pos)
+		if cel is PixelCel and image.is_indexed:
+			palette_index = image.indices_image.get_pixel(final_pos.x, final_pos.y).r8 - 1
+		if not is_zero_approx(color.a):
+			break
+	return {"color": color, "index": palette_index}
+
+
+## Picks the color of the top-most visible pixel at [param pos] and assigns it to
+## [param button]. Works like the Color Picker tool, but without switching tools.
+## Returns [code]false[/code] when [param pos] is outside the canvas.
+func pick_color_at(pos: Vector2i, button: int = MOUSE_BUTTON_LEFT) -> bool:
+	var info := get_color_at(pos)
+	if info.is_empty():
+		return false
+	assign_color(info["color"], button, false, int(info["index"]))
+	return true
+
+
+## Composites the visible layers inside [param region] (in canvas pixels) into a
+## small RGBA image. Used by the touch color picker magnifier, so no viewport
+## readback is needed.
+func get_composited_region(region: Rect2i) -> Image:
+	var output := Image.create_empty(region.size.x, region.size.y, false, Image.FORMAT_RGBA8)
+	# An opaque checkerboard base, like the canvas transparent checker, so
+	# transparent pixels do not look like a dark haze in the magnifier.
+	var checker_light := Color(0.42, 0.42, 0.42)
+	var checker_dark := Color(0.32, 0.32, 0.32)
+	for y in region.size.y:
+		for x in region.size.x:
+			var light := ((x >> 1) + (y >> 1)) % 2 == 0
+			output.set_pixel(x, y, checker_light if light else checker_dark)
+	var project := Global.current_project
+	var frame := project.frames[project.current_frame]
+	for idx in project.layers.size():
+		var layer := project.layers[idx]
+		if not layer.is_visible_in_hierarchy():
+			continue
+		var cel := frame.cels[idx]
+		if cel == null:
+			continue
+		var source := cel.get_image()
+		if source == null:
+			continue
+		var cel_rect := Rect2i(region.position - cel.offset, region.size)
+		var src_rect := cel_rect.intersection(Rect2i(Vector2i.ZERO, source.get_size()))
+		if src_rect.size.x <= 0 or src_rect.size.y <= 0:
+			continue
+		var part := source.get_region(src_rect)
+		if part.is_compressed():
+			part.decompress()
+		if part.get_format() != Image.FORMAT_RGBA8:
+			part.convert(Image.FORMAT_RGBA8)
+		var destination := src_rect.position + cel.offset - region.position
+		output.blend_rect(part, Rect2i(Vector2i.ZERO, part.get_size()), destination)
+	return output
+
+
 func get_mirrored_positions(
 	pos: Vector2i, project := Global.current_project, offset := 0
 ) -> Array[Vector2i]:
@@ -857,17 +1009,45 @@ func draw_preview() -> void:
 func handle_draw(position: Vector2i, event: InputEvent) -> void:
 	if not Global.can_draw:
 		return
+	# While the touch color picker or a multi-finger gesture owns the input, new
+	# presses must not start a stroke (this also blocks Android's long press
+	# right click). The stroke that was already running is cancelled separately.
+	if (
+		hold_to_pick_active
+		and (
+			event.is_action_pressed(&"activate_left_tool")
+			or event.is_action_pressed(&"activate_right_tool")
+		)
+	):
+		return
 
 	var draw_pos := position
 	if Global.mirror_view:
 		draw_pos.x = Global.current_project.size.x - position.x - 1
 	if event is InputEventGesture:
+		cancel_pending_press()
 		if active_button == MOUSE_BUTTON_LEFT:
 			_slots[active_button].tool_node.cancel_tool()
 			active_button = -1
 		elif active_button == MOUSE_BUTTON_RIGHT:
 			_slots[active_button].tool_node.cancel_tool()
 			active_button = -1
+	# A release that arrives before the deferred press started still paints.
+	if (
+		_pending_press_button != -1
+		and (
+			event.is_action_released(&"activate_left_tool")
+			or event.is_action_released(&"activate_right_tool")
+		)
+	):
+		var pending_button := _pending_press_button
+		_pending_press_button = -1
+		if not hold_to_pick_active:
+			_start_stroke(pending_button, draw_pos)
+			_end_stroke(draw_pos)
+		return
+	if _pending_press_button != -1 and event is InputEventMouseMotion:
+		_pending_press_pos = draw_pos
 	if Input.is_action_pressed(&"change_layer_automatically", true):
 		if event.is_action(&"activate_left_tool"):
 			if _slots[MOUSE_BUTTON_LEFT].tool_node is not BaseSelectionTool:
@@ -879,11 +1059,9 @@ func handle_draw(position: Vector2i, event: InputEvent) -> void:
 				return
 
 	if event.is_action_pressed(&"activate_left_tool") and active_button == -1 and not pen_inverted:
-		active_button = MOUSE_BUTTON_LEFT
-		_slots[active_button].tool_node.draw_start(draw_pos)
+		_begin_press(MOUSE_BUTTON_LEFT, draw_pos)
 	elif event.is_action_released(&"activate_left_tool") and active_button == MOUSE_BUTTON_LEFT:
-		_slots[active_button].tool_node.draw_end(draw_pos)
-		active_button = -1
+		_end_stroke(draw_pos)
 	elif (
 		(
 			event.is_action_pressed(&"activate_right_tool")
@@ -892,14 +1070,12 @@ func handle_draw(position: Vector2i, event: InputEvent) -> void:
 		)
 		or event.is_action_pressed(&"activate_left_tool") and active_button == -1 and pen_inverted
 	):
-		active_button = MOUSE_BUTTON_RIGHT
-		_slots[active_button].tool_node.draw_start(draw_pos)
+		_begin_press(MOUSE_BUTTON_RIGHT, draw_pos)
 	elif (
 		(event.is_action_released(&"activate_right_tool") and active_button == MOUSE_BUTTON_RIGHT)
 		or event.is_action_released(&"activate_left_tool") and active_button == MOUSE_BUTTON_RIGHT
 	):
-		_slots[active_button].tool_node.draw_end(draw_pos)
-		active_button = -1
+		_end_stroke(draw_pos)
 
 	if event is InputEventMouseMotion:
 		pen_pressure = event.pressure
