@@ -1049,15 +1049,10 @@ func _colour_of(node_id: String, depth: int) -> Variant:
 	if node.is_empty():
 		return null
 	var params: Dictionary = params_for(node)
-	var own: Variant = own_colour(params)
-	if own != null:
-		return own
-	var node_type := str(node["type"])
-	if own_colour_stops(node, params):
-		# Reading a canvas through its transparency gives coverage, not a picture,
-		# so a colour does not travel through it.
-		return null
-	if node_type == "blend":
+	# A blend never owns a colour. It only decides how the two colours it is given
+	# combine, with the same factor it blends the values with, so a colour set on
+	# the branch in front of it always comes through.
+	if str(node["type"]) == "blend":
 		var from_a: Variant = _colour_of(_input_id(node, 0), depth + 1)
 		var from_b: Variant = _colour_of(_input_id(node, 1), depth + 1)
 		if from_a == null:
@@ -1065,6 +1060,13 @@ func _colour_of(node_id: String, depth: int) -> Variant:
 		if from_b == null:
 			return from_a
 		return (from_a as Color).lerp(from_b as Color, clampf(float(params.get("factor", 0.5)), 0.0, 1.0))
+	var own: Variant = own_colour(params)
+	if own != null:
+		return own
+	if own_colour_stops(node, params):
+		# Reading a canvas through its transparency gives coverage, not a picture,
+		# so a colour does not travel through it.
+		return null
 	return _colour_of(_input_id(node, 0), depth + 1)
 
 
@@ -3483,9 +3485,9 @@ func build_ocean_preset() -> void:
 	get_node_by_id(noise)["params"].merge({"scale": 4.0, "octaves": 2, "seed": 7}, true)
 	get_node_by_id(foam)["params"].merge({"op": 0, "factor": 0.16}, true)
 	get_node_by_id(post)["params"].merge({"op": 6, "steps": 5}, true)
-	# The colour now lives on the node that paints the picture and travels down
-	# from there, so the output needs no colour settings of its own.
-	get_node_by_id(post)["params"].merge(
+	# The colour sits on the gradient that paints the water and travels down from
+	# there. The blend in between mixes it with the waves and never owns a colour.
+	get_node_by_id(depth)["params"].merge(
 		{"tint": true, "color": Color(0.13, 0.38, 0.6, 1.0)}, true
 	)
 
@@ -3644,7 +3646,9 @@ func build_mask_growth_preset() -> void:
 		true
 	)
 	get_node_by_id(blend)["params"].merge({"op": 2, "factor": 1.0}, true)
-	get_node_by_id(blend)["params"].merge(
+	# The colour belongs to the noise that fills the picture, and the blend only
+	# mixes it with the growing mask.
+	get_node_by_id(noise)["params"].merge(
 		{"tint": true, "color": Color(0.28, 0.62, 0.78, 1.0)}, true
 	)
 	get_node_by_id(out)["params"].merge({"transparent": true}, true)
@@ -3870,7 +3874,9 @@ func build_vine_preset() -> void:
 		true
 	)
 	get_node_by_id(blend)["params"].merge({"op": 1, "factor": 1.0}, true)
-	get_node_by_id(blend)["params"].merge(
+	# The leaves are the colour of the picture; the stem stays uncoloured and the
+	# blend mixes the two branches, so setting a colour on the scatter shows up.
+	get_node_by_id(scatter)["params"].merge(
 		{"tint": true, "color": Color(0.26, 0.55, 0.24, 1.0)}, true
 	)
 	get_node_by_id(out)["params"].merge({"transparent": true}, true)
