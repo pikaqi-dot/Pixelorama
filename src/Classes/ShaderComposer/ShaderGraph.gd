@@ -501,6 +501,28 @@ func _is_upstream_of(candidate: String, id: String) -> bool:
 	return false
 
 
+## Nodes that read [param id], directly or through other nodes. Used to redraw
+## only the thumbnails whose picture can have changed.
+func downstream_ids(id: String) -> Array[String]:
+	var result: Array[String] = []
+	var pending: Array[String] = [id]
+	var seen := {id: true}
+	while not pending.is_empty():
+		var current: String = pending.pop_back()
+		for node: Dictionary in nodes:
+			var node_id := str(node["id"])
+			if seen.has(node_id):
+				continue
+			var inputs: Dictionary = node["inputs"]
+			for slot: int in inputs.keys():
+				if str(inputs[slot]) == current:
+					seen[node_id] = true
+					result.append(node_id)
+					pending.append(node_id)
+					break
+	return result
+
+
 ## Nodes that feed [param id], directly or not.
 func upstream_ids(id: String) -> Array[String]:
 	var result: Array[String] = []

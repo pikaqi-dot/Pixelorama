@@ -23,6 +23,9 @@ const PLAYBACK_BUDGET_MSEC := 90.0
 ## Longest time one slice of the preview may take before the frame is handed
 ## back, so input and scrolling stay responsive while a graph is painted.
 const PREVIEW_SLICE_MSEC := 12.0
+## Time one frame may spend on node thumbnails. They are drawn a few at a time
+## instead of all at once after every preview refresh.
+const THUMB_BUDGET_MSEC := 4.0
 ## Minimum height of every interactive row, which keeps it usable with a finger.
 const TOUCH_SIZE := 40
 const TOUCH_FONT_SIZE := 15
@@ -127,9 +130,13 @@ var _frame_count: SpinBox
 var _play_timer: Timer
 var _play_button: Button
 var _playhead := 0.0
-## Rotates through the node thumbnails while the animation plays, so only one
-## of them is redrawn per tick.
-var _thumbnail_index := 0
+## Node thumbnails waiting to be redrawn, and the one the playback rotates to.
+var _thumb_queue: Array[String] = []
+var _thumb_index := 0
+## Nodes whose thumbnail picture can have changed. Everything downstream of an
+## edited node is affected, nothing else is, so only those are repainted.
+var _dirty_previews: Dictionary = {}
+var _all_previews_dirty := true
 ## Measured size and duration of the last preview, used to keep every refresh
 ## inside a time budget on slower devices.
 var _preview_side := 0
@@ -427,6 +434,8 @@ func _refresh_graph() -> void:
 	_graph_edit.clear_connections()
 	# The previews belong to the nodes being rebuilt, so the map starts over.
 	_node_previews.clear()
+	_all_previews_dirty = true
+	_dirty_previews.clear()
 	for child in _graph_edit.get_children():
 		if child is GraphNode:
 			_graph_edit.remove_child(child)
@@ -638,6 +647,44 @@ func _make_node_preview(node: Dictionary) -> Control:
 	return column
 
 
+## Paints queued thumbnails a few milliseconds at a time, so a graph with many
+## nodes never blocks one frame after a change or a playback tick.
+func _process(_delta: float) -> void:
+	if _thumb_queue.is_empty() or not visible:
+		return
+	var deadline := Time.get_ticks_usec() + int(THUMB_BUDGET_MSEC * 1000.0)
+	var index := 0
+	while index < _thumb_queue.size() and Time.get_ticks_usec() < deadline:
+		var node_id: String = _thumb_queue[index]
+		var entry: Dictionary = _node_previews.get(node_id, {})
+		if entry.is_empty():
+			_thumb_queue.remove_at(index)
+			continue
+		var frame: Control = entry["frame"]
+		if not is_instance_valid(frame):
+			_node_previews.erase(node_id)
+			_thumb_queue.remove_at(index)
+			continue
+		if not frame.visible or not _preview_on_screen(frame):
+			# Keep it queued: it is drawn as soon as it scrolls back in.
+			index += 1
+			continue
+		_thumb_queue.remove_at(index)
+		_refresh_node_preview(node_id, entry)
+
+
+## True when a node preview is inside the visible part of the graph, so panning
+## a big graph does not pay for pictures nobody sees.
+func _preview_on_screen(frame: Control) -> bool:
+	if not is_instance_valid(_graph_edit):
+		return false
+	var view := _graph_edit.get_global_rect()
+	if view.size.x <= 0.0 or view.size.y <= 0.0:
+		# Before the first layout there is no visible area to test against.
+		return true
+	return view.intersects(frame.get_global_rect())
+
+
 ## Folds the preview of one node away, or brings it back with a fresh picture.
 func _toggle_node_preview(node_id: String) -> void:
 	var entry: Dictionary = _node_previews.get(node_id, {})
@@ -666,20 +713,39 @@ func _refresh_node_preview(node_id: String, entry: Dictionary) -> void:
 	)
 
 
-## Keeps every open preview in step with the graph. Folded ones are skipped, so a
-## crowded graph does not pay for pictures nobody sees.
-func _refresh_node_previews() -> void:
-	if _node_previews.is_empty():
+## Marks a node and everything downstream of it for a thumbnail redraw. Editing
+## one branch no longer repaints the whole graph.
+func _mark_preview_dirty(node_id: String) -> void:
+	if node_id.is_empty() or graph.get_node_by_id(node_id).is_empty():
+		_all_previews_dirty = true
 		return
-	for node_id: String in _node_previews.keys():
-		var entry: Dictionary = _node_previews[node_id]
-		var frame: Control = entry["frame"]
+	_dirty_previews[node_id] = true
+	for other: String in graph.downstream_ids(node_id):
+		_dirty_previews[other] = true
+
+
+## Queues the previews whose picture can have changed. [method _process] paints
+## them a few at a time, and only the ones inside the visible part of the graph.
+func _refresh_node_previews() -> void:
+	var candidates: Array = []
+	if _all_previews_dirty:
+		_all_previews_dirty = false
+		candidates = _node_previews.keys()
+	else:
+		candidates = _dirty_previews.keys()
+		_dirty_previews.clear()
+	if candidates.is_empty():
+		return
+	for node_id: String in candidates:
+		var entry: Dictionary = _node_previews.get(node_id, {})
+		var frame: Control = entry.get("frame", null)
 		if not is_instance_valid(frame):
 			_node_previews.erase(node_id)
 			continue
 		if not frame.visible:
 			continue
-		_refresh_node_preview(node_id, entry)
+		if not _thumb_queue.has(node_id):
+			_thumb_queue.append(node_id)
 
 
 func _on_connection_request(from_node: StringName, from_port: int, to_node: StringName, to_port: int) -> void:
@@ -1966,6 +2032,7 @@ func _build_animation_section(params: Dictionary) -> void:
 			if _selected_id.is_empty():
 				return
 			_push_undo("%s:anim" % _selected_id)
+			_mark_preview_dirty(_selected_id)
 			if index <= 0 or index > keys.size():
 				params.erase("anim")
 			else:
@@ -2146,6 +2213,7 @@ func _add_option(
 	option.item_selected.connect(
 		func(index: int) -> void:
 			_push_undo("%s:%s" % [_selected_id, key])
+			_mark_preview_dirty(_selected_id)
 			params[key] = index
 			_schedule_preview()
 			# Some options change which controls are shown, like the path shape.
@@ -2251,6 +2319,7 @@ func _open_path_editor(node_id: String) -> void:
 	editor.points_changed.connect(
 		func(new_points: Array) -> void:
 			_push_undo("%s:points" % node_id)
+			_mark_preview_dirty(node_id)
 			params["points"] = new_points
 			_schedule_preview()
 	)
@@ -2385,6 +2454,7 @@ func _add_slider(
 	slider.value_changed.connect(
 		func(new_value: float) -> void:
 			_push_undo("%s:%s" % [_selected_id, key])
+			_mark_preview_dirty(_selected_id)
 			params[key] = new_value
 			display.text = _format_number(new_value, step)
 			_schedule_preview()
@@ -2420,6 +2490,7 @@ func _add_number(
 	spin.value_changed.connect(
 		func(new_value: float) -> void:
 			_push_undo("%s:%s" % [_selected_id, key])
+			_mark_preview_dirty(_selected_id)
 			params[key] = int(new_value)
 			_schedule_preview()
 	)
@@ -2438,6 +2509,7 @@ func _add_check(
 	check.toggled.connect(
 		func(pressed: bool) -> void:
 			_push_undo("%s:%s" % [_selected_id, key])
+			_mark_preview_dirty(_selected_id)
 			params[key] = pressed
 			_schedule_preview()
 			# Some checkboxes change which controls are shown, like the closed path.
@@ -2460,6 +2532,7 @@ func _add_color(label_text: String, value: Color, params: Dictionary, key: Strin
 	picker.color_changed.connect(
 		func(color: Color) -> void:
 			_push_undo("%s:%s" % [_selected_id, key])
+			_mark_preview_dirty(_selected_id)
 			params[key] = color
 			_schedule_preview()
 	)
@@ -2513,7 +2586,7 @@ func _wait_for_preview() -> void:
 
 
 func _refresh_preview() -> void:
-	if not is_instance_valid(_preview):
+	if not is_instance_valid(_preview) or not visible:
 		return
 	if _suspend_preview:
 		_preview_pending = false
@@ -2555,6 +2628,10 @@ func _refresh_preview() -> void:
 		_preview_busy = false
 		return
 	_preview.texture = ImageTexture.create_from_image(image)
+	# A clock or a live source changes every thumbnail; without them only the
+	# branches touched by the edit need a new picture.
+	if graph.uses_time() or graph.uses_source():
+		_all_previews_dirty = true
 	# There is one thumbnail per node, so they are spread over several frames
 	# while playing instead of competing with the main preview.
 	if playing:
@@ -2589,20 +2666,21 @@ func _is_playing() -> bool:
 	return is_instance_valid(_play_timer) and not _play_timer.is_stopped()
 
 
-## Redraws a single visible node thumbnail, taking turns. Spreading them out
-## keeps the animation preview responsive on a phone.
+## Queues one visible thumbnail, taking turns. While the animation plays this is
+## the only thumbnail work, so it never competes with the main preview.
 func _refresh_one_node_preview() -> void:
 	if _node_previews.is_empty():
 		return
 	var ids: Array = _node_previews.keys()
 	for _step in ids.size():
-		_thumbnail_index = (_thumbnail_index + 1) % ids.size()
-		var node_id: String = ids[_thumbnail_index]
+		_thumb_index = (_thumb_index + 1) % ids.size()
+		var node_id: String = ids[_thumb_index]
 		var entry: Dictionary = _node_previews[node_id]
 		var frame: Control = entry["frame"]
 		if not is_instance_valid(frame) or not frame.visible:
 			continue
-		_refresh_node_preview(node_id, entry)
+		if not _thumb_queue.has(node_id):
+			_thumb_queue.append(node_id)
 		return
 
 
