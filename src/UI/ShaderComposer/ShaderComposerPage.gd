@@ -1772,6 +1772,10 @@ func _add_path_editor(params: Dictionary, bezier := false) -> void:
 		editor.set_bezier(stored, bool(params.get("closed", false)))
 	else:
 		editor.set_points(stored, float(params.get("phase", 0.0)))
+	if bezier and bool(params.get("closed", false)):
+		# The editor gives a closed path a tangent across the seam, so the node
+		# takes the repaired handles instead of generating a visible corner.
+		params["points"] = editor.payload()
 	editor.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	editor.custom_minimum_size = Vector2(0, 200)
 	editor.points_changed.connect(

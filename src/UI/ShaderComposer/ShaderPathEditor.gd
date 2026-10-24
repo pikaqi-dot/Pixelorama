@@ -89,6 +89,15 @@ func set_bezier(new_entries: Array, new_closed: bool, new_phase := 0.0) -> void:
 			}
 		)
 	phase = fposmod(new_phase, 1.0)
+	# Closing a path puts the ends next to each other, so an end without a
+	# tangent across the seam shows as a corner. Only the seam handle is
+	# checked, so a shape that was authored open keeps its other handles.
+	if handles and closed and _entries.size() >= 3:
+		var last_index := _entries.size() - 1
+		if (_entries[0]["in"] as Vector2) == Vector2.ZERO:
+			_smooth_vertex(0)
+		if (_entries[last_index]["out"] as Vector2) == Vector2.ZERO:
+			_smooth_vertex(last_index)
 	_reset_drag()
 
 
