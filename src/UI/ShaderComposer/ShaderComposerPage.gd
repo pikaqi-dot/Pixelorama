@@ -100,6 +100,15 @@ var _node_preview: TextureRect
 var _graph_host: Control
 ## Floating window with the output of the whole graph, on top of the graph view.
 var _preview_panel: PanelContainer
+## Area that holds the picture and the backdrop behind it.
+var _preview_frame: Control
+## Backdrop of the picture: solid black, solid white or a checker for transparency.
+var _preview_back: TextureRect
+var _preview_back_choice: OptionButton
+var _preview_backdrop := 0
+var _preview_solid_black: ImageTexture
+var _preview_solid_white: ImageTexture
+var _preview_checker: ImageTexture
 ## Title bar of that window, which is the handle used to move it.
 var _preview_header: Label
 var _preview_dragging := false
@@ -410,24 +419,52 @@ func _build_ui() -> void:
 	var panel_column := VBoxContainer.new()
 	panel_column.add_theme_constant_override("separation", 4)
 	_preview_panel.add_child(panel_column)
+	var preview_header_row := HBoxContainer.new()
+	preview_header_row.add_theme_constant_override("separation", 6)
+	panel_column.add_child(preview_header_row)
 	_preview_header = Label.new()
 	_preview_header.text = "输出预览 ⠿"
 	_preview_header.tooltip_text = "按住这一行拖动预览，点图片放大"
 	_preview_header.mouse_filter = Control.MOUSE_FILTER_STOP
 	_preview_header.mouse_default_cursor_shape = Control.CURSOR_MOVE
 	_preview_header.custom_minimum_size = Vector2(0, 28)
+	_preview_header.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	_preview_header.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
 	_preview_header.add_theme_font_size_override("font_size", 13)
 	_preview_header.gui_input.connect(_on_preview_header_input)
-	panel_column.add_child(_preview_header)
+	preview_header_row.add_child(_preview_header)
+	# The backdrop makes the transparent parts of the output readable, and white
+	# is what the artwork will look like on paper.
+	_preview_back_choice = OptionButton.new()
+	_preview_back_choice.add_item("黑", 0)
+	_preview_back_choice.add_item("白", 1)
+	_preview_back_choice.add_item("透明", 2)
+	_preview_back_choice.select(_preview_backdrop)
+	_preview_back_choice.custom_minimum_size = Vector2(84, 28)
+	_preview_back_choice.add_theme_font_size_override("font_size", 12)
+	_preview_back_choice.tooltip_text = "预览底色"
+	_preview_back_choice.item_selected.connect(_on_preview_backdrop_selected)
+	preview_header_row.add_child(_preview_back_choice)
+	_preview_frame = Control.new()
+	_preview_frame.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	panel_column.add_child(_preview_frame)
+	_preview_back = TextureRect.new()
+	_preview_back.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	_preview_back.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+	_preview_back.stretch_mode = TextureRect.STRETCH_TILE
+	_preview_back.texture_filter = CanvasItem.TEXTURE_FILTER_NEAREST
+	_preview_back.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_preview_frame.add_child(_preview_back)
 	_preview = TextureRect.new()
+	_preview.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
 	_preview.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
 	_preview.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
 	_preview.texture_filter = CanvasItem.TEXTURE_FILTER_NEAREST
 	_preview.mouse_filter = Control.MOUSE_FILTER_STOP
 	_preview.tooltip_text = "输出节点的结果，点一下放大"
 	_preview.gui_input.connect(_on_preview_input)
-	panel_column.add_child(_preview)
+	_preview_frame.add_child(_preview)
+	_apply_preview_backdrop()
 	_graph_host.resized.connect(_fit_preview_panel)
 
 	_side = VBoxContainer.new()
@@ -3606,6 +3643,54 @@ func _preview_box(width: float, max_height: float) -> Vector2:
 	return Vector2(roundf(width), roundf(height))
 
 
+## Backdrop of the floating picture: solid black, solid white, or a checker that
+## shows where the output is transparent.
+func _apply_preview_backdrop() -> void:
+	if not is_instance_valid(_preview_back):
+		return
+	match _preview_backdrop:
+		1:
+			_preview_back.texture = _preview_backdrop_texture(Color(0.93, 0.93, 0.95))
+		2:
+			if _preview_checker == null:
+				_preview_checker = _make_checker_texture()
+			_preview_back.texture = _preview_checker
+		_:
+			_preview_back.texture = _preview_backdrop_texture(Color(0.05, 0.05, 0.06))
+
+
+func _on_preview_backdrop_selected(index: int) -> void:
+	_preview_backdrop = clampi(index, 0, 2)
+	_apply_preview_backdrop()
+
+
+## A one pixel texture repeated over the frame, which is the cheapest way to paint
+## a solid backdrop behind the picture.
+func _preview_backdrop_texture(color: Color) -> ImageTexture:
+	var light := color.r > 0.5
+	var cached := _preview_solid_white if light else _preview_solid_black
+	if cached != null:
+		return cached
+	var image := Image.create_empty(1, 1, false, Image.FORMAT_RGBA8)
+	image.set_pixel(0, 0, color)
+	var texture := ImageTexture.create_from_image(image)
+	if light:
+		_preview_solid_white = texture
+	else:
+		_preview_solid_black = texture
+	return texture
+
+
+## Checkerboard that stands for "transparent", like the one under the canvas.
+func _make_checker_texture() -> ImageTexture:
+	var image := Image.create_empty(16, 16, false, Image.FORMAT_RGBA8)
+	for y in 16:
+		for x in 16:
+			var light := ((x / 8) + (y / 8)) % 2 == 0
+			image.set_pixel(x, y, Color(0.32, 0.32, 0.34) if light else Color(0.2, 0.2, 0.22))
+	return ImageTexture.create_from_image(image)
+
+
 ## Sizes the floating output window to the canvas shape and a corner of the graph
 ## area. It runs again when the graph area changes size, so the window keeps a
 ## sensible size on a phone and on a desktop.
@@ -3615,11 +3700,11 @@ func _fit_preview_panel() -> void:
 	var host := _graph_host.size
 	var box_width := clampf(host.x * 0.34, 96.0, 220.0)
 	var box := _preview_box(box_width, maxf(host.y * 0.45, 80.0))
-	# The image fills the frame, and the frame is the canvas shape plus room for
-	# the title bar, so nothing is squashed and nothing takes room it does not use.
-	if is_instance_valid(_preview):
-		_preview.custom_minimum_size = box
-	_preview_panel.custom_minimum_size = box + Vector2(14.0, 44.0)
+	# The frame is the canvas shape, plus room for the title row, so nothing is
+	# squashed and nothing takes room it does not use.
+	if is_instance_valid(_preview_frame):
+		_preview_frame.custom_minimum_size = box
+	_preview_panel.custom_minimum_size = box + Vector2(14.0, 46.0)
 	_preview_panel.size = _preview_panel.custom_minimum_size
 	if not _preview_placed and host.x >= box.x and host.y >= box.y:
 		_preview_panel.position = Vector2(12, 12)
