@@ -14,6 +14,8 @@ const UNDO_LIMIT := 24
 var _board: Board
 var _undo: Array[Image] = []
 var _dirty := false
+var _brush_slider: HSlider
+var _brush_value: Label
 
 
 func _ready() -> void:
@@ -42,6 +44,34 @@ func _ready() -> void:
 	_board.stroke_started.connect(_remember)
 	_board.stroke_finished.connect(func() -> void: _dirty = true)
 	column.add_child(_board)
+	# Brush size row: the arrows step by exactly one pixel, the slider covers
+	# everything in between.
+	var brush_row := HBoxContainer.new()
+	brush_row.add_theme_constant_override("separation", 6)
+	var brush_label := Label.new()
+	brush_label.text = "画笔"
+	brush_row.add_child(brush_label)
+	brush_row.add_child(
+		_make_button("−", func() -> void: _step_brush(-1.0), "减一像素", Vector2(34, TOUCH_SIZE))
+	)
+	_brush_slider = HSlider.new()
+	_brush_slider.min_value = 1
+	_brush_slider.max_value = 16
+	_brush_slider.step = 1
+	_brush_slider.value = 1
+	_brush_slider.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_brush_slider.custom_minimum_size = Vector2(0, TOUCH_SIZE)
+	_brush_slider.value_changed.connect(_on_brush_size_changed)
+	brush_row.add_child(_brush_slider)
+	brush_row.add_child(
+		_make_button("+", func() -> void: _step_brush(1.0), "加一像素", Vector2(34, TOUCH_SIZE))
+	)
+	_brush_value = Label.new()
+	_brush_value.custom_minimum_size = Vector2(34, 0)
+	_brush_value.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
+	brush_row.add_child(_brush_value)
+	column.add_child(brush_row)
+	_on_brush_size_changed(_brush_slider.value)
 	var hint := Label.new()
 	hint.text = (
 		"只用白色绘制，橡皮擦掉透明度；完成后写回这个节点读取的图层。"
@@ -94,13 +124,34 @@ func _undo_last() -> void:
 	_dirty = true
 
 
-func _make_button(text: String, callback: Callable) -> Button:
+func _make_button(
+	text: String, callback: Callable, tooltip := "", min_size := Vector2(0, TOUCH_SIZE)
+) -> Button:
 	var button := Button.new()
 	button.text = text
-	button.custom_minimum_size = Vector2(0, TOUCH_SIZE)
+	button.tooltip_text = tooltip
+	button.custom_minimum_size = min_size
 	button.add_theme_font_size_override("font_size", 15)
 	button.pressed.connect(callback)
 	return button
+
+
+## Brush size in pixels, shared by the pencil and the eraser.
+func _on_brush_size_changed(value: float) -> void:
+	var size := clampi(int(roundf(value)), 1, 16)
+	if is_instance_valid(_board):
+		_board.brush_size = size
+	if is_instance_valid(_brush_value):
+		_brush_value.text = str(size)
+
+
+## One arrow press moves the brush size by exactly one pixel.
+func _step_brush(direction: float) -> void:
+	if not is_instance_valid(_brush_slider):
+		return
+	var step := maxf(_brush_slider.step, 0.0001)
+	var next := snappedf(_brush_slider.value + step * direction, step)
+	_brush_slider.value = clampf(next, _brush_slider.min_value, _brush_slider.max_value)
 
 
 ## Drawing surface. It keeps the pixel image, scales it up with whole pixels so
@@ -111,6 +162,8 @@ class Board extends Control:
 
 	## 0 pencil, 1 eraser, 2 fill, 3 rectangle, 4 circle.
 	var tool := 0
+	## Side of the square brush the pencil and the eraser stamp, in pixels.
+	var brush_size := 1
 	var image: Image
 	var texture: ImageTexture
 
@@ -125,6 +178,8 @@ class Board extends Control:
 	func _ready() -> void:
 		mouse_filter = Control.MOUSE_FILTER_STOP
 		focus_mode = Control.FOCUS_NONE
+		# Nearest filtering keeps the pixels square instead of smearing them.
+		texture_filter = CanvasItem.TEXTURE_FILTER_NEAREST
 		resized.connect(_layout)
 		_layout()
 
@@ -261,7 +316,12 @@ class Board extends Control:
 
 
 	func _paint(pixel: Vector2i) -> void:
-		_set_pixel(pixel.x, pixel.y, tool == 0)
+		var white := tool == 0
+		var brush := maxi(brush_size, 1)
+		var start := Vector2i(-(brush / 2), -(brush / 2))
+		for offset_y in brush:
+			for offset_x in brush:
+				_set_pixel(pixel.x + start.x + offset_x, pixel.y + start.y + offset_y, white)
 
 
 	func _paint_line(from: Vector2i, to: Vector2i) -> void:

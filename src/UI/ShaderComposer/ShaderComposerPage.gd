@@ -2844,7 +2844,19 @@ func _add_slider(
 	slider.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	slider.size_flags_vertical = Control.SIZE_SHRINK_CENTER
 	slider.custom_minimum_size = Vector2(0, TOUCH_SIZE)
+	# Arrows on both sides step by exactly one step, which is far easier than
+	# trying to hit a precise spot on the track with a finger.
+	row.add_child(
+		_make_button(
+			"−", func() -> void: _step_slider(slider, -1.0), "减一档", Vector2(34, TOUCH_SIZE)
+		)
+	)
 	row.add_child(slider)
+	row.add_child(
+		_make_button(
+			"+", func() -> void: _step_slider(slider, 1.0), "加一档", Vector2(34, TOUCH_SIZE)
+		)
+	)
 	var display := Label.new()
 	display.text = _format_number(value, step)
 	display.custom_minimum_size = Vector2(48, 0)
@@ -2859,6 +2871,14 @@ func _add_slider(
 			_schedule_preview()
 	)
 	_params_target.add_child(row)
+
+
+## One arrow press moves a slider by exactly one step, so a value can be tuned
+## without hitting the track at the right pixel.
+func _step_slider(slider: HSlider, direction: float) -> void:
+	var step := maxf(slider.step, 0.0001)
+	var next := snappedf(slider.value + step * direction, step)
+	slider.value = clampf(next, slider.min_value, slider.max_value)
 
 
 func _add_number(
