@@ -36,19 +36,22 @@ const SOURCE_REFRESH_MSEC := 600
 const HOLD_MENU_MSEC := 500
 ## The path window takes most of the screen, the control points need the room.
 const PATH_POPUP_RATIO := 0.9
-## Side of the thumbnail drawn on a path node, in pixels.
-const PATH_THUMB_SIZE := 72
+## Side of the preview drawn in the frame under every node, in pixels.
+const NODE_PREVIEW_SIZE := 56
 
 var graph: RefCounted
 var _graph_edit: GraphEdit
 var _params_box: VBoxContainer
 var _params_hint: Label
-## The large path window and the node it edits, plus the thumbnails on the path
-## nodes. The editor is only alive while the window is open.
+## The large path window and the node it edits. The editor is only alive while
+## the window is open.
 var _path_popup: PopupPanel
 var _path_popup_node := ""
-var _path_thumbs: Dictionary = {}
 var _path_editor
+## Preview frame, thumbnail and toggle button of every node, by node id.
+var _node_previews: Dictionary = {}
+## Nodes whose preview frame the user folded away. Open is the default.
+var _preview_collapsed: Dictionary = {}
 var _preview: TextureRect
 ## Tapping the small preview opens it at a readable size.
 var _preview_popup: PopupPanel
@@ -390,8 +393,8 @@ func _refresh_graph() -> void:
 				if not group.is_empty():
 					group["position"] = (child as GraphNode).position_offset
 	_graph_edit.clear_connections()
-	# The thumbnails belong to the nodes being rebuilt, so the map starts over.
-	_path_thumbs.clear()
+	# The previews belong to the nodes being rebuilt, so the map starts over.
+	_node_previews.clear()
 	for child in _graph_edit.get_children():
 		if child is GraphNode:
 			_graph_edit.remove_child(child)
@@ -534,9 +537,6 @@ func _make_graph_node(node: Dictionary) -> GraphNode:
 	description.text = ShaderGraphScript.describe(node)
 	description.add_theme_font_size_override("font_size", 12)
 	graph_node.add_child(description)
-	if str(node["type"]) == "path":
-		# A path is easier to recognise from a picture than from its points.
-		graph_node.add_child(_make_path_thumb(node))
 	if input_count >= 2:
 		# Every slot needs its own child, otherwise the second input port does not
 		# exist and connections to it are dropped. The label says what the port
@@ -549,23 +549,95 @@ func _make_graph_node(node: Dictionary) -> GraphNode:
 		second_input.modulate = Color(1.0, 1.0, 1.0, 0.6)
 		second_input.custom_minimum_size = Vector2(0, 14)
 		graph_node.add_child(second_input)
+	# Every node shows what it produces, in a frame that can be folded away.
+	graph_node.add_child(_make_node_preview(node))
 	return graph_node
 
 
-## Thumbnail of a path node. It is drawn from the same rasteriser as the graph,
-## so what the node shows is exactly what the branch produces.
-func _make_path_thumb(node: Dictionary) -> TextureRect:
+## Preview frame of every node, under its ports. It shows the value that node
+## outputs, and its header folds the frame away when the graph gets crowded.
+func _make_node_preview(node: Dictionary) -> Control:
+	var node_id := str(node["id"])
+	var column := VBoxContainer.new()
+	column.add_theme_constant_override("separation", 2)
+	var toggle := Button.new()
+	toggle.text = "▾ 预览"
+	toggle.alignment = HORIZONTAL_ALIGNMENT_LEFT
+	toggle.flat = true
+	toggle.focus_mode = Control.FOCUS_NONE
+	toggle.custom_minimum_size = Vector2(0, 20)
+	toggle.add_theme_font_size_override("font_size", 11)
+	toggle.modulate = Color(1.0, 1.0, 1.0, 0.75)
+	toggle.pressed.connect(func() -> void: _toggle_node_preview(node_id))
+	column.add_child(toggle)
+
+	var frame := PanelContainer.new()
+	var body := MarginContainer.new()
+	for side in ["left", "right", "top", "bottom"]:
+		body.add_theme_constant_override("margin_" + side, 3)
+	frame.add_child(body)
 	var thumb := TextureRect.new()
-	thumb.custom_minimum_size = Vector2(PATH_THUMB_SIZE, PATH_THUMB_SIZE)
+	thumb.custom_minimum_size = Vector2(NODE_PREVIEW_SIZE, NODE_PREVIEW_SIZE)
 	thumb.texture_filter = CanvasItem.TEXTURE_FILTER_NEAREST
 	thumb.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
 	thumb.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
 	thumb.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	body.add_child(thumb)
+	column.add_child(frame)
+
+	var collapsed := bool(_preview_collapsed.get(node_id, false))
+	frame.visible = not collapsed
+	toggle.text = "▸ 预览" if collapsed else "▾ 预览"
+	_node_previews[node_id] = {"frame": frame, "thumb": thumb, "toggle": toggle}
+	if not collapsed:
+		thumb.texture = ImageTexture.create_from_image(
+			graph.preview_node(node_id, Vector2i(NODE_PREVIEW_SIZE, NODE_PREVIEW_SIZE))
+		)
+	return column
+
+
+## Folds the preview of one node away, or brings it back with a fresh picture.
+func _toggle_node_preview(node_id: String) -> void:
+	var entry: Dictionary = _node_previews.get(node_id, {})
+	if entry.is_empty():
+		return
+	var frame: Control = entry["frame"]
+	if not is_instance_valid(frame):
+		return
+	var show := not frame.visible
+	frame.visible = show
+	_preview_collapsed[node_id] = not show
+	var toggle: Button = entry["toggle"]
+	if is_instance_valid(toggle):
+		toggle.text = "▾ 预览" if show else "▸ 预览"
+	if show:
+		_refresh_node_preview(node_id, entry)
+
+
+## Redraws the preview of one node.
+func _refresh_node_preview(node_id: String, entry: Dictionary) -> void:
+	var thumb: TextureRect = entry["thumb"]
+	if not is_instance_valid(thumb) or graph.get_node_by_id(node_id).is_empty():
+		return
 	thumb.texture = ImageTexture.create_from_image(
-		graph.rasterise_path(node["params"], Vector2i(PATH_THUMB_SIZE, PATH_THUMB_SIZE))
+		graph.preview_node(node_id, Vector2i(NODE_PREVIEW_SIZE, NODE_PREVIEW_SIZE))
 	)
-	_path_thumbs[str(node["id"])] = thumb
-	return thumb
+
+
+## Keeps every open preview in step with the graph. Folded ones are skipped, so a
+## crowded graph does not pay for pictures nobody sees.
+func _refresh_node_previews() -> void:
+	if _node_previews.is_empty():
+		return
+	for node_id: String in _node_previews.keys():
+		var entry: Dictionary = _node_previews[node_id]
+		var frame: Control = entry["frame"]
+		if not is_instance_valid(frame):
+			_node_previews.erase(node_id)
+			continue
+		if not frame.visible:
+			continue
+		_refresh_node_preview(node_id, entry)
 
 
 func _on_connection_request(from_node: StringName, from_port: int, to_node: StringName, to_port: int) -> void:
@@ -1927,7 +1999,6 @@ func _open_path_editor(node_id: String) -> void:
 		func(new_points: Array) -> void:
 			_push_undo("%s:points" % node_id)
 			params["points"] = new_points
-			_refresh_all_path_thumbs()
 			_schedule_preview()
 	)
 
@@ -1961,23 +2032,6 @@ func _close_path_editor() -> void:
 		_path_popup.hide()
 	_path_popup_node = ""
 	_path_editor = null
-
-
-## Keeps the thumbnails on the path nodes in step with the control points.
-func _refresh_all_path_thumbs() -> void:
-	if _path_thumbs.is_empty():
-		return
-	for node_id: String in _path_thumbs.keys():
-		var thumb: TextureRect = _path_thumbs[node_id]
-		if not is_instance_valid(thumb):
-			_path_thumbs.erase(node_id)
-			continue
-		var node: Dictionary = graph.get_node_by_id(node_id)
-		if node.is_empty():
-			continue
-		thumb.texture = ImageTexture.create_from_image(
-			graph.rasterise_path(node["params"], Vector2i(PATH_THUMB_SIZE, PATH_THUMB_SIZE))
-		)
 
 
 func _add_slider(
@@ -2145,7 +2199,7 @@ func _refresh_preview() -> void:
 		_path_editor.set_phase(graph.time)
 	var image: Image = graph.generate(preview_size)
 	_preview.texture = ImageTexture.create_from_image(image)
-	_refresh_all_path_thumbs()
+	_refresh_node_previews()
 	if is_instance_valid(_preview_big) and _preview_popup.visible:
 		_preview_big.texture = _preview.texture
 	# A graph that reads the artwork keeps following it while the user draws.

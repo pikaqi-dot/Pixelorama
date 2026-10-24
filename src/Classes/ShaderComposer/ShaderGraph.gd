@@ -1568,6 +1568,18 @@ static func _bezier_point(
 	)
 
 
+## Grayscale preview of what one node outputs, used by the frame under the nodes
+## in the graph editor. It evaluates the node the same way the generator does, so
+## the picture always matches that branch of the graph.
+func preview_node(node_id: String, size: Vector2i) -> Image:
+	var image := Image.create_empty(size.x, size.y, false, Image.FORMAT_RGBA8)
+	for y in size.y:
+		for x in size.x:
+			var value := clampf(_eval(node_id, Vector2(x, y), size, 0), 0.0, 1.0)
+			image.set_pixel(x, y, Color(value, value, value, 1.0))
+	return image
+
+
 ## Rasterises the stroke of a path node at [param size] and caches it, so the
 ## per pixel evaluation is just a lookup.
 func _path_image(node: Dictionary, size: Vector2i) -> Image:
