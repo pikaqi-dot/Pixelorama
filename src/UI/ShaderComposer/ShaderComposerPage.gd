@@ -7,6 +7,7 @@ extends Panel
 
 const ShaderGraphScript := preload("res://src/Classes/ShaderComposer/ShaderGraph.gd")
 const ShaderPathEditorScript := preload("res://src/UI/ShaderComposer/ShaderPathEditor.gd")
+const ShaderValueChangerScript := preload("res://src/UI/ShaderComposer/ShaderValueChanger.gd")
 
 const PORT_COLOR := Color(0.55, 0.8, 1.0)
 const PREVIEW_LIMIT := 256
@@ -105,6 +106,11 @@ var _param_sections: Array[Dictionary] = []
 ## built from this, so every slider and number can be animated without a hand
 ## written list per node type.
 var _animatable: Dictionary = {}
+## Touch screens change numbers by dragging; a keyboard would cover the panel.
+## A phone browser reports itself as web_mobile, not as a mobile platform.
+var _drag_numbers := (
+	OS.has_feature("mobile") or OS.has_feature("web_android") or OS.has_feature("web_ios")
+)
 ## Long press on a node opens a context menu.
 var _node_menu: PopupMenu
 var _hold_id := ""
@@ -127,7 +133,7 @@ var _can_draw_before := true
 ## Animation phase shown in the preview, and how many frames a dynamic graph
 ## generates.
 var _phase: HSlider
-var _frame_count: SpinBox
+var _frame_count: Control
 ## Playback of the preview, and the layer being edited (when reopened from one).
 var _play_timer: Timer
 var _play_button: Button
@@ -185,8 +191,7 @@ func open_page(layer: BaseLayer = null) -> void:
 	_editing_layer = layer
 	if layer != null and layer.has_meta("shader_graph"):
 		graph.from_dict(layer.get_meta("shader_graph"))
-		if is_instance_valid(_frame_count):
-			_frame_count.value = int(layer.get_meta("shader_frames", _frame_count.value))
+		_set_frame_count_value(int(layer.get_meta("shader_frames", _frame_count_value())))
 		_selected_id = ""
 		_show_params("")
 		_refresh_graph()
@@ -283,14 +288,7 @@ func _build_ui() -> void:
 	toolbar.add_child(_preset_menu)
 	_play_button = _make_button("▶", _on_play_pressed, "循环播放预览")
 	toolbar.add_child(_play_button)
-	_frame_count = SpinBox.new()
-	_frame_count.min_value = 1
-	_frame_count.max_value = 60
-	_frame_count.step = 1
-	_frame_count.value = 8
-	_frame_count.tooltip_text = "生成多少帧"
-	_frame_count.custom_minimum_size = Vector2(78, TOUCH_SIZE)
-	_frame_count.add_theme_font_size_override("font_size", TOUCH_FONT_SIZE)
+	_frame_count = _make_frame_count_control()
 	toolbar.add_child(_frame_count)
 	_status = Label.new()
 	_status.size_flags_horizontal = Control.SIZE_EXPAND_FILL
@@ -1099,7 +1097,7 @@ func _export_scene_now() -> void:
 	var scene_path := folder.path_join("shader_graph.tscn")
 	var project := Global.current_project
 	var image_size: Vector2i = project.size if project != null else Vector2i(64, 64)
-	var frames := maxi(int(_frame_count.value) if is_instance_valid(_frame_count) else 1, 1)
+	var frames := _frame_count_value()
 	var script_file := FileAccess.open(script_path, FileAccess.WRITE)
 	if script_file == null:
 		Global.notification_label("无法写入 %s" % script_path)
@@ -2681,25 +2679,33 @@ func _add_number(
 	label.custom_minimum_size = Vector2(84, 0)
 	label.add_theme_font_size_override("font_size", 14)
 	row.add_child(label)
-	var spin := SpinBox.new()
-	spin.min_value = min_value
-	spin.max_value = max_value
-	spin.step = step
-	spin.value = value
-	spin.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	spin.custom_minimum_size = Vector2(0, TOUCH_SIZE)
-	spin.add_theme_font_size_override("font_size", TOUCH_FONT_SIZE)
-	spin.value_changed.connect(
-		func(new_value: float) -> void:
-			_push_undo("%s:%s" % [_selected_id, key])
-			_mark_preview_dirty(_selected_id)
-			params[key] = int(new_value)
-			_schedule_preview()
-			# The crop numbers change the source preview drawn under them.
-			if rebuild and not _selected_id.is_empty():
-				call_deferred("_show_params", _selected_id)
-	)
-	row.add_child(spin)
+	var apply := func(new_value: float) -> void:
+		_push_undo("%s:%s" % [_selected_id, key])
+		_mark_preview_dirty(_selected_id)
+		params[key] = int(new_value)
+		_schedule_preview()
+		# The crop numbers change the source preview drawn under them.
+		if rebuild and not _selected_id.is_empty():
+			call_deferred("_show_params", _selected_id)
+	if _drag_numbers:
+		# A drag strip instead of a text field, so the keyboard never covers the
+		# parameter panel on a phone.
+		var changer := ShaderValueChangerScript.new()
+		changer.set_range(min_value, max_value, step, true, value)
+		changer.custom_minimum_size = Vector2(0, TOUCH_SIZE)
+		changer.value_changed.connect(apply)
+		row.add_child(changer)
+	else:
+		var spin := SpinBox.new()
+		spin.min_value = min_value
+		spin.max_value = max_value
+		spin.step = step
+		spin.value = value
+		spin.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		spin.custom_minimum_size = Vector2(0, TOUCH_SIZE)
+		spin.add_theme_font_size_override("font_size", TOUCH_FONT_SIZE)
+		spin.value_changed.connect(apply)
+		row.add_child(spin)
 	_params_target.add_child(row)
 
 
@@ -2905,7 +2911,7 @@ func _on_play_pressed() -> void:
 
 
 func _advance_playback() -> void:
-	var frames := maxi(int(_frame_count.value) if is_instance_valid(_frame_count) else 1, 1)
+	var frames := _frame_count_value()
 	_playhead = fmod(_playhead + 1.0 / float(frames), 1.0)
 	if is_instance_valid(_phase):
 		_phase.set_value_no_signal(_playhead)
@@ -3001,7 +3007,7 @@ func _on_add_layer_now() -> void:
 	var project := Global.current_project
 	if project == null:
 		return
-	var frames := maxi(int(_frame_count.value) if is_instance_valid(_frame_count) else 1, 1)
+	var frames := _frame_count_value()
 	# A big animated graph takes a moment, so show what is going on first.
 	if is_instance_valid(_status):
 		_status.text = "正在生成 %d 帧…" % frames
@@ -3050,6 +3056,40 @@ static func _update_shader_layer(project: Project, layer_index: int, images: Arr
 	project.undo_redo.add_do_method(Global.undo_or_redo.bind(false))
 	project.undo_redo.add_undo_method(Global.undo_or_redo.bind(true))
 	project.undo_redo.commit_action()
+
+
+## The frame count is a spin box on desktop and a drag strip on a touch screen,
+## where the keyboard would cover the preview.
+func _make_frame_count_control() -> Control:
+	var current := 8
+	if _drag_numbers:
+		var changer := ShaderValueChangerScript.new()
+		changer.suffix = " 帧"
+		changer.set_range(1, 60, 1, true, current)
+		changer.custom_minimum_size = Vector2(96, TOUCH_SIZE)
+		changer.tooltip_text = "生成多少帧，左右滑动调整"
+		return changer
+	var spin := SpinBox.new()
+	spin.min_value = 1
+	spin.max_value = 60
+	spin.step = 1
+	spin.value = current
+	spin.tooltip_text = "生成多少帧"
+	spin.custom_minimum_size = Vector2(78, TOUCH_SIZE)
+	spin.add_theme_font_size_override("font_size", TOUCH_FONT_SIZE)
+	return spin
+
+
+## Reads the frame count from whichever control the toolbar has.
+func _frame_count_value() -> int:
+	if not is_instance_valid(_frame_count):
+		return 1
+	return maxi(int(_frame_count.get("value")), 1)
+
+
+func _set_frame_count_value(frames: int) -> void:
+	if is_instance_valid(_frame_count):
+		_frame_count.set("value", frames)
 
 
 ## Builds the cel image of the project. Indexed projects map colours to the
