@@ -15,7 +15,17 @@ const NODE_TYPES := {
 	"constant": {"label": "Constant", "inputs": 0},
 	"time": {"label": "Time", "inputs": 0},
 	"wave": {"label": "Wave", "inputs": 1},
+	# Transform group. They all move the sampling position, so they can be
+	# chained and applied to any branch of the graph.
 	"transform": {"label": "Transform", "inputs": 1},
+	"scale": {"label": "Scale", "inputs": 1},
+	"flip": {"label": "Flip", "inputs": 1},
+	"skew": {"label": "Skew", "inputs": 1},
+	"tile": {"label": "Tile", "inputs": 1},
+	"polar": {"label": "Polar", "inputs": 1},
+	"crop": {"label": "Crop", "inputs": 1},
+	"padding": {"label": "Padding", "inputs": 1},
+	"echo": {"label": "Echo", "inputs": 1},
 	"warp": {"label": "Warp", "inputs": 2},
 	"math": {"label": "Math", "inputs": 1},
 	"blend": {"label": "Blend", "inputs": 2},
@@ -34,6 +44,8 @@ const MATH_OPS := [
 	"Add", "Subtract", "Multiply", "Min", "Max", "Step", "Posterize", "Invert", "Sine"
 ]
 const BLEND_OPS := ["Mix", "Add", "Multiply", "Screen", "Difference"]
+const POLAR_MODES := ["矩形 → 极坐标", "极坐标 → 矩形"]
+const ECHO_MODES := ["最大值（拖影）", "平均值（残影）"]
 ## Coordinates closer than this to a pixel are treated as that pixel. Only used to
 ## cancel the floating point noise of rotations by right angles.
 const SNAP_STEP := 0.000001
@@ -228,6 +240,22 @@ static func default_params(type: String) -> Dictionary:
 				"offset_y": 0.0,
 				"tile": false,
 			}
+		"scale":
+			return {"scale_x": 1.0, "scale_y": 1.0, "tile": false}
+		"flip":
+			return {"horizontal": false, "vertical": false}
+		"skew":
+			return {"angle_x": 0.0, "angle_y": 0.0}
+		"tile":
+			return {"count_x": 2.0, "count_y": 2.0, "offset_x": 0.0, "offset_y": 0.0}
+		"polar":
+			return {"mode": 0, "repeat": 2.0, "twist": 0.0}
+		"crop":
+			return {"left": 0.0, "top": 0.0, "right": 1.0, "bottom": 1.0}
+		"padding":
+			return {"amount": 0.15}
+		"echo":
+			return {"count": 4, "angle": 90.0, "distance": 0.2, "mode": 0}
 		"warp":
 			return {"amount": 0.15}
 		"math":
@@ -342,6 +370,100 @@ func _eval(node_id: String, uv: Vector2, size: Vector2i, depth: int) -> float:
 			if bool(params.get("tile", false)):
 				mapped = Vector2(fposmod(mapped.x, size_vec.x), fposmod(mapped.y, size_vec.y))
 			return clampf(_eval(_input_id(node, 0), mapped, size, depth + 1), 0.0, 1.0)
+		"scale":
+			# Separate axes, and a negative factor mirrors that axis.
+			var scale_mapped := Vector2(
+				_scale_axis(uv.x, size_vec.x, float(params["scale_x"])),
+				_scale_axis(uv.y, size_vec.y, float(params["scale_y"]))
+			)
+			var scale_wrap := bool(params.get("tile", false))
+			return _sample(node, 0, scale_mapped, size, depth, scale_wrap, scale_wrap)
+		"flip":
+			var flip_mapped := uv
+			if bool(params["horizontal"]):
+				flip_mapped.x = size_vec.x - 1.0 - flip_mapped.x
+			if bool(params["vertical"]):
+				flip_mapped.y = size_vec.y - 1.0 - flip_mapped.y
+			return clampf(_eval(_input_id(node, 0), flip_mapped, size, depth + 1), 0.0, 1.0)
+		"skew":
+			# Shearing around the centre, so the content stays roughly in place.
+			var skew_pivot := size_vec * 0.5
+			var shear := Vector2(
+				tan(deg_to_rad(clampf(float(params["angle_x"]), -80.0, 80.0))),
+				tan(deg_to_rad(clampf(float(params["angle_y"]), -80.0, 80.0)))
+			)
+			var skew_delta := uv - skew_pivot
+			var skew_mapped := Vector2(
+				uv.x + skew_delta.y * shear.x, uv.y + skew_delta.x * shear.y
+			)
+			return _sample(
+				node, 0, skew_mapped.snapped(Vector2(SNAP_STEP, SNAP_STEP)), size, depth
+			)
+		"tile":
+			var tile_count := Vector2(
+				maxf(float(params["count_x"]), 1.0), maxf(float(params["count_y"]), 1.0)
+			)
+			var tile_shift := (
+				Vector2(float(params["offset_x"]), float(params["offset_y"])) * size_vec
+			)
+			return _sample(node, 0, uv * tile_count + tile_shift, size, depth, true, true)
+		"polar":
+			var polar_repeat := maxf(float(params["repeat"]), 1.0)
+			var polar_twist := float(params.get("twist", 0.0))
+			var polar_half := minf(size_vec.x, size_vec.y) * 0.5
+			if int(params["mode"]) == 0:
+				# Rectangle to polar: the angle becomes the X axis, the radius the Y.
+				var polar_delta := uv - size_vec * 0.5
+				var polar_angle := atan2(polar_delta.y, polar_delta.x) / TAU + 0.5 + polar_twist
+				var polar_radius := polar_delta.length() / maxf(polar_half, 0.001)
+				var polar_mapped := Vector2(
+					polar_angle * polar_repeat * size_vec.x, polar_radius * size_vec.y
+				)
+				return _sample(node, 0, polar_mapped, size, depth, true, false)
+			# Polar to rectangle: X is the angle again and Y the distance to the centre.
+			var unwrap_angle := (uv.x / size_vec.x) * TAU * polar_repeat + polar_twist * TAU
+			var unwrap_radius := (uv.y / size_vec.y) * polar_half
+			var unwrap_mapped := (
+				size_vec * 0.5
+				+ Vector2(cos(unwrap_angle), sin(unwrap_angle)) * unwrap_radius
+			)
+			return _sample(node, 0, unwrap_mapped, size, depth)
+		"crop":
+			# Everything outside the rectangle is empty, which frames the branch.
+			var crop_left := float(params["left"]) * size_vec.x
+			var crop_top := float(params["top"]) * size_vec.y
+			var crop_right := float(params["right"]) * size_vec.x
+			var crop_bottom := float(params["bottom"]) * size_vec.y
+			if (
+				uv.x < crop_left
+				or uv.x >= crop_right
+				or uv.y < crop_top
+				or uv.y >= crop_bottom
+			):
+				return 0.0
+			return clampf(_eval(_input_id(node, 0), uv, size, depth + 1), 0.0, 1.0)
+		"padding":
+			# Squeezes the branch inwards, leaving an empty margin around it.
+			var pad_amount := clampf(float(params["amount"]), 0.0, 0.49)
+			var pad_scale := maxf(1.0 - pad_amount * 2.0, 0.02)
+			var pad_mapped := (uv - size_vec * 0.5) / pad_scale + size_vec * 0.5
+			return _sample(node, 0, pad_mapped, size, depth)
+		"echo":
+			# Samples the branch several times along a direction, which smears a
+			# moving pattern into a trail.
+			var echo_count := clampi(int(params["count"]), 1, 12)
+			var echo_direction := Vector2.from_angle(deg_to_rad(float(params["angle"])))
+			var echo_step := echo_direction * float(params["distance"]) * size_vec.y
+			var echo_best := 0.0
+			var echo_total := 0.0
+			for i in echo_count:
+				var echo_weight := float(i) / float(maxi(echo_count - 1, 1))
+				var echo_value := _sample(node, 0, uv + echo_step * echo_weight, size, depth)
+				echo_best = maxf(echo_best, echo_value)
+				echo_total += echo_value
+			if int(params["mode"]) == 0:
+				return echo_best
+			return clampf(echo_total / float(echo_count), 0.0, 1.0)
 		"warp":
 			# The first input is the field, the second one the image being distorted.
 			var amount := float(params.get("amount", 0.15)) * size_vec.y
@@ -374,6 +496,43 @@ func _eval(node_id: String, uv: Vector2, size: Vector2i, depth: int) -> float:
 		"output":
 			return clampf(_eval(_input_id(node, 0), uv, size, depth + 1), 0.0, 1.0)
 	return 0.0
+
+
+## Evaluates input [param slot] of [param node] at [param uv]. Axes that are not
+## wrapped are empty outside the canvas, which is what the compositing nodes need.
+func _sample(
+	node: Dictionary,
+	slot: int,
+	uv: Vector2,
+	size: Vector2i,
+	depth: int,
+	wrap_x := false,
+	wrap_y := false
+) -> float:
+	var sampled := uv
+	if wrap_x:
+		sampled.x = fposmod(sampled.x, float(size.x))
+	elif sampled.x < 0.0 or sampled.x >= float(size.x):
+		return 0.0
+	if wrap_y:
+		sampled.y = fposmod(sampled.y, float(size.y))
+	elif sampled.y < 0.0 or sampled.y >= float(size.y):
+		return 0.0
+	return clampf(_eval(_input_id(node, slot), sampled, size, depth + 1), 0.0, 1.0)
+
+
+## Maps a coordinate around the middle of its axis, so scaling keeps the content
+## centred. A negative factor mirrors the axis, using the pixel grid rather than
+## the axis length so the result never falls outside the canvas.
+static func _scale_axis(value: float, extent: float, factor: float) -> float:
+	var scale := factor
+	var source := value
+	if scale < 0.0:
+		source = extent - 1.0 - source
+		scale = -scale
+	if scale < 0.01:
+		scale = 0.01
+	return (source - extent * 0.5) / scale + extent * 0.5
 
 
 func _math_value(op: int, source: float, params: Dictionary) -> float:
@@ -448,6 +607,31 @@ static func describe(node: Dictionary) -> String:
 			return "%.1f 周期 · %d°" % [float(params["frequency"]), int(params["angle"])]
 		"transform":
 			return "×%.2f · %d°" % [float(params["scale"]), int(params["angle"])]
+		"scale":
+			return "×%.2f · %.2f" % [float(params["scale_x"]), float(params["scale_y"])]
+		"flip":
+			var flips: Array[String] = []
+			if bool(params["horizontal"]):
+				flips.append("H")
+			if bool(params["vertical"]):
+				flips.append("V")
+			return "-".join(flips) if not flips.is_empty() else "—"
+		"skew":
+			return "%d° / %d°" % [int(params["angle_x"]), int(params["angle_y"])]
+		"tile":
+			return "%d×%d" % [int(params["count_x"]), int(params["count_y"])]
+		"polar":
+			return POLAR_MODES[int(params["mode"])]
+		"crop":
+			return "%d%%…%d%%" % [
+				int(float(params["left"]) * 100.0), int(float(params["right"]) * 100.0)
+			]
+		"padding":
+			return "%d%%" % int(float(params["amount"]) * 200.0)
+		"echo":
+			return "%d · %s" % [
+				int(params["count"]), "Max" if int(params["mode"]) == 0 else "Avg"
+			]
 		"warp":
 			return "%.2f" % float(params.get("amount", 0.15))
 		"math":

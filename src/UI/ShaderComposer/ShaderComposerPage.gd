@@ -429,6 +429,47 @@ func _show_params(id: String) -> void:
 			_add_slider("偏移 X", -1.0, 1.0, 0.01, float(params["offset_x"]), params, "offset_x")
 			_add_slider("偏移 Y", -1.0, 1.0, 0.01, float(params["offset_y"]), params, "offset_y")
 			_add_check("平铺", bool(params.get("tile", false)), params, "tile")
+		"scale":
+			_add_slider("X 缩放", -4.0, 4.0, 0.05, float(params["scale_x"]), params, "scale_x")
+			_add_slider("Y 缩放", -4.0, 4.0, 0.05, float(params["scale_y"]), params, "scale_y")
+			_add_check("平铺", bool(params.get("tile", false)), params, "tile")
+		"flip":
+			_add_check("水平翻转", bool(params["horizontal"]), params, "horizontal")
+			_add_check("垂直翻转", bool(params["vertical"]), params, "vertical")
+		"skew":
+			_add_slider("X 倾斜", -80.0, 80.0, 1.0, float(params["angle_x"]), params, "angle_x")
+			_add_slider("Y 倾斜", -80.0, 80.0, 1.0, float(params["angle_y"]), params, "angle_y")
+		"tile":
+			_add_slider("横向次数", 1.0, 8.0, 1.0, float(params["count_x"]), params, "count_x")
+			_add_slider("纵向次数", 1.0, 8.0, 1.0, float(params["count_y"]), params, "count_y")
+			_add_slider("偏移 X", -1.0, 1.0, 0.01, float(params["offset_x"]), params, "offset_x")
+			_add_slider("偏移 Y", -1.0, 1.0, 0.01, float(params["offset_y"]), params, "offset_y")
+		"polar":
+			_add_option("方向", ShaderGraphScript.POLAR_MODES, int(params["mode"]), params, "mode")
+			_add_slider("重复", 1.0, 8.0, 1.0, float(params["repeat"]), params, "repeat")
+			_add_slider("旋转", -1.0, 1.0, 0.01, float(params.get("twist", 0.0)), params, "twist")
+		"crop":
+			var crop_hint := Label.new()
+			crop_hint.text = "按画布比例裁剪，框外变空。左 < 右、上 < 下 才会出内容。"
+			crop_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+			crop_hint.add_theme_font_size_override("font_size", 13)
+			_params_box.add_child(crop_hint)
+			_add_slider("左", 0.0, 1.0, 0.01, float(params["left"]), params, "left")
+			_add_slider("上", 0.0, 1.0, 0.01, float(params["top"]), params, "top")
+			_add_slider("右", 0.0, 1.0, 0.01, float(params["right"]), params, "right")
+			_add_slider("下", 0.0, 1.0, 0.01, float(params["bottom"]), params, "bottom")
+		"padding":
+			_add_slider("边距", 0.0, 0.49, 0.01, float(params["amount"]), params, "amount")
+		"echo":
+			var echo_hint := Label.new()
+			echo_hint.text = "沿一个方向重复采样。最大值留下拖影，平均值得到残影。"
+			echo_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+			echo_hint.add_theme_font_size_override("font_size", 13)
+			_params_box.add_child(echo_hint)
+			_add_slider("采样数", 1.0, 12.0, 1.0, float(params["count"]), params, "count")
+			_add_option("合并", ShaderGraphScript.ECHO_MODES, int(params["mode"]), params, "mode")
+			_add_slider("角度", 0.0, 360.0, 1.0, float(params["angle"]), params, "angle")
+			_add_slider("距离", 0.0, 1.0, 0.01, float(params["distance"]), params, "distance")
 		"warp":
 			var warp_hint := Label.new()
 			warp_hint.text = "输入 1 是扰动场，输入 2 是被扭曲的图案。"
