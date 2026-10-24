@@ -16,6 +16,7 @@ var _undo: Array[Image] = []
 var _dirty := false
 var _brush_slider: HSlider
 var _brush_value: Label
+var _status: Label
 
 
 func _ready() -> void:
@@ -28,15 +29,28 @@ func _ready() -> void:
 	toolbar.add_theme_constant_override("h_separation", 6)
 	toolbar.add_theme_constant_override("v_separation", 6)
 	column.add_child(toolbar)
+	# `toggled` is used instead of `pressed`, because a group button that is
+	# already selected does not emit `pressed`, and the tool must follow what the
+	# button shows.
 	var group := ButtonGroup.new()
 	for index in TOOLS.size():
 		var tool_index := index
-		var button := _make_button(TOOLS[index], func() -> void: _board.tool = tool_index)
+		var button := _make_button(TOOLS[index], Callable())
 		button.toggle_mode = true
 		button.button_group = group
+		button.toggled.connect(
+			func(on: bool) -> void:
+				if not on or not is_instance_valid(_board):
+					return
+				_board.tool = tool_index
+				_update_status()
+		)
 		button.button_pressed = tool_index == 0
 		toolbar.add_child(button)
 	toolbar.add_child(_make_button("撤销", _undo_last))
+	_status = Label.new()
+	_status.add_theme_font_size_override("font_size", 13)
+	column.add_child(_status)
 	_board = Board.new()
 	_board.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	_board.size_flags_vertical = Control.SIZE_EXPAND_FILL
@@ -132,7 +146,8 @@ func _make_button(
 	button.tooltip_text = tooltip
 	button.custom_minimum_size = min_size
 	button.add_theme_font_size_override("font_size", 15)
-	button.pressed.connect(callback)
+	if callback.is_valid():
+		button.pressed.connect(callback)
 	return button
 
 
@@ -143,6 +158,16 @@ func _on_brush_size_changed(value: float) -> void:
 		_board.brush_size = size
 	if is_instance_valid(_brush_value):
 		_brush_value.text = str(size)
+	_update_status()
+
+
+## Shows the active tool and brush, so it is obvious which one is drawing.
+func _update_status() -> void:
+	if not is_instance_valid(_status) or not is_instance_valid(_board):
+		return
+	_status.text = "工具：%s · 笔刷 %d px" % [
+		TOOLS[clampi(_board.tool, 0, TOOLS.size() - 1)], _board.brush_size
+	]
 
 
 ## One arrow press moves the brush size by exactly one pixel.
@@ -351,16 +376,9 @@ class Board extends Control:
 
 	func _refresh() -> void:
 		if image != null:
-			# Updating the texture in place avoids allocating one per pointer
-			# event, which is what makes a fast stroke on a phone feel chopped.
-			if (
-				texture == null
-				or texture.get_width() != image.get_width()
-				or texture.get_height() != image.get_height()
-			):
-				texture = ImageTexture.create_from_image(image)
-			else:
-				texture.update(image)
+			# A fresh texture per change is the reliable path: updating an existing
+			# one in place can leave stale pixels on some renderers.
+			texture = ImageTexture.create_from_image(image)
 		queue_redraw()
 
 
