@@ -57,6 +57,9 @@ const GRAPH_SOURCE := "res://src/Classes/ShaderComposer/ShaderGraph.gd"
 const SOURCE_REFRESH_MSEC := 600
 ## How long a press on a node has to last to open the context menu.
 const HOLD_MENU_MSEC := 500
+## Finger travel that turns a hold into a drag, which cancels the menu. A
+## touchscreen wobbles by a few pixels, so this is larger than a mouse would need.
+const HOLD_MENU_MOVE := 20.0
 ## The path window takes most of the screen, the control points need the room.
 const PATH_POPUP_RATIO := 0.9
 ## Smallest height of the control point canvas. When the screen is shorter than
@@ -138,9 +141,15 @@ var _drag_numbers := (
 ## Long press on a node opens a context menu.
 var _node_menu: PopupMenu
 var _hold_id := ""
-var _hold_start := 0
 var _hold_position := Vector2.ZERO
 var _hold_moved := false
+## True once the press lasted long enough, waiting for the release to open.
+var _hold_ready := false
+## Node the open context menu belongs to. It outlives the release, which is why
+## the menu items still know what they act on.
+var _menu_node_id := ""
+## Runs while a node is pressed, so the hold is measured without the release.
+var _hold_timer: Timer
 ## Saved graph presets, and the small dialog used to name them.
 var _preset_menu: MenuButton
 ## Secondary actions, so the toolbar stays short on a phone.
@@ -442,7 +451,15 @@ func _build_ui() -> void:
 	_node_menu.add_item("编辑路径…", 4)
 	_node_menu.add_item("旁路此节点", 5)
 	_node_menu.id_pressed.connect(_on_node_menu_pressed)
+	_node_menu.popup_hide.connect(_on_node_menu_hidden)
 	add_child(_node_menu)
+	# Measures the press while the finger is down, so a dropped release event
+	# cannot make the long press miss.
+	_hold_timer = Timer.new()
+	_hold_timer.one_shot = true
+	_hold_timer.wait_time = float(HOLD_MENU_MSEC) / 1000.0
+	_hold_timer.timeout.connect(_on_hold_timeout)
+	add_child(_hold_timer)
 
 	# Scrubbing the phase is how a dynamic graph is previewed frame by frame.
 	var phase_row := HBoxContainer.new()
@@ -2300,9 +2317,11 @@ func _section_of(box: Node) -> Variant:
 ## Long press on a node opens this menu. It is the touch friendly version of
 ## right click, which a phone does not have.
 func _on_node_menu_pressed(id: int) -> void:
-	if _hold_id.is_empty() or graph.get_node_by_id(_hold_id).is_empty():
+	var target := _menu_node_id if not _menu_node_id.is_empty() else _hold_id
+	if target.is_empty() or graph.get_node_by_id(target).is_empty():
 		return
-	_selected_id = _hold_id
+	_hold_id = target
+	_selected_id = target
 	match id:
 		0:
 			_on_copy_pressed()
@@ -2320,47 +2339,94 @@ func _on_node_menu_pressed(id: int) -> void:
 			_toggle_bypass(_hold_id)
 
 
-## Tracks press and release on a node, so a hold of half a second (without
-## dragging) opens the context menu while a tap only selects.
+## Tracks press and release on a node. The hold is measured by a timer that runs
+## while the finger is down, so the decision no longer depends on when the release
+## happens to arrive. A right click opens the menu at once, which is also what
+## Android sends when a finger rests on the screen.
 func _on_graph_node_input(event: InputEvent, node_id: String) -> void:
 	if event is InputEventMouseButton:
 		var button := event as InputEventMouseButton
+		if button.button_index == MOUSE_BUTTON_RIGHT:
+			if button.pressed:
+				_prepare_node_menu(node_id)
+				_open_node_menu(node_id, button.global_position)
+			return
 		if button.button_index != MOUSE_BUTTON_LEFT:
 			return
 		if button.pressed:
+			_prepare_node_menu(node_id)
 			_hold_id = node_id
-			_hold_start = Time.get_ticks_msec()
 			_hold_position = button.global_position
 			_hold_moved = false
-			# The path entry only makes sense for a node that owns control points.
-			var node: Dictionary = graph.get_node_by_id(node_id)
-			var editable := str(node.get("type", "")) == "path"
-			if str(node.get("type", "")) == "follow_path":
-				editable = (
-					int((node["params"] as Dictionary).get("shape", 0))
-					== ShaderGraphScript.PATH_CUSTOM
-				)
-			_node_menu.set_item_disabled(4, not editable)
-			# A node without inputs has nothing to pass through, so it cannot be
-			# bypassed; for the others the entry says what tapping it would do.
-			var has_input := false
-			var node_type := str(node.get("type", ""))
-			if ShaderGraphScript.NODE_TYPES.has(node_type):
-				has_input = int(ShaderGraphScript.NODE_TYPES[node_type]["inputs"]) >= 1
-			_node_menu.set_item_disabled(5, not has_input)
-			_node_menu.set_item_text(
-				5, "启用此节点" if bool(node.get("bypass", false)) else "旁路此节点"
-			)
+			_hold_ready = false
+			if is_instance_valid(_hold_timer):
+				_hold_timer.start()
 			return
-		var held := Time.get_ticks_msec() - _hold_start
-		if _hold_id == node_id and not _hold_moved and held >= HOLD_MENU_MSEC:
-			_hold_id = node_id
-			_node_menu.popup(Rect2i(Vector2i(_hold_position), Vector2i.ZERO))
-		_hold_id = ""
+		if is_instance_valid(_hold_timer):
+			_hold_timer.stop()
+		if _hold_id == node_id and _hold_ready and not _hold_moved:
+			# Opening on release keeps the finger that triggered the menu from
+			# also picking the first entry under it.
+			_open_node_menu(node_id, _hold_position)
+		elif not _node_menu.visible:
+			_hold_id = ""
+		_hold_ready = false
 		return
 	if event is InputEventMouseMotion and _hold_id == node_id:
-		if (event as InputEventMouseMotion).global_position.distance_to(_hold_position) > 14.0:
+		var motion := event as InputEventMouseMotion
+		if motion.global_position.distance_to(_hold_position) > HOLD_MENU_MOVE:
 			_hold_moved = true
+			_hold_ready = false
+			if is_instance_valid(_hold_timer):
+				_hold_timer.stop()
+
+
+## Enables the menu entries that only make sense for this node, before it opens.
+func _prepare_node_menu(node_id: String) -> void:
+	var node: Dictionary = graph.get_node_by_id(node_id)
+	if node.is_empty():
+		return
+	# The path entry only makes sense for a node that owns control points.
+	var editable := str(node.get("type", "")) == "path"
+	if str(node.get("type", "")) == "follow_path":
+		editable = (
+			int((node["params"] as Dictionary).get("shape", 0))
+			== ShaderGraphScript.PATH_CUSTOM
+		)
+	_node_menu.set_item_disabled(4, not editable)
+	# A node without inputs has nothing to pass through, so it cannot be bypassed;
+	# for the others the entry says what tapping it would do.
+	var has_input := false
+	var node_type := str(node.get("type", ""))
+	if ShaderGraphScript.NODE_TYPES.has(node_type):
+		has_input = int(ShaderGraphScript.NODE_TYPES[node_type]["inputs"]) >= 1
+	_node_menu.set_item_disabled(5, not has_input)
+	_node_menu.set_item_text(5, "启用此节点" if bool(node.get("bypass", false)) else "旁路此节点")
+
+
+## Shows the context menu of [param node_id] at [param position]. The node is
+## remembered separately from the press, so the entries still know their target
+## after the finger is lifted and while the menu is open.
+func _open_node_menu(node_id: String, position: Vector2) -> void:
+	if graph.get_node_by_id(node_id).is_empty():
+		return
+	_hold_id = node_id
+	_menu_node_id = node_id
+	_node_menu.popup(Rect2i(Vector2i(position), Vector2i.ZERO))
+
+
+## Fires while the finger is still on the node, so a long press is recognised
+## even if the release event never arrives (Android occasionally drops it).
+func _on_hold_timeout() -> void:
+	if _hold_id.is_empty() or _hold_moved:
+		return
+	_hold_ready = true
+
+
+func _on_node_menu_hidden() -> void:
+	_hold_id = ""
+	_menu_node_id = ""
+	_hold_ready = false
 
 
 static func _row_label(row: Node) -> String:
