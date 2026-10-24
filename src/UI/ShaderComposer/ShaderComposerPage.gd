@@ -279,9 +279,9 @@ func close_page() -> void:
 		_source_timer.stop()
 	if is_instance_valid(_play_timer):
 		_play_timer.stop()
-	if is_instance_valid(_play_button):
-		_play_button.text = "▶"
-	_editing_layer = null
+		if is_instance_valid(_play_button):
+			_play_button.text = "▶ 播放"
+		_editing_layer = null
 	_graph_fingers.clear()
 	_graph_gesture = false
 	hide()
@@ -302,9 +302,9 @@ func pause_page() -> void:
 		_source_timer.stop()
 	if is_instance_valid(_play_timer):
 		_play_timer.stop()
-	if is_instance_valid(_play_button):
-		_play_button.text = "▶"
-	hide()
+		if is_instance_valid(_play_button):
+			_play_button.text = "▶ 播放"
+		hide()
 	Global.can_draw = _can_draw_before
 
 
@@ -379,7 +379,12 @@ func _build_ui() -> void:
 	_preset_menu.add_theme_font_size_override("font_size", TOUCH_FONT_SIZE)
 	_build_preset_menu()
 	toolbar.add_child(_preset_menu)
-	_play_button = _make_button("▶", _on_play_pressed, "循环播放预览")
+	# A transport button, not a glyph: it is one of the most used controls and a
+	# single ▶ was barely a finger wide.
+	_play_button = _make_button(
+		"▶ 播放", _on_play_pressed, "循环播放预览", Vector2(88, TOUCH_SIZE)
+	)
+	_play_button.add_theme_font_size_override("font_size", 17)
 	toolbar.add_child(_play_button)
 	_frame_count = _make_frame_count_control()
 	toolbar.add_child(_frame_count)
@@ -2639,9 +2644,9 @@ func _on_hold_timeout() -> void:
 	_hold_ready = true
 
 
+## The chosen entry arrives after the popup closed, so the node it belongs to is
+## kept — clearing it here is what made every entry look like a dead click.
 func _on_node_menu_hidden() -> void:
-	_hold_id = ""
-	_menu_node_id = ""
 	_hold_ready = false
 
 
@@ -3613,10 +3618,10 @@ func _on_play_pressed() -> void:
 	if _play_timer.is_stopped():
 		_play_timer.wait_time = 1.0 / maxf(PREVIEW_FPS, 1.0)
 		_play_timer.start()
-		_play_button.text = "⏸"
+		_play_button.text = "⏸ 暂停"
 	else:
 		_play_timer.stop()
-		_play_button.text = "▶"
+		_play_button.text = "▶ 播放"
 		# The thumbnails skipped during playback catch up in one go.
 		_refresh_node_previews()
 		_refresh_preview()
