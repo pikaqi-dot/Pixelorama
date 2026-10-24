@@ -232,6 +232,9 @@ var _raster_time := -1.0
 ## Bounds of the non empty part of a branch, rebuilt for every generated image.
 var _bounds_cache := {}
 var _bayer_cache := {}
+## Decoded paintings of the canvas nodes, by node id, kept with the stored PNG they
+## were decoded from so an edit invalidates it without extra bookkeeping.
+var _painting_cache := {}
 ## Rasterised paths and the project layers read by the input nodes, per generate.
 var _path_cache := {}
 ## Sizes currently held in [member _path_cache], so the cache can stay bounded.
@@ -745,8 +748,12 @@ static func default_params(type: String) -> Dictionary:
 			}
 		"pixel_art":
 			return {
-				# 0 reads the drawing area, 1 draws the path connected to input 1.
+				# 0 reads a frame of a layer, 1 draws the path connected to input 1,
+				# 2 uses the picture painted in the node's own window. That painting
+				# is a PNG in the graph itself, so it belongs to the project and
+				# never writes into a layer.
 				"source": 0,
+				"painting": "",
 				"layer": 0,
 				"frame_mode": 0,
 				"frame": 0,
@@ -1236,8 +1243,11 @@ func _eval(node_id: String, uv: Vector2, size: Vector2i, depth: int) -> float:
 		return transformed * clampf(float(params.get("alpha", 1.0)), 0.0, 1.0)
 	elif node_type == "pixel_art":
 		# The canvas node either reads the drawing area or draws its path input.
-		if int(params.get("source", 0)) == 1:
-			return _canvas_path_value(node, params, uv, size, depth)
+		match int(params.get("source", 0)):
+			1:
+				return _canvas_path_value(node, params, uv, size, depth)
+			2:
+				return _painting_value(node, params, uv, size)
 		return _source_value(node, params, uv, size)
 	elif node_type == "time":
 		# Loops of the animation and a per node offset, so several time driven
@@ -2934,9 +2944,65 @@ func clear_source_cache() -> void:
 	_source_cache.clear()
 
 
-## The layer behind a pixel_art node, for the editor preview.
+## The picture behind a pixel_art node, for the editor preview. It is either the
+## layer the node reads or the painting stored in the node itself.
 func source_image(node: Dictionary) -> Image:
-	return _source_image(node, params_for(node))
+	var params: Dictionary = params_for(node)
+	if int(params.get("source", 0)) == 2:
+		return painting_image(node, params)
+	return _source_image(node, params)
+
+
+## Painting of a canvas node, decoded from the PNG stored in its parameters. The
+## stored string is part of the cache key, so redoing a stroke or undoing it finds
+## the right picture without any extra invalidation.
+func painting_image(node: Dictionary, params: Dictionary) -> Image:
+	var stored := str(params.get("painting", ""))
+	if stored.is_empty():
+		return null
+	var key := str(node["id"])
+	var cached: Dictionary = _painting_cache.get(key, {})
+	if str(cached.get("data", "")) == stored:
+		return cached.get("image", null)
+	var image: Image = null
+	var bytes := Marshalls.base64_to_raw(stored)
+	if not bytes.is_empty():
+		var decoded := Image.new()
+		if decoded.load_png_from_buffer(bytes) == OK:
+			image = decoded
+	_painting_cache[key] = {"data": stored, "image": image}
+	return image
+
+
+## Stores a painting on a canvas node as a PNG inside the graph. Nothing is written
+## to a project layer, so other canvas nodes keep their own picture, and the PNG
+## travels with the project file.
+func set_painting(node_id: String, image: Image) -> void:
+	var node := get_node_by_id(node_id)
+	if node.is_empty() or image == null or image.is_empty():
+		return
+	var params: Dictionary = node["params"]
+	params["painting"] = Marshalls.raw_to_base64(image.save_png_to_buffer())
+	_painting_cache.erase(node_id)
+
+
+## Value of a canvas node in window mode at [param uv]. The stored picture is
+## stretched over the canvas the same way a layer is, so the crop numbers and the
+## channel switch keep working.
+func _painting_value(
+	node: Dictionary, params: Dictionary, uv: Vector2, size: Vector2i
+) -> float:
+	var image := painting_image(node, params)
+	if image == null or image.is_empty():
+		return 0.0
+	return sample_source(
+		image,
+		int(params.get("channel", 0)),
+		bool(params.get("invert", false)),
+		uv,
+		size,
+		source_crop(params, image.get_size())
+	)
 
 
 ## Size of the layer behind a pixel_art node, or a zero vector when the layer
@@ -3145,6 +3211,7 @@ static func describe(node: Dictionary) -> String:
 				path_text += " · 闭合"
 			return path_text
 		"pixel_art":
+			var channels := ["亮度", "透明度", "反向透明度"]
 			if int(params.get("source", 0)) == 1:
 				var line_text := "路径线条 · 宽 %.3f–%.3f" % [
 					float(params.get("width_min", 0.0)),
@@ -3153,7 +3220,11 @@ static func describe(node: Dictionary) -> String:
 				if bool(params.get("fill", false)):
 					line_text += " · 填充"
 				return line_text
-			var channels := ["亮度", "透明度", "反向透明度"]
+			if int(params.get("source", 0)) == 2:
+				# The label is built from the stored string, because [method describe]
+				# has to work without a decoded picture for exported code.
+				var stored := str(params.get("painting", ""))
+				return "绘画窗口 · %s" % ("已画" if not stored.is_empty() else "空白")
 			var source_text := "%s · 图层 %d" % [
 				channels[clampi(int(params.get("channel", 0)), 0, 2)],
 				int(params.get("layer", 0)) + 1

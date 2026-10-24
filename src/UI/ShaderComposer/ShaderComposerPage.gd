@@ -2078,20 +2078,23 @@ func _show_params(id: String) -> void:
 				"reveal_reverse"
 			)
 		"pixel_art":
-			# The canvas node either reads the drawing area or draws a path as
-			# pixel lines, so the panel switches with the source.
+			# Three sources: a frame of a project layer, a path drawn as pixel
+			# lines, or the picture painted in the node's own window.
 			_add_option(
 				"来源",
-				["画布图像", "路径线条"],
+				["图层帧画", "路径线条", "绘画窗口"],
 				int(params.get("source", 0)),
 				params,
 				"source",
 				true
 			)
-			if int(params.get("source", 0)) == 1:
-				_build_canvas_line_section(id, params)
-			else:
-				_build_canvas_image_section(id, params)
+			match int(params.get("source", 0)):
+				1:
+					_build_canvas_line_section(id, params)
+				2:
+					_build_canvas_paint_section(id, params)
+				_:
+					_build_canvas_image_section(id, params)
 		"constant":
 			_add_slider("数值", 0.0, 1.0, 0.01, float(params.get("value", 0.5)), params, "value")
 		"time":
@@ -2867,20 +2870,33 @@ func _build_canvas_image_section(id: String, params: Dictionary) -> void:
 	)
 	_add_check("反相", bool(params.get("invert", false)), params, "invert")
 	_build_source_crop_section(id, params)
+
+
+## Controls of a canvas node that paints its own picture in the small window.
+func _build_canvas_paint_section(id: String, params: Dictionary) -> void:
+	var paint_hint := Label.new()
+	paint_hint.text = (
+		"这张画属于这个节点：窗口里画的东西存进图里、跟着项目一起保存，"
+		+ "不写进任何图层，所以别的画布节点不会跟着变。"
+		+ "窗口按画布大小打开，只有铅笔、橡皮、填充、方形、圆形，只用白色。"
+	)
+	paint_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	paint_hint.add_theme_font_size_override("font_size", 13)
+	_params_target.add_child(paint_hint)
 	_params_target.add_child(
 		_make_button(
-			"绘画窗口…", func() -> void: _open_canvas_editor(id), "在画布大小的窗口里直接画材质"
+			"绘画窗口…", func() -> void: _open_canvas_editor(id), "在画布大小的窗口里画这张图"
 		)
 	)
-	var draw_hint := Label.new()
-	draw_hint.text = (
-		"窗口按画布大小打开，只有铅笔、橡皮、填充、方形、圆形，只用白色；"
-		+ "完成后写回这个节点读取的图层。若是另一个画布节点也在读同一图层，"
-		+ "第一次打开窗口时会自动给这个节点复制一份独立图层，两边互不影响。"
+	_add_option(
+		"通道",
+		["亮度×透明度", "透明度", "反向透明度"],
+		int(params.get("channel", 0)),
+		params,
+		"channel"
 	)
-	draw_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	draw_hint.add_theme_font_size_override("font_size", 13)
-	_params_target.add_child(draw_hint)
+	_add_check("反相", bool(params.get("invert", false)), params, "invert")
+	_build_source_crop_section(id, params)
 
 
 ## Stroke controls of a canvas node in path mode.
@@ -3082,22 +3098,19 @@ func _reset_source_crop(node_id: String, params: Dictionary) -> void:
 	call_deferred("_show_params", node_id)
 
 
-## Opens the small drawing window of a canvas node. It paints into the layer the
-## node reads, after making sure that layer belongs to this node alone.
+## Opens the drawing window of a canvas node. It edits the picture the node owns,
+## which is stored in the graph as a PNG and saved with the project. No layer is
+## touched, so other canvas nodes never change because of a stroke here.
 func _open_canvas_editor(node_id: String) -> void:
-	# Two canvas nodes reading one layer would paint over each other, so a shared
-	# layer is copied into one of the node's own before the window opens.
-	_own_layer_for(node_id)
 	var node: Dictionary = graph.get_node_by_id(node_id)
 	if node.is_empty():
 		return
-	var cel: BaseCel = graph.source_cel(node)
-	if cel == null or not cel is PixelCel:
-		Global.notification_label("这个节点读取的图层不能直接绘制（不是像素图层）")
-		return
-	var painted: Image = graph.source_image(node)
+	var params: Dictionary = node["params"]
+	var painted: Image = graph.painting_image(node, params)
 	if painted == null or painted.is_empty():
-		Global.notification_label("这个节点读不到图层内容")
+		painted = _blank_canvas_image()
+	if painted == null:
+		Global.notification_label("读不到画布尺寸")
 		return
 	if not is_instance_valid(_canvas_editor):
 		_canvas_popup = PopupPanel.new()
@@ -3114,67 +3127,22 @@ func _open_canvas_editor(node_id: String) -> void:
 		_canvas_editor.finished.connect(_finish_canvas_editor)
 		_canvas_popup.popup_hide.connect(_finish_canvas_editor)
 	_canvas_node_id = node_id
-	# The window always works at canvas size, because a cel only stores the
-	# rectangle it painted plus an offset.
+	# The window works at canvas size at all times, which is also the size the
+	# stored painting has.
 	_canvas_editor.setup(painted.duplicate())
 	_popup_canvas_editor()
 
 
-## True when another canvas node in layer mode reads [param layer_index], which is
-## what makes painting in one of them show up in the other.
-func _canvas_layer_shared(node_id: String, layer_index: int) -> bool:
-	for other: Dictionary in graph.nodes:
-		if str(other["id"]) == node_id or str(other["type"]) != "pixel_art":
-			continue
-		var params: Dictionary = other["params"]
-		if int(params.get("source", 0)) != 0:
-			continue
-		if int(params.get("layer", 0)) == layer_index:
-			return true
-	return false
-
-
-## Copies the picture of a canvas node into a layer of its own, so painting in its
-## window stops changing another canvas node that reads the same layer. The new
-## layer goes to the end of the stack, which leaves every other layer index, and
-## therefore every other canvas node, exactly where it was.
-func _own_layer_for(node_id: String) -> void:
+## Transparent picture at the project size, which is what a new painting starts on.
+func _blank_canvas_image() -> Image:
 	var project := Global.current_project
-	var node: Dictionary = graph.get_node_by_id(node_id)
-	if project == null or node.is_empty() or project.layers.is_empty():
-		return
-	var params: Dictionary = node["params"]
-	if int(params.get("source", 0)) != 0:
-		return
-	var layer_index := clampi(int(params.get("layer", 0)), 0, project.layers.size() - 1)
-	if not _canvas_layer_shared(node_id, layer_index):
-		return
-	var painted: Image = graph.source_image(node)
-	if painted == null or painted.is_empty():
-		painted = Image.create_empty(
-			maxi(project.size.x, 1), maxi(project.size.y, 1), false, Image.FORMAT_RGBA8
-		)
-		painted.fill(Color(0.0, 0.0, 0.0, 0.0))
-	var layer := PixelLayer.new(project, "画布 %s" % node_id)
-	var cels: Array = []
-	for frame in maxi(project.frames.size(), 1):
-		var cel := layer.new_empty_cel()
-		if cel is PixelCel:
-			(cel as PixelCel).image = _make_cel_image(painted, project)
-			cel.update_texture()
-		cels.append(cel)
-	var new_index := project.layers.size()
-	project.undo_redo.create_action("Add Canvas Layer")
-	project.undo_redo.add_do_method(project.add_layers.bind([layer], [new_index], [cels]))
-	project.undo_redo.add_undo_method(project.remove_layers.bind([new_index]))
-	project.undo_redo.add_do_method(Global.undo_or_redo.bind(false))
-	project.undo_redo.add_undo_method(Global.undo_or_redo.bind(true))
-	project.undo_redo.commit_action()
-	params["layer"] = project.layers.find(layer)
-	params["frame_mode"] = 0
-	graph.clear_source_cache()
-	_refresh_graph()
-	Global.notification_label("这个画布节点已获得独立图层「%s」" % layer.name)
+	if project == null:
+		return null
+	var image := Image.create_empty(
+		maxi(project.size.x, 1), maxi(project.size.y, 1), false, Image.FORMAT_RGBA8
+	)
+	image.fill(Color(0.0, 0.0, 0.0, 0.0))
+	return image
 
 
 ## Sizes the drawing window to the canvas, inside the visible part of the screen.
@@ -3199,8 +3167,7 @@ func _popup_canvas_editor() -> void:
 	_canvas_popup.popup_centered_clamped(target, 0.95)
 
 
-## Closes the drawing window and writes what was drawn into the layer, as one
-## undo step, so the drawing can be undone like any other edit.
+## Closes the drawing window and keeps what was drawn, as one undo step.
 func _finish_canvas_editor() -> void:
 	if not is_instance_valid(_canvas_editor):
 		return
@@ -3216,38 +3183,24 @@ func _finish_canvas_editor() -> void:
 		return
 	var image: Image = editor.take_result()
 	if image != null:
-		_write_canvas_image(node_id, image)
+		_store_painting(node_id, image)
 
 
-## Puts the painted buffer back into the cel the node reads.
-func _write_canvas_image(node_id: String, image: Image) -> void:
+## Keeps the painted buffer on the node itself. The page undo stack snapshots the
+## whole graph, so the PNG travels with it and the stroke can be undone like any
+## other edit — without ever touching a project layer.
+func _store_painting(node_id: String, image: Image) -> void:
 	var node: Dictionary = graph.get_node_by_id(node_id)
-	var project := Global.current_project
-	if node.is_empty() or project == null:
+	if node.is_empty() or image == null or image.is_empty():
 		return
-	var cel: BaseCel = graph.source_cel(node)
-	if cel == null or not cel is PixelCel:
-		return
-	var pixel_cel := cel as PixelCel
-	var replaced_image = pixel_cel.get_image()
-	var replaced_offset: Vector2i = pixel_cel.offset
-	var incoming := _make_cel_image(image, project)
-	project.undo_redo.create_action("绘制画布材质")
-	project.undo_redo.add_do_method(_set_canvas_cel.bind(pixel_cel, incoming, Vector2i.ZERO))
-	project.undo_redo.add_undo_method(
-		_set_canvas_cel.bind(pixel_cel, replaced_image, replaced_offset)
-	)
-	project.undo_redo.add_do_method(Global.undo_or_redo.bind(false))
-	project.undo_redo.add_undo_method(Global.undo_or_redo.bind(true))
-	project.undo_redo.commit_action()
-	# The layer changed, so every canvas node reading it has to read it again.
-	# The caches are shared, but the previews stay per node: only the node whose
-	# window was used is repainted here, the others follow the dirty queue.
-	graph.clear_source_cache()
+	_push_undo()
+	graph.set_painting(node_id, image)
+	var params: Dictionary = (graph.get_node_by_id(node_id)["params"] as Dictionary)
+	params["source"] = 2
 	_mark_preview_dirty(node_id)
 	_refresh_node_now(node_id)
 	_schedule_preview()
-	# The crop preview and the reported source size both follow the layer.
+	# The panel shows how big the painting is, so it is rebuilt after a stroke.
 	if _selected_id == node_id:
 		call_deferred("_show_params", node_id)
 
@@ -4018,14 +3971,6 @@ static func _make_cel_image(image: Image, project: Project) -> ImageExtended:
 
 
 static func _set_cel_image(cel: PixelCel, image: ImageExtended) -> void:
-	cel.image = image
-	cel.update_texture()
-
-
-## Writes a canvas sized image into a pixel cel and resets its offset. The
-## drawing window works in canvas space, so the cel has to match it.
-static func _set_canvas_cel(cel: PixelCel, image: ImageExtended, offset: Vector2i) -> void:
-	cel.offset = offset
 	cel.image = image
 	cel.update_texture()
 
