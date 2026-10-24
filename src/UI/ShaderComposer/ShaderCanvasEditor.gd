@@ -180,6 +180,9 @@ class Board extends Control:
 		focus_mode = Control.FOCUS_NONE
 		# Nearest filtering keeps the pixels square instead of smearing them.
 		texture_filter = CanvasItem.TEXTURE_FILTER_NEAREST
+		# The raw touch stream is handled in _input, next to the emulated mouse
+		# events, so a finger drag keeps drawing on every platform.
+		set_process_input(true)
 		resized.connect(_layout)
 		_layout()
 
@@ -250,46 +253,83 @@ class Board extends Control:
 				var pixel := _to_pixel(event.position)
 				if pixel.x < 0:
 					return
-				stroke_started.emit()
-				if tool == 2:
-					_flood_fill(pixel)
-					_refresh()
-					stroke_finished.emit()
-					accept_event()
-					return
-				_pressed = true
-				_last = pixel
-				_start = pixel
-				_end = pixel
-				if tool >= 3:
-					_shaping = true
-					queue_redraw()
-				else:
-					_paint(pixel)
-					_refresh()
+				_begin_stroke(pixel)
 				accept_event()
 			elif _pressed:
-				if _shaping:
-					_rasterise_shape()
-					_shaping = false
-				_pressed = false
-				_refresh()
-				stroke_finished.emit()
-				queue_redraw()
+				_end_stroke()
 				accept_event()
-		elif event is InputEventMouseMotion and _pressed:
+			return
+		if event is InputEventMouseMotion and _pressed:
 			var motion := event as InputEventMouseMotion
 			var pixel := _to_pixel(motion.position)
 			if pixel.x < 0:
 				return
-			if _shaping:
-				_end = pixel
-				queue_redraw()
-			else:
-				_paint_line(_last, pixel)
-				_last = pixel
-				_refresh()
+			_continue_stroke(pixel)
 			accept_event()
+
+
+	## Touch does not always arrive as emulated mouse events inside a popup, so
+	## the raw touch stream is handled here as well. The checks make the two paths
+	## work together: a stroke that a mouse press started is not started twice.
+	func _input(event: InputEvent) -> void:
+		if image == null or not is_visible_in_tree():
+			return
+		if event is InputEventScreenTouch:
+			var touch := make_input_local(event) as InputEventScreenTouch
+			if touch.pressed:
+				if _pressed:
+					return
+				var pixel := _to_pixel(touch.position)
+				if pixel.x >= 0:
+					_begin_stroke(pixel)
+			else:
+				_end_stroke()
+		elif event is InputEventScreenDrag and _pressed:
+			var drag := make_input_local(event) as InputEventScreenDrag
+			var pixel := _to_pixel(drag.position)
+			if pixel.x >= 0:
+				_continue_stroke(pixel)
+
+
+	func _begin_stroke(pixel: Vector2i) -> void:
+		stroke_started.emit()
+		if tool == 2:
+			_flood_fill(pixel)
+			_refresh()
+			stroke_finished.emit()
+			return
+		_pressed = true
+		_last = pixel
+		_start = pixel
+		_end = pixel
+		if tool >= 3:
+			_shaping = true
+			queue_redraw()
+			return
+		_paint(pixel)
+		_refresh()
+
+
+	func _continue_stroke(pixel: Vector2i) -> void:
+		if _shaping:
+			_end = pixel
+			queue_redraw()
+			return
+		_paint_line(_last, pixel)
+		_last = pixel
+		_refresh()
+
+
+	func _end_stroke() -> void:
+		if not _pressed:
+			return
+		if _shaping:
+			_rasterise_shape()
+			_shaping = false
+		_pressed = false
+		_refresh()
+		stroke_finished.emit()
+		queue_redraw()
 
 
 	## Pixel under [param position], or (-1, -1) when the position is outside the
@@ -311,7 +351,16 @@ class Board extends Control:
 
 	func _refresh() -> void:
 		if image != null:
-			texture = ImageTexture.create_from_image(image)
+			# Updating the texture in place avoids allocating one per pointer
+			# event, which is what makes a fast stroke on a phone feel chopped.
+			if (
+				texture == null
+				or texture.get_width() != image.get_width()
+				or texture.get_height() != image.get_height()
+			):
+				texture = ImageTexture.create_from_image(image)
+			else:
+				texture.update(image)
 		queue_redraw()
 
 
