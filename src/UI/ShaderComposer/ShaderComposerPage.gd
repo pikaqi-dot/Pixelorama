@@ -2743,7 +2743,8 @@ func _build_canvas_image_section(id: String, params: Dictionary) -> void:
 	var draw_hint := Label.new()
 	draw_hint.text = (
 		"窗口按画布大小打开，只有铅笔、橡皮、填充、方形、圆形，只用白色；"
-		+ "完成后写回这个节点读取的图层，读同一图层（同一帧）的画布节点都会跟着变。"
+		+ "完成后写回这个节点读取的图层。若是另一个画布节点也在读同一图层，"
+		+ "第一次打开窗口时会自动给这个节点复制一份独立图层，两边互不影响。"
 	)
 	draw_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	draw_hint.add_theme_font_size_override("font_size", 13)
@@ -2949,9 +2950,12 @@ func _reset_source_crop(node_id: String, params: Dictionary) -> void:
 	call_deferred("_show_params", node_id)
 
 
-## Opens the small drawing window of a canvas node. It paints into the same layer
-## the node reads, so the material can be made without leaving the composer.
+## Opens the small drawing window of a canvas node. It paints into the layer the
+## node reads, after making sure that layer belongs to this node alone.
 func _open_canvas_editor(node_id: String) -> void:
+	# Two canvas nodes reading one layer would paint over each other, so a shared
+	# layer is copied into one of the node's own before the window opens.
+	_own_layer_for(node_id)
 	var node: Dictionary = graph.get_node_by_id(node_id)
 	if node.is_empty():
 		return
@@ -2982,6 +2986,63 @@ func _open_canvas_editor(node_id: String) -> void:
 	# rectangle it painted plus an offset.
 	_canvas_editor.setup(painted.duplicate())
 	_popup_canvas_editor()
+
+
+## True when another canvas node in layer mode reads [param layer_index], which is
+## what makes painting in one of them show up in the other.
+func _canvas_layer_shared(node_id: String, layer_index: int) -> bool:
+	for other: Dictionary in graph.nodes:
+		if str(other["id"]) == node_id or str(other["type"]) != "pixel_art":
+			continue
+		var params: Dictionary = other["params"]
+		if int(params.get("source", 0)) != 0:
+			continue
+		if int(params.get("layer", 0)) == layer_index:
+			return true
+	return false
+
+
+## Copies the picture of a canvas node into a layer of its own, so painting in its
+## window stops changing another canvas node that reads the same layer. The new
+## layer goes to the end of the stack, which leaves every other layer index, and
+## therefore every other canvas node, exactly where it was.
+func _own_layer_for(node_id: String) -> void:
+	var project := Global.current_project
+	var node: Dictionary = graph.get_node_by_id(node_id)
+	if project == null or node.is_empty() or project.layers.is_empty():
+		return
+	var params: Dictionary = node["params"]
+	if int(params.get("source", 0)) != 0:
+		return
+	var layer_index := clampi(int(params.get("layer", 0)), 0, project.layers.size() - 1)
+	if not _canvas_layer_shared(node_id, layer_index):
+		return
+	var painted: Image = graph.source_image(node)
+	if painted == null or painted.is_empty():
+		painted = Image.create_empty(
+			maxi(project.size.x, 1), maxi(project.size.y, 1), false, Image.FORMAT_RGBA8
+		)
+		painted.fill(Color(0.0, 0.0, 0.0, 0.0))
+	var layer := PixelLayer.new(project, "画布 %s" % node_id)
+	var cels: Array = []
+	for frame in maxi(project.frames.size(), 1):
+		var cel := layer.new_empty_cel()
+		if cel is PixelCel:
+			(cel as PixelCel).image = _make_cel_image(painted, project)
+			cel.update_texture()
+		cels.append(cel)
+	var new_index := project.layers.size()
+	project.undo_redo.create_action("Add Canvas Layer")
+	project.undo_redo.add_do_method(project.add_layers.bind([layer], [new_index], [cels]))
+	project.undo_redo.add_undo_method(project.remove_layers.bind([new_index]))
+	project.undo_redo.add_do_method(Global.undo_or_redo.bind(false))
+	project.undo_redo.add_undo_method(Global.undo_or_redo.bind(true))
+	project.undo_redo.commit_action()
+	params["layer"] = project.layers.find(layer)
+	params["frame_mode"] = 0
+	graph.clear_source_cache()
+	_refresh_graph()
+	Global.notification_label("这个画布节点已获得独立图层「%s」" % layer.name)
 
 
 ## Sizes the drawing window to the canvas, inside the visible part of the screen.
