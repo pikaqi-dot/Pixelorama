@@ -3,8 +3,8 @@ extends RefCounted
 ## A tiny node graph that turns procedural nodes into a pixel image.
 ##
 ## Every node produces a single grayscale value between 0 and 1 for a pixel. The
-## [code]output[/code] node turns that value into a color with a two stop ramp and
-## a limited number of steps, which keeps the result pixel art friendly.
+## [code]output[/code] node turns that value into a color with a three stop ramp
+## and a limited number of steps, which keeps the result pixel art friendly.
 
 ## Node types and how many inputs they take.
 const NODE_TYPES := {
@@ -12,8 +12,11 @@ const NODE_TYPES := {
 	"gradient": {"label": "Gradient", "inputs": 0},
 	"radial": {"label": "Radial", "inputs": 0},
 	"checker": {"label": "Checker", "inputs": 0},
+	"constant": {"label": "Constant", "inputs": 0},
 	"time": {"label": "Time", "inputs": 0},
 	"wave": {"label": "Wave", "inputs": 1},
+	"transform": {"label": "Transform", "inputs": 1},
+	"warp": {"label": "Warp", "inputs": 2},
 	"math": {"label": "Math", "inputs": 1},
 	"blend": {"label": "Blend", "inputs": 2},
 	"output": {"label": "Output", "inputs": 1},
@@ -31,6 +34,9 @@ const MATH_OPS := [
 	"Add", "Subtract", "Multiply", "Min", "Max", "Step", "Posterize", "Invert", "Sine"
 ]
 const BLEND_OPS := ["Mix", "Add", "Multiply", "Screen", "Difference"]
+## Coordinates closer than this to a pixel are treated as that pixel. Only used to
+## cancel the floating point noise of rotations by right angles.
+const SNAP_STEP := 0.000001
 
 ## Nodes of the graph, as dictionaries: id, type, position, params, inputs.
 var nodes: Array[Dictionary] = []
@@ -111,10 +117,24 @@ func from_dict(data: Dictionary) -> void:
 	_next_id = maxi(int(data.get("next_id", 1)), 1)
 	# Keep ids unique even if the snapshot came from an older graph.
 	for node: Dictionary in nodes:
-		var id := str(node["id"])
-		var suffix := id.get_slice("_", -1)
+		var suffix := str(node["id"]).get_slice("_", -1)
 		if suffix.is_valid_int():
 			_next_id = maxi(_next_id, int(suffix) + 1)
+
+
+## Copies [param id] with its parameters, placed next to the original. Inputs are
+## kept when they are not part of the copy itself, so a chain can be duplicated.
+func duplicate_node(id: String) -> String:
+	var source := get_node_by_id(id)
+	if source.is_empty():
+		return ""
+	var copy_id := add_node(str(source["type"]))
+	var copy := get_node_by_id(copy_id)
+	copy["params"] = (source["params"] as Dictionary).duplicate(true)
+	copy["position"] = (source.get("position", Vector2.ZERO) as Vector2) + Vector2(40, 40)
+	var inputs: Dictionary = (source["inputs"] as Dictionary).duplicate()
+	copy["inputs"] = inputs
+	return copy_id
 
 
 ## Connects [param from_id]'s output to input [param slot] of [param to_id].
@@ -192,12 +212,24 @@ static func default_params(type: String) -> Dictionary:
 				"invert": false,
 				"falloff": 1.0,
 			}
-		"time":
-			return {}
-		"wave":
-			return {"frequency": 2.0, "angle": 0.0, "amplitude": 1.0}
 		"checker":
 			return {"cell": 8.0}
+		"constant":
+			return {"value": 0.5}
+		"time":
+			return {"speed": 1.0, "offset": 0.0}
+		"wave":
+			return {"frequency": 2.0, "angle": 0.0, "amplitude": 1.0}
+		"transform":
+			return {
+				"angle": 0.0,
+				"scale": 1.0,
+				"offset_x": 0.0,
+				"offset_y": 0.0,
+				"tile": false,
+			}
+		"warp":
+			return {"amount": 0.15}
 		"math":
 			return {"op": 0, "amount": 0.5, "steps": 4}
 		"blend":
@@ -206,7 +238,9 @@ static func default_params(type: String) -> Dictionary:
 			return {
 				"steps": 2,
 				"color_a": Color(0.09, 0.09, 0.12, 1.0),
+				"color_mid": Color(0.45, 0.45, 0.5, 1.0),
 				"color_b": Color(0.95, 0.95, 0.98, 1.0),
+				"mid_position": 0.5,
 			}
 	return {}
 
@@ -221,20 +255,26 @@ func generate(size: Vector2i) -> Image:
 		image.fill(Color(0, 0, 0, 0))
 		return image
 	var output := get_node_by_id(output_id)
-	var steps := maxi(int(output["params"]["steps"]), 2)
-	var color_a: Color = output["params"]["color_a"]
-	var color_b: Color = output["params"]["color_b"]
+	var output_params: Dictionary = output["params"]
+	var steps := maxi(int(output_params["steps"]), 2)
+	var color_a: Color = output_params["color_a"]
+	var color_mid: Color = output_params.get("color_mid", color_a)
+	var color_b: Color = output_params["color_b"]
+	var mid_position := clampf(float(output_params.get("mid_position", 0.5)), 0.05, 0.95)
 	var source := _input_id(output, 0)
 	for y in size.y:
 		for x in size.x:
-			var value := clampf(_eval(source, x, y, size, 0), 0.0, 1.0)
+			var value := clampf(_eval(source, Vector2(x, y), size, 0), 0.0, 1.0)
 			var step := floori(value * steps)
 			var ramp := clampf(float(step) / float(steps - 1), 0.0, 1.0)
-			var color := color_a.lerp(color_b, ramp)
-			if step >= steps:
-				color = color_b
-			image.set_pixel(x, y, color)
+			image.set_pixel(x, y, _ramp_color(color_a, color_mid, color_b, mid_position, ramp))
 	return image
+
+
+static func _ramp_color(a: Color, mid: Color, b: Color, mid_position: float, t: float) -> Color:
+	if t <= mid_position:
+		return a.lerp(mid, t / mid_position)
+	return mid.lerp(b, (t - mid_position) / (1.0 - mid_position))
 
 
 func _input_id(node: Dictionary, slot: int) -> String:
@@ -242,8 +282,8 @@ func _input_id(node: Dictionary, slot: int) -> String:
 	return str(inputs.get(slot, ""))
 
 
-## Value of [param node_id] for the pixel at [param x], [param y].
-func _eval(node_id: String, x: int, y: int, size: Vector2i, depth: int) -> float:
+## Value of [param node_id] at the pixel (or the mapped canvas position) [param uv].
+func _eval(node_id: String, uv: Vector2, size: Vector2i, depth: int) -> float:
 	if node_id.is_empty() or depth > 32:
 		return 0.0
 	var node := get_node_by_id(node_id)
@@ -251,42 +291,72 @@ func _eval(node_id: String, x: int, y: int, size: Vector2i, depth: int) -> float
 		return 0.0
 	var params: Dictionary = node["params"]
 	var size_vec := Vector2(size)
+	var normalized := uv / size_vec
 	match str(node["type"]):
 		"noise":
-			return _noise_value(node_id, params, x, y)
+			return _noise_value(node_id, params, uv)
 		"gradient":
 			var direction := Vector2.from_angle(deg_to_rad(float(params["angle"])))
-			var normalized := (Vector2(x, y) / size_vec) - Vector2(0.5, 0.5)
 			var shift := float(params.get("offset", 0.0))
-			return clampf(0.5 + normalized.dot(direction) * 1.414 + shift, 0.0, 1.0)
+			return clampf(
+				0.5 + (normalized - Vector2(0.5, 0.5)).dot(direction) * 1.414 + shift, 0.0, 1.0
+			)
 		"radial":
 			var center := Vector2(float(params["center_x"]), float(params["center_y"]))
-			var distance := ((Vector2(x, y) / size_vec) - center).length()
+			var distance := (normalized - center).length()
 			var value := clampf(1.0 - distance / maxf(float(params["radius"]), 0.001), 0.0, 1.0)
 			value = pow(value, maxf(float(params.get("falloff", 1.0)), 0.05))
 			return 1.0 - value if bool(params["invert"]) else value
 		"checker":
 			var cell := maxf(float(params["cell"]), 1.0)
-			var odd := (floori(x / cell) + floori(y / cell)) % 2
+			var odd := (floori(uv.x / cell) + floori(uv.y / cell)) % 2
 			return 1.0 if odd == 1 else 0.0
+		"constant":
+			return clampf(float(params.get("value", 0.5)), 0.0, 1.0)
 		"time":
-			return clampf(time, 0.0, 1.0)
+			# Loops of the animation and a per node offset, so several time driven
+			# parts of a graph can run out of phase.
+			var loops := maxf(float(params.get("speed", 1.0)), 0.0)
+			return fposmod(time * loops + float(params.get("offset", 0.0)), 1.0)
 		"wave":
-			# A travelling sine: the phase comes from a time node, the direction and
-			# frequency shape the crests, so the result reads as moving water.
-			var phase := clampf(_eval(_input_id(node, 0), x, y, size, depth + 1), 0.0, 1.0)
+			var phase := clampf(_eval(_input_id(node, 0), uv, size, depth + 1), 0.0, 1.0)
 			var travel := Vector2.from_angle(deg_to_rad(float(params["angle"])))
-			var position := Vector2(x, y) / size_vec
 			var wave := 0.5 + 0.5 * sin(
-				TAU * (position.dot(travel) * float(params["frequency"]) + phase)
+				TAU * (normalized.dot(travel) * float(params["frequency"]) + phase)
 			)
 			return lerpf(0.5, wave, clampf(float(params["amplitude"]), 0.0, 1.0))
+		"transform":
+			# Maps the canvas position before the input is sampled, so any branch
+			# can be scaled, rotated, moved or tiled.
+			var pivot := size_vec * 0.5
+			var mapped := (uv - pivot).rotated(deg_to_rad(float(params["angle"])))
+			mapped /= maxf(float(params["scale"]), 0.01)
+			mapped += pivot
+			mapped += (
+				Vector2(float(params["offset_x"]), float(params["offset_y"])) * size_vec
+			)
+			# cos(90°) is not exactly zero, so a quarter turn leaves a ~1e-16 wobble
+			# that flips pixels sitting on a color step. Snapping far below a pixel
+			# removes the wobble without touching the visible result.
+			mapped = mapped.snapped(Vector2(SNAP_STEP, SNAP_STEP))
+			if bool(params.get("tile", false)):
+				mapped = Vector2(fposmod(mapped.x, size_vec.x), fposmod(mapped.y, size_vec.y))
+			return clampf(_eval(_input_id(node, 0), mapped, size, depth + 1), 0.0, 1.0)
+		"warp":
+			# The first input is the field, the second one the image being distorted.
+			var amount := float(params.get("amount", 0.15)) * size_vec.y
+			var field_x := _eval(_input_id(node, 0), uv, size, depth + 1) - 0.5
+			var field_y := (
+				_eval(_input_id(node, 0), uv + Vector2(37.0, 61.0), size, depth + 1) - 0.5
+			)
+			var shifted := uv + Vector2(field_x, field_y) * amount * 2.0
+			return clampf(_eval(_input_id(node, 1), shifted, size, depth + 1), 0.0, 1.0)
 		"math":
-			var source := clampf(_eval(_input_id(node, 0), x, y, size, depth + 1), 0.0, 1.0)
+			var source := clampf(_eval(_input_id(node, 0), uv, size, depth + 1), 0.0, 1.0)
 			return _math_value(int(params["op"]), source, params)
 		"blend":
-			var a := clampf(_eval(_input_id(node, 0), x, y, size, depth + 1), 0.0, 1.0)
-			var b := clampf(_eval(_input_id(node, 1), x, y, size, depth + 1), 0.0, 1.0)
+			var a := clampf(_eval(_input_id(node, 0), uv, size, depth + 1), 0.0, 1.0)
+			var b := clampf(_eval(_input_id(node, 1), uv, size, depth + 1), 0.0, 1.0)
 			var factor := clampf(float(params["factor"]), 0.0, 1.0)
 			var blended := 0.0
 			match BLEND_OPS[int(params["op"])]:
@@ -302,7 +372,7 @@ func _eval(node_id: String, x: int, y: int, size: Vector2i, depth: int) -> float
 					blended = absf(a - b)
 			return clampf(lerpf(a, blended, factor), 0.0, 1.0)
 		"output":
-			return clampf(_eval(_input_id(node, 0), x, y, size, depth + 1), 0.0, 1.0)
+			return clampf(_eval(_input_id(node, 0), uv, size, depth + 1), 0.0, 1.0)
 	return 0.0
 
 
@@ -332,7 +402,7 @@ func _math_value(op: int, source: float, params: Dictionary) -> float:
 
 
 ## Noise is sampled with [FastNoiseLite], which is cached per node.
-func _noise_value(node_id: String, params: Dictionary, x: int, y: int) -> float:
+func _noise_value(node_id: String, params: Dictionary, uv: Vector2) -> float:
 	var signature := "%d|%.4f|%d|%d|%.4f" % [
 		int(params["noise_type"]),
 		float(params["scale"]),
@@ -351,7 +421,7 @@ func _noise_value(node_id: String, params: Dictionary, x: int, y: int) -> float:
 		noise.fractal_gain = clampf(float(params["gain"]), 0.05, 0.95)
 		_noise_cache[node_id] = noise
 		_noise_signature[node_id] = signature
-	return clampf(noise.get_noise_2d(float(x), float(y)) * 0.5 + 0.5, 0.0, 1.0)
+	return clampf(noise.get_noise_2d(uv.x, uv.y) * 0.5 + 0.5, 0.0, 1.0)
 
 
 ## Small description of a node, used by the interface.
@@ -370,10 +440,16 @@ static func describe(node: Dictionary) -> String:
 			return "r %.2f" % float(params["radius"])
 		"checker":
 			return "cell %d px" % int(params["cell"])
+		"constant":
+			return "%.2f" % float(params.get("value", 0.5))
 		"time":
-			return "帧相位"
+			return "速度 %.1f" % float(params.get("speed", 1.0))
 		"wave":
 			return "%.1f 周期 · %d°" % [float(params["frequency"]), int(params["angle"])]
+		"transform":
+			return "×%.2f · %d°" % [float(params["scale"]), int(params["angle"])]
+		"warp":
+			return "%.2f" % float(params.get("amount", 0.15))
 		"math":
 			return MATH_OPS[int(params["op"])]
 		"blend":
@@ -436,7 +512,9 @@ func build_ocean_preset() -> void:
 		{
 			"steps": 5,
 			"color_a": Color(0.04, 0.13, 0.32, 1.0),
-			"color_b": Color(0.56, 0.89, 0.96, 1.0),
+			"color_mid": Color(0.13, 0.38, 0.6, 1.0),
+			"color_b": Color(0.62, 0.91, 0.97, 1.0),
+			"mid_position": 0.5,
 		},
 		true
 	)

@@ -151,9 +151,11 @@ func _build_ui() -> void:
 	_add_type.add_theme_font_size_override("font_size", TOUCH_FONT_SIZE)
 	toolbar.add_child(_add_type)
 	toolbar.add_child(_make_button("添加节点", _on_add_pressed))
+	toolbar.add_child(_make_button("复制选中", _on_copy_pressed))
 	toolbar.add_child(_make_button("删除选中", _on_delete_pressed))
 	toolbar.add_child(_make_button("刷新预览", _refresh_preview))
 	toolbar.add_child(_make_button("示例：像素海面", _on_ocean_preset_pressed))
+	toolbar.add_child(_make_button("重置图", _on_reset_pressed, "回到 Noise → Output 的初始图"))
 	_play_button = _make_button("▶ 播放", _on_play_pressed, "循环播放预览")
 	toolbar.add_child(_play_button)
 	var frames_label := Label.new()
@@ -333,6 +335,26 @@ func _on_add_pressed() -> void:
 	_schedule_preview()
 
 
+func _on_copy_pressed() -> void:
+	if _selected_id.is_empty():
+		return
+	var copy: String = graph.duplicate_node(_selected_id)
+	if copy.is_empty():
+		return
+	_refresh_graph()
+	_selected_id = copy
+	_show_params(copy)
+	_schedule_preview()
+
+
+func _on_reset_pressed() -> void:
+	graph.reset_to_default()
+	_selected_id = ""
+	_show_params("")
+	_refresh_graph()
+	_refresh_preview()
+
+
 func _on_delete_pressed() -> void:
 	if _selected_id.is_empty():
 		return
@@ -384,15 +406,36 @@ func _show_params(id: String) -> void:
 			_add_check("反向", bool(params["invert"]), params, "invert")
 		"checker":
 			_add_slider("格子 (px)", 1.0, 64.0, 1.0, float(params["cell"]), params, "cell")
+		"constant":
+			_add_slider("数值", 0.0, 1.0, 0.01, float(params.get("value", 0.5)), params, "value")
 		"time":
 			var hint := Label.new()
-			hint.text = "输出当前帧的相位（0…1）。接到 Wave 的输入口，生成时按帧数逐帧出图。"
+			hint.text = (
+				"输出当前帧的相位（0…1）。接到 Wave、Transform 等节点的输入口，"
+				+ "生成时按帧数逐帧出图。速度是每帧前进的圈数。"
+			)
 			hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+			hint.add_theme_font_size_override("font_size", 13)
 			_params_box.add_child(hint)
+			_add_slider("速度", 0.0, 4.0, 0.05, float(params.get("speed", 1.0)), params, "speed")
+			_add_slider("偏移", 0.0, 1.0, 0.01, float(params.get("offset", 0.0)), params, "offset")
 		"wave":
 			_add_slider("频率", 0.5, 16.0, 0.1, float(params["frequency"]), params, "frequency")
 			_add_slider("角度", 0.0, 360.0, 1.0, float(params["angle"]), params, "angle")
 			_add_slider("振幅", 0.0, 1.0, 0.01, float(params["amplitude"]), params, "amplitude")
+		"transform":
+			_add_slider("旋转", 0.0, 360.0, 1.0, float(params["angle"]), params, "angle")
+			_add_slider("缩放", 0.1, 4.0, 0.05, float(params["scale"]), params, "scale")
+			_add_slider("偏移 X", -1.0, 1.0, 0.01, float(params["offset_x"]), params, "offset_x")
+			_add_slider("偏移 Y", -1.0, 1.0, 0.01, float(params["offset_y"]), params, "offset_y")
+			_add_check("平铺", bool(params.get("tile", false)), params, "tile")
+		"warp":
+			var warp_hint := Label.new()
+			warp_hint.text = "输入 1 是扰动场，输入 2 是被扭曲的图案。"
+			warp_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+			warp_hint.add_theme_font_size_override("font_size", 13)
+			_params_box.add_child(warp_hint)
+			_add_slider("强度", 0.0, 0.5, 0.01, float(params.get("amount", 0.15)), params, "amount")
 		"math":
 			_add_option("运算", ShaderGraphScript.MATH_OPS, int(params["op"]), params, "op")
 			_add_slider("强度", 0.0, 1.0, 0.01, float(params["amount"]), params, "amount")
@@ -403,7 +446,19 @@ func _show_params(id: String) -> void:
 		"output":
 			_add_number("色阶", 2, 32, 1, int(params["steps"]), params, "steps")
 			_add_color("颜色 A", params["color_a"], params, "color_a")
+			_add_color(
+				"颜色 中", params.get("color_mid", params["color_a"]), params, "color_mid"
+			)
 			_add_color("颜色 B", params["color_b"], params, "color_b")
+			_add_slider(
+				"中间位置",
+				0.05,
+				0.95,
+				0.01,
+				float(params.get("mid_position", 0.5)),
+				params,
+				"mid_position"
+			)
 
 
 func _add_option(
