@@ -133,8 +133,11 @@ var _magnifier_image_origin := Vector2i.ZERO
 var _magnifier_rotation := 0.0
 ## When the current pick started, used as a hard limit for a still finger.
 var _hold_pick_started_msec := 0
-## Full screen node editor, created the first time it is opened.
+## Node editor, created the first time it is opened. It lives in the canvas area
+## as a tab, so the drawing view stays one tap away.
 var _shader_composer: Control
+## Tab strip that switches between the drawing view and the node editor.
+var _view_tabs: TabBar
 ## Last theme color applied to the lens, so it is only restyled when it changes.
 var _lens_edge_cache := Color(-1, -1, -1, -1)
 
@@ -177,6 +180,7 @@ func _process(_delta: float) -> void:
 
 
 func _ready() -> void:
+	_ensure_view_tabs()
 	Global.cel_switched.connect(_on_cel_switched)
 	Global.single_tool_mode_changed.connect(_on_single_tool_mode_changed)
 	if Global.window_transparency:
@@ -971,14 +975,99 @@ func _on_main_canvas_visibility_changed() -> void:
 	update_transparent_shader()
 
 
-## Opens the full screen node editor used to generate a layer from a graph.
-## Passing a [param layer] that was made by it loads that layer's graph back, so
-## its nodes can be adjusted and the layer regenerated.
+## Opens the node editor used to generate a layer from a graph. Passing a
+## [param layer] that was made by it loads that layer's graph back, so its nodes
+## can be adjusted and the layer regenerated.
 func open_shader_composer(layer: BaseLayer = null) -> void:
+	_ensure_view_tabs()
+	_ensure_shader_composer()
 	if not is_instance_valid(_shader_composer):
-		_shader_composer = load("res://src/UI/ShaderComposer/ShaderComposerPage.gd").new()
-		add_child(_shader_composer)
+		return
 	_shader_composer.call("open_page", layer)
+	if is_instance_valid(_view_tabs):
+		if _view_tabs.current_tab != 1:
+			_view_tabs.current_tab = 1
+	else:
+		_show_composer_view(true)
+
+
+## Puts the drawing tab and the node editor tab next to the project tabs, so both
+## are always one tap away. The project tabs are moved into a row of their own,
+## which is the only change made to the existing interface tree.
+func _ensure_view_tabs() -> void:
+	if is_instance_valid(_view_tabs):
+		return
+	var main_canvas := get_node_or_null("DockableContainer/Main Canvas")
+	if main_canvas == null:
+		return
+	_view_tabs = TabBar.new()
+	_view_tabs.name = "ViewTabs"
+	_view_tabs.add_tab("绘画")
+	_view_tabs.add_tab("节点图层")
+	_view_tabs.tab_changed.connect(_on_view_tab_changed)
+	var tabs_container := main_canvas.get_node_or_null("TabsContainer")
+	if tabs_container == null:
+		main_canvas.add_child(_view_tabs)
+		main_canvas.move_child(_view_tabs, 1)
+		return
+	var row := tabs_container.get_node_or_null("ViewTabsRow") as HBoxContainer
+	if row == null:
+		row = HBoxContainer.new()
+		row.name = "ViewTabsRow"
+		row.add_theme_constant_override("separation", 10)
+		tabs_container.add_child(row)
+		tabs_container.move_child(row, 0)
+	var project_tabs := tabs_container.get_node_or_null("TabBar") as Control
+	if project_tabs != null and project_tabs.get_parent() != row:
+		project_tabs.reparent(row)
+		project_tabs.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	row.add_child(_view_tabs)
+
+
+## Creates the node editor inside the canvas area, on first use.
+func _ensure_shader_composer() -> void:
+	if is_instance_valid(_shader_composer):
+		return
+	var main_canvas := get_node_or_null("DockableContainer/Main Canvas")
+	if main_canvas == null:
+		return
+	_shader_composer = load("res://src/UI/ShaderComposer/ShaderComposerPage.gd").new()
+	main_canvas.add_child(_shader_composer)
+	_shader_composer.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_shader_composer.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	if _shader_composer.has_signal("page_closed"):
+		_shader_composer.connect("page_closed", _on_composer_closed)
+
+
+func _on_view_tab_changed(tab: int) -> void:
+	_show_composer_view(tab == 1)
+
+
+## Swaps the canvas rows for the node editor. The project tabs and the rest of
+## the interface stay in place, so the drawing tools never move.
+func _show_composer_view(active: bool) -> void:
+	var main_canvas := get_node_or_null("DockableContainer/Main Canvas")
+	if main_canvas == null:
+		return
+	var ruler := main_canvas.get_node_or_null("HorizontalRuler") as CanvasItem
+	var viewport_row := main_canvas.get_node_or_null("ViewportandVerticalRuler") as CanvasItem
+	if ruler != null:
+		ruler.visible = not active
+	if viewport_row != null:
+		viewport_row.visible = not active
+	if not is_instance_valid(_shader_composer):
+		return
+	if active:
+		_shader_composer.call("resume_page")
+	else:
+		_shader_composer.call("pause_page")
+
+
+## The close button of the editor brings the drawing tab back.
+func _on_composer_closed() -> void:
+	if is_instance_valid(_view_tabs):
+		_view_tabs.current_tab = 0
+	_show_composer_view(false)
 
 
 func update_transparent_shader() -> void:
