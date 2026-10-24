@@ -8,42 +8,42 @@ extends RefCounted
 
 ## Node types and how many inputs they take.
 const NODE_TYPES := {
-	"noise": {"label": "Noise", "inputs": 0},
-	"gradient": {"label": "Gradient", "inputs": 0},
-	"radial": {"label": "Radial", "inputs": 0},
-	"checker": {"label": "Checker", "inputs": 0},
-	"constant": {"label": "Constant", "inputs": 0},
-	"time": {"label": "Time", "inputs": 0},
-	"wave": {"label": "Wave", "inputs": 1},
+	"noise": {"label": "噪声", "inputs": 0},
+	"gradient": {"label": "渐变", "inputs": 0},
+	"radial": {"label": "径向", "inputs": 0},
+	"checker": {"label": "棋盘", "inputs": 0},
+	"constant": {"label": "常量", "inputs": 0},
+	"time": {"label": "时间", "inputs": 0},
+	"wave": {"label": "波纹", "inputs": 1},
 	# Transform group. They all move the sampling position, so they can be
 	# chained and applied to any branch of the graph.
-	"transform": {"label": "Transform", "inputs": 1},
-	"scale": {"label": "Scale", "inputs": 1},
-	"flip": {"label": "Flip", "inputs": 1},
-	"skew": {"label": "Skew", "inputs": 1},
-	"tile": {"label": "Tile", "inputs": 1},
-	"polar": {"label": "Polar", "inputs": 1},
-	"crop": {"label": "Crop", "inputs": 1},
-	"padding": {"label": "Padding", "inputs": 1},
-	"echo": {"label": "Echo", "inputs": 1},
-	"follow_path": {"label": "Follow Path", "inputs": 2},
-	"mesh_warp": {"label": "Mesh Warp", "inputs": 1},
-	"area_warp": {"label": "Area Warp", "inputs": 2},
-	"nine_slice": {"label": "Nine Slice", "inputs": 1},
-	"crop_content": {"label": "Crop Content", "inputs": 1},
-	"kaleidoscope": {"label": "Kaleidoscope", "inputs": 1},
-	"bend": {"label": "Bend", "inputs": 1},
-	"stretch": {"label": "Stretch", "inputs": 1},
-	"mirror": {"label": "Mirror", "inputs": 1},
-	"warp": {"label": "Warp", "inputs": 2},
+	"transform": {"label": "变换", "inputs": 1},
+	"scale": {"label": "缩放", "inputs": 1},
+	"flip": {"label": "翻转", "inputs": 1},
+	"skew": {"label": "倾斜", "inputs": 1},
+	"tile": {"label": "平铺", "inputs": 1},
+	"polar": {"label": "极坐标", "inputs": 1},
+	"crop": {"label": "裁剪", "inputs": 1},
+	"padding": {"label": "边距", "inputs": 1},
+	"echo": {"label": "回声", "inputs": 1},
+	"follow_path": {"label": "跟随路径", "inputs": 2},
+	"mesh_warp": {"label": "网格变形", "inputs": 1},
+	"area_warp": {"label": "区域扭曲", "inputs": 2},
+	"nine_slice": {"label": "九宫格", "inputs": 1},
+	"crop_content": {"label": "内容裁剪", "inputs": 1},
+	"kaleidoscope": {"label": "万花筒", "inputs": 1},
+	"bend": {"label": "弯曲", "inputs": 1},
+	"stretch": {"label": "拉伸", "inputs": 1},
+	"mirror": {"label": "镜像", "inputs": 1},
+	"warp": {"label": "扭曲", "inputs": 2},
 	# Filters read neighbouring pixels, they do not move the mapping.
-	"blur": {"label": "Blur", "inputs": 1},
-	"edge": {"label": "Edge", "inputs": 1},
-	"dither": {"label": "Dither", "inputs": 1},
-	"pixelate": {"label": "Pixelate", "inputs": 1},
-	"math": {"label": "Math", "inputs": 1},
-	"blend": {"label": "Blend", "inputs": 2},
-	"output": {"label": "Output", "inputs": 1},
+	"blur": {"label": "模糊", "inputs": 1},
+	"edge": {"label": "描边", "inputs": 1},
+	"dither": {"label": "抖动", "inputs": 1},
+	"pixelate": {"label": "像素化", "inputs": 1},
+	"math": {"label": "运算", "inputs": 1},
+	"blend": {"label": "混合", "inputs": 2},
+	"output": {"label": "输出", "inputs": 1},
 }
 
 const NOISE_TYPES := ["Simplex", "Simplex Smooth", "Perlin", "Cellular", "Value"]
@@ -490,7 +490,14 @@ static func default_params(type: String) -> Dictionary:
 		"padding":
 			return {"amount": 0.15, "align_x": 0.5, "align_y": 0.5}
 		"echo":
-			return {"count": 4, "angle": 90.0, "distance": 0.2, "mode": 0}
+			return {
+				"count": 4,
+				"angle": 90.0,
+				"distance": 0.2,
+				"mode": 0,
+				"animated": false,
+				"frame_step": 0.05,
+			}
 		"follow_path":
 			return {
 				"shape": 0,
@@ -814,18 +821,30 @@ func _eval(node_id: String, uv: Vector2, size: Vector2i, depth: int) -> float:
 			var pad_mapped := ((normalized - pad_origin) / pad_scale) * size_vec
 			return _sample(node, 0, pad_mapped, size, depth)
 		"echo":
-			# Samples the branch several times along a direction, which smears a
-			# moving pattern into a trail.
+			# Samples the branch several times, either along a direction (a spatial
+			# trail) or at earlier animation phases (a cross frame trail).
 			var echo_count := clampi(int(params["count"]), 1, 12)
-			var echo_direction := Vector2.from_angle(deg_to_rad(float(params["angle"])))
-			var echo_step := echo_direction * float(params["distance"]) * size_vec.y
 			var echo_best := 0.0
 			var echo_total := 0.0
-			for i in echo_count:
-				var echo_weight := float(i) / float(maxi(echo_count - 1, 1))
-				var echo_value := _sample(node, 0, uv + echo_step * echo_weight, size, depth)
-				echo_best = maxf(echo_best, echo_value)
-				echo_total += echo_value
+			if bool(params.get("animated", false)):
+				var echo_original_time := time
+				var echo_step_time := clampf(float(params.get("frame_step", 0.05)), 0.001, 0.5)
+				for i in echo_count:
+					time = fposmod(echo_original_time - echo_step_time * float(i), 1.0)
+					var echo_frame := clampf(
+						_eval(_input_id(node, 0), uv, size, depth + 1), 0.0, 1.0
+					)
+					echo_best = maxf(echo_best, echo_frame)
+					echo_total += echo_frame
+				time = echo_original_time
+			else:
+				var echo_direction := Vector2.from_angle(deg_to_rad(float(params["angle"])))
+				var echo_delta := echo_direction * float(params["distance"]) * size_vec.y
+				for i in echo_count:
+					var echo_weight := float(i) / float(maxi(echo_count - 1, 1))
+					var echo_sample := _sample(node, 0, uv + echo_delta * echo_weight, size, depth)
+					echo_best = maxf(echo_best, echo_sample)
+					echo_total += echo_sample
 			if int(params["mode"]) == 0:
 				return echo_best
 			return clampf(echo_total / float(echo_count), 0.0, 1.0)
@@ -1387,11 +1406,23 @@ static func describe(node: Dictionary) -> String:
 	return ""
 
 
+## True when the graph samples neighbours or does a pass over the whole branch,
+## so the preview should be generated at a lower resolution.
+func is_expensive() -> bool:
+	const HEAVY := ["echo", "blur", "warp", "area_warp", "mesh_warp", "crop_content"]
+	for node: Dictionary in nodes:
+		if HEAVY.has(str(node["type"])):
+			return true
+	return false
+
+
 ## True when the graph changes over time, so generating a layer has to produce
 ## one image per frame.
 func uses_time() -> bool:
 	for node: Dictionary in nodes:
 		if node["type"] == "time":
+			return true
+		if node["type"] == "echo" and bool(node["params"].get("animated", false)):
 			return true
 	return false
 

@@ -10,6 +10,8 @@ const ShaderPathEditorScript := preload("res://src/UI/ShaderComposer/ShaderPathE
 
 const PORT_COLOR := Color(0.55, 0.8, 1.0)
 const PREVIEW_LIMIT := 256
+## Preview size for graphs that sample neighbours, which are much slower.
+const PREVIEW_LIMIT_HEAVY := 128
 ## Minimum height of every interactive row, which keeps it usable with a finger.
 const TOUCH_SIZE := 40
 const TOUCH_FONT_SIZE := 15
@@ -17,6 +19,12 @@ const TOUCH_FONT_SIZE := 15
 const NARROW_WIDTH := 760
 ## Frames per second of the looping preview.
 const PREVIEW_FPS := 8.0
+## How many graph snapshots the undo history keeps.
+const UNDO_LIMIT := 40
+## Repeated parameter edits within this window collapse into one undo step.
+const UNDO_COALESCE_MSEC := 700
+## Where user made graph presets live.
+const PRESET_DIR := "user://shader_presets"
 
 var graph: RefCounted
 var _graph_edit: GraphEdit
@@ -35,6 +43,21 @@ var _preview_timer: Timer
 var _selected_id := ""
 ## Nodes selected in the graph, so several of them can be grouped at once.
 var _selected_ids: Array[String] = []
+## Tapping a node adds it to the selection instead of replacing it.
+var _multi_select := false
+## Snapshots of the graph, so node edits can be undone like the rest of the app.
+var _undo_stack: Array[Dictionary] = []
+var _redo_stack: Array[Dictionary] = []
+var _undo_key := ""
+var _undo_time := 0
+## Filters the parameter rows of the selected node.
+var _param_filter := ""
+var _param_filter_edit: LineEdit
+## Saved graph presets, and the small dialog used to name them.
+var _preset_menu: MenuButton
+var _preset_paths: Array[String] = []
+var _preset_dialog: ConfirmationDialog
+var _preset_name: LineEdit
 var _can_draw_before := true
 ## Animation phase shown in the preview, and how many frames a dynamic graph
 ## generates.
@@ -161,9 +184,16 @@ func _build_ui() -> void:
 	toolbar.add_child(_make_button("复制选中", _on_copy_pressed))
 	toolbar.add_child(_make_button("删除选中", _on_delete_pressed))
 	toolbar.add_child(_make_button("组合选中", _on_group_pressed, "把选中的节点放进一个可折叠的组"))
+	toolbar.add_child(_make_button("多选", _on_multi_select_pressed, "打开后连续点节点即可多选"))
+	toolbar.add_child(_make_button("撤销", _undo, "Ctrl+Z"))
+	toolbar.add_child(_make_button("重做", _redo, "Ctrl+Y"))
 	toolbar.add_child(_make_button("刷新预览", _refresh_preview))
-	toolbar.add_child(_make_button("示例：像素海面", _on_ocean_preset_pressed))
-	toolbar.add_child(_make_button("重置图", _on_reset_pressed, "回到 Noise → Output 的初始图"))
+	_preset_menu = MenuButton.new()
+	_preset_menu.text = "预设"
+	_preset_menu.custom_minimum_size = Vector2(0, TOUCH_SIZE)
+	_preset_menu.add_theme_font_size_override("font_size", TOUCH_FONT_SIZE)
+	_build_preset_menu()
+	toolbar.add_child(_preset_menu)
 	_play_button = _make_button("▶ 播放", _on_play_pressed, "循环播放预览")
 	toolbar.add_child(_play_button)
 	var frames_label := Label.new()
@@ -208,6 +238,26 @@ func _build_ui() -> void:
 
 	_side = VBoxContainer.new()
 	_body.add_child(_side)
+
+	var filter_row := HBoxContainer.new()
+	var filter_label := Label.new()
+	filter_label.text = "筛选"
+	filter_label.custom_minimum_size = Vector2(48, 0)
+	filter_label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	filter_label.add_theme_font_size_override("font_size", 14)
+	filter_row.add_child(filter_label)
+	_param_filter_edit = LineEdit.new()
+	_param_filter_edit.placeholder_text = "参数名过滤…"
+	_param_filter_edit.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_param_filter_edit.custom_minimum_size = Vector2(0, TOUCH_SIZE)
+	_param_filter_edit.add_theme_font_size_override("font_size", TOUCH_FONT_SIZE)
+	_param_filter_edit.text_changed.connect(
+		func(text: String) -> void:
+			_param_filter = text
+			_show_params(_selected_id)
+	)
+	filter_row.add_child(_param_filter_edit)
+	_side.add_child(filter_row)
 
 	_params_hint = Label.new()
 	_params_hint.text = "选择一个节点来编辑参数"
@@ -384,11 +434,13 @@ func _toggle_group(group_id: String) -> void:
 	var group: Dictionary = graph.get_group(group_id)
 	if group.is_empty():
 		return
+	_push_undo()
 	graph.set_group_collapsed(group_id, not bool(group.get("collapsed", false)))
 	_refresh_graph()
 
 
 func _dissolve_group(group_id: String) -> void:
+	_push_undo()
 	graph.remove_group(group_id)
 	_refresh_graph()
 
@@ -399,6 +451,7 @@ func _on_group_pressed() -> void:
 		# The status line is rewritten by the preview, so use the app notification.
 		Global.notification_label("先选中两个以上节点再组合")
 		return
+	_push_undo()
 	var group_id: String = graph.add_group(_selected_ids)
 	if group_id.is_empty():
 		Global.notification_label("选中的节点已经在别的组里")
@@ -429,18 +482,21 @@ func _make_graph_node(node: Dictionary) -> GraphNode:
 
 
 func _on_connection_request(from_node: StringName, from_port: int, to_node: StringName, to_port: int) -> void:
+	_push_undo()
 	graph.connect_nodes(str(from_node), str(to_node), to_port)
 	_refresh_graph()
 	_schedule_preview()
 
 
 func _on_disconnection_request(from_node: StringName, from_port: int, to_node: StringName, to_port: int) -> void:
+	_push_undo()
 	graph.disconnect_input(str(to_node), to_port)
 	_refresh_graph()
 	_schedule_preview()
 
 
 func _on_delete_nodes_request(nodes: Array[StringName]) -> void:
+	_push_undo()
 	var removed := {}
 	for node_name in nodes:
 		var target := str(node_name)
@@ -494,6 +550,7 @@ func _on_add_menu_pressed(item_id: int) -> void:
 	var type: String = str(_menu_types.get(item_id, ""))
 	if type.is_empty():
 		return
+	_push_undo()
 	# New nodes land next to the visible area instead of on top of each other.
 	var offset := Vector2(60 + graph.nodes.size() * 24, 40 + graph.nodes.size() * 18)
 	var node_id: String = graph.add_node(type, offset)
@@ -503,9 +560,70 @@ func _on_add_menu_pressed(item_id: int) -> void:
 	_schedule_preview()
 
 
+## Remembers the graph before a change. Repeating the same key shortly after
+## (dragging a slider) collapses into a single undo step.
+func _push_undo(key := "") -> void:
+	var now := Time.get_ticks_msec()
+	if not key.is_empty() and key == _undo_key and now - _undo_time < UNDO_COALESCE_MSEC:
+		_undo_time = now
+		return
+	_undo_key = key
+	_undo_time = now
+	_undo_stack.append(graph.to_dict())
+	if _undo_stack.size() > UNDO_LIMIT:
+		_undo_stack.pop_front()
+	_redo_stack.clear()
+
+
+func _undo() -> void:
+	if _undo_stack.is_empty():
+		Global.notification_label("没有可撤销的节点操作")
+		return
+	_redo_stack.append(graph.to_dict())
+	graph.from_dict(_undo_stack.pop_back())
+	_undo_key = ""
+	_after_history_change()
+
+
+func _redo() -> void:
+	if _redo_stack.is_empty():
+		Global.notification_label("没有可重做的节点操作")
+		return
+	_undo_stack.append(graph.to_dict())
+	graph.from_dict(_redo_stack.pop_back())
+	_undo_key = ""
+	_after_history_change()
+
+
+func _after_history_change() -> void:
+	_selected_ids.clear()
+	if (
+		graph.get_node_by_id(_selected_id).is_empty()
+		and graph.get_group(_selected_id).is_empty()
+	):
+		_selected_id = ""
+	_refresh_graph()
+	_show_params(_selected_id)
+	_refresh_preview()
+
+
+## Turns tap-to-select into tap-to-add, so several nodes can be grouped by touch.
+func _on_multi_select_pressed() -> void:
+	_multi_select = not _multi_select
+	Global.notification_label("多选：%s" % ("开" if _multi_select else "关"))
+	if _multi_select:
+		if not _selected_id.is_empty() and not _selected_ids.has(_selected_id):
+			_selected_ids.append(_selected_id)
+	elif _selected_ids.size() > 1:
+		_selected_ids.clear()
+		if not _selected_id.is_empty():
+			_selected_ids.append(_selected_id)
+
+
 func _on_copy_pressed() -> void:
 	if _selected_id.is_empty():
 		return
+	_push_undo()
 	var copy: String = graph.duplicate_node(_selected_id)
 	if copy.is_empty():
 		return
@@ -515,7 +633,113 @@ func _on_copy_pressed() -> void:
 	_schedule_preview()
 
 
+## Builds the preset menu: two built in presets, the save entry and the files the
+## user saved before.
+func _build_preset_menu() -> void:
+	var root := _preset_menu.get_popup()
+	root.clear()
+	_preset_paths.clear()
+	root.add_item("默认图", 0)
+	root.add_item("像素海面", 1)
+	root.add_separator()
+	root.add_item("保存当前图…", 2)
+	var saved := _list_presets()
+	if not saved.is_empty():
+		root.add_separator("已保存")
+	var id := 10
+	for path in saved:
+		_preset_paths.append(path)
+		root.add_item(path.get_file().get_basename(), id)
+		id += 1
+	if not root.id_pressed.is_connected(_on_preset_pressed):
+		root.id_pressed.connect(_on_preset_pressed)
+
+
+func _list_presets() -> Array[String]:
+	var result: Array[String] = []
+	var dir := DirAccess.open(PRESET_DIR)
+	if dir == null:
+		return result
+	dir.list_dir_begin()
+	var file_name := dir.get_next()
+	while not file_name.is_empty():
+		if not dir.current_is_dir() and file_name.get_extension() == "txt":
+			result.append(PRESET_DIR.path_join(file_name))
+		file_name = dir.get_next()
+	dir.list_dir_end()
+	result.sort()
+	return result
+
+
+func _on_preset_pressed(id: int) -> void:
+	if id == 0:
+		_on_reset_pressed()
+		return
+	if id == 1:
+		_on_ocean_preset_pressed()
+		return
+	if id == 2:
+		_show_preset_dialog()
+		return
+	var index := id - 10
+	if index >= 0 and index < _preset_paths.size():
+		_load_preset(_preset_paths[index])
+
+
+func _show_preset_dialog() -> void:
+	if not is_instance_valid(_preset_dialog):
+		_preset_dialog = ConfirmationDialog.new()
+		_preset_dialog.title = "保存预设"
+		_preset_name = LineEdit.new()
+		_preset_name.custom_minimum_size = Vector2(240, TOUCH_SIZE)
+		_preset_name.add_theme_font_size_override("font_size", TOUCH_FONT_SIZE)
+		_preset_dialog.add_child(_preset_name)
+		_preset_dialog.confirmed.connect(_save_preset)
+		add_child(_preset_dialog)
+	_preset_dialog.popup_centered(Vector2i(320, 140))
+	_preset_name.grab_focus()
+	_preset_name.select_all()
+
+
+func _save_preset() -> void:
+	var typed := _preset_name.text.strip_edges()
+	if typed.is_empty():
+		Global.notification_label("预设名不能为空")
+		return
+	DirAccess.make_dir_recursive_absolute(ProjectSettings.globalize_path(PRESET_DIR))
+	var path := PRESET_DIR.path_join(typed.validate_filename() + ".txt")
+	var file := FileAccess.open(path, FileAccess.WRITE)
+	if file == null:
+		Global.notification_label("无法写入预设")
+		return
+	file.store_string(var_to_str(graph.to_dict()))
+	file.close()
+	_build_preset_menu()
+	Global.notification_label("预设已保存：%s" % typed)
+
+
+func _load_preset(path: String) -> void:
+	var file := FileAccess.open(path, FileAccess.READ)
+	if file == null:
+		Global.notification_label("无法读取预设")
+		return
+	var data = str_to_var(file.get_as_text())
+	file.close()
+	if not (data is Dictionary):
+		Global.notification_label("预设文件损坏：%s" % path.get_file())
+		return
+	_push_undo()
+	graph.from_dict(data as Dictionary)
+	_selected_id = ""
+	_selected_ids.clear()
+	_refresh_graph()
+	_show_params("")
+	_refresh_preview()
+	Global.notification_label("已载入预设：%s" % path.get_file().get_basename())
+
+
 func _on_reset_pressed() -> void:
+	_push_undo()
 	graph.reset_to_default()
 	_selected_id = ""
 	_show_params("")
@@ -526,6 +750,7 @@ func _on_reset_pressed() -> void:
 func _on_delete_pressed() -> void:
 	if _selected_id.is_empty():
 		return
+	_push_undo()
 	if _selected_id.begins_with(ShaderGraphScript.GROUP_PREFIX):
 		graph.remove_group(_selected_id)
 	else:
@@ -539,12 +764,19 @@ func _on_delete_pressed() -> void:
 
 func _on_node_selected(node: Node) -> void:
 	_selected_id = str(node.name)
-	if not _selected_ids.has(_selected_id):
+	if _multi_select:
+		if not _selected_ids.has(_selected_id):
+			_selected_ids.append(_selected_id)
+	else:
+		_selected_ids.clear()
 		_selected_ids.append(_selected_id)
 	_show_params(_selected_id)
 
 
 func _on_node_deselected(node: Node) -> void:
+	if _multi_select:
+		# In multi select mode the graph deselects on every new tap, keep the set.
+		return
 	var node_id := str(node.name)
 	_selected_ids.erase(node_id)
 	if _selected_id == node_id:
@@ -685,12 +917,25 @@ func _show_params(id: String) -> void:
 			)
 		"echo":
 			var echo_hint := Label.new()
-			echo_hint.text = "沿一个方向重复采样。最大值留下拖影，平均值得到残影。"
+			echo_hint.text = (
+				"空间回声沿一个方向重复采样；跨帧回声则取更早的相位，做出残影。"
+				+ "最大值留下拖影，平均值得到残影。"
+			)
 			echo_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 			echo_hint.add_theme_font_size_override("font_size", 13)
 			_params_box.add_child(echo_hint)
 			_add_slider("采样数", 1.0, 12.0, 1.0, float(params["count"]), params, "count")
 			_add_option("合并", ShaderGraphScript.ECHO_MODES, int(params["mode"]), params, "mode")
+			_add_check("跨帧回声", bool(params.get("animated", false)), params, "animated")
+			_add_slider(
+				"帧间隔",
+				0.01,
+				0.5,
+				0.01,
+				float(params.get("frame_step", 0.05)),
+				params,
+				"frame_step"
+			)
 			_add_slider("角度", 0.0, 360.0, 1.0, float(params["angle"]), params, "angle")
 			_add_slider("距离", 0.0, 1.0, 0.01, float(params["distance"]), params, "distance")
 		"follow_path":
@@ -883,6 +1128,27 @@ func _show_params(id: String) -> void:
 				params,
 				"alpha_from_value"
 			)
+	_apply_param_filter()
+
+
+## Hides the parameter rows whose label does not contain the filter text.
+func _apply_param_filter() -> void:
+	if _param_filter.is_empty():
+		return
+	var needle := _param_filter.to_lower()
+	for child in _params_box.get_children():
+		child.visible = _row_label(child).to_lower().contains(needle)
+
+
+static func _row_label(row: Node) -> String:
+	if row is CheckBox:
+		return (row as CheckBox).text
+	if row is Label:
+		return (row as Label).text
+	for child in row.get_children():
+		if child is Label:
+			return (child as Label).text
+	return ""
 
 
 func _add_option(
@@ -908,6 +1174,7 @@ func _add_option(
 	option.add_theme_font_size_override("font_size", TOUCH_FONT_SIZE)
 	option.item_selected.connect(
 		func(index: int) -> void:
+			_push_undo("%s:%s" % [_selected_id, key])
 			params[key] = index
 			_schedule_preview()
 			# Some options change which controls are shown, like the path shape.
@@ -931,6 +1198,7 @@ func _add_path_editor(params: Dictionary) -> void:
 	editor.custom_minimum_size = Vector2(0, 200)
 	editor.points_changed.connect(
 		func(new_points: Array) -> void:
+			_push_undo("%s:points" % _selected_id)
 			params["points"] = new_points
 			_schedule_preview()
 	)
@@ -982,6 +1250,7 @@ func _add_slider(
 	row.add_child(display)
 	slider.value_changed.connect(
 		func(new_value: float) -> void:
+			_push_undo("%s:%s" % [_selected_id, key])
 			params[key] = new_value
 			display.text = _format_number(new_value, step)
 			_schedule_preview()
@@ -1014,6 +1283,7 @@ func _add_number(
 	spin.add_theme_font_size_override("font_size", TOUCH_FONT_SIZE)
 	spin.value_changed.connect(
 		func(new_value: float) -> void:
+			_push_undo("%s:%s" % [_selected_id, key])
 			params[key] = int(new_value)
 			_schedule_preview()
 	)
@@ -1031,6 +1301,7 @@ func _add_check(
 	check.add_theme_font_size_override("font_size", TOUCH_FONT_SIZE)
 	check.toggled.connect(
 		func(pressed: bool) -> void:
+			_push_undo("%s:%s" % [_selected_id, key])
 			params[key] = pressed
 			_schedule_preview()
 	)
@@ -1049,6 +1320,7 @@ func _add_color(label_text: String, value: Color, params: Dictionary, key: Strin
 	picker.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	picker.color_changed.connect(
 		func(color: Color) -> void:
+			_push_undo("%s:%s" % [_selected_id, key])
 			params[key] = color
 			_schedule_preview()
 	)
@@ -1073,8 +1345,9 @@ func _refresh_preview() -> void:
 	var project := Global.current_project
 	if project == null:
 		return
+	var limit := PREVIEW_LIMIT_HEAVY if graph.is_expensive() else PREVIEW_LIMIT
 	var preview_size := Vector2i(
-		mini(project.size.x, PREVIEW_LIMIT), mini(project.size.y, PREVIEW_LIMIT)
+		mini(project.size.x, limit), mini(project.size.y, limit)
 	)
 	graph.time = _phase.value if is_instance_valid(_phase) else 0.0
 	if is_instance_valid(_path_editor):
@@ -1115,6 +1388,7 @@ func _advance_playback() -> void:
 
 ## Builds the ready made pixel sea, so a dynamic result is one click away.
 func _on_ocean_preset_pressed() -> void:
+	_push_undo()
 	graph.build_ocean_preset()
 	_selected_id = ""
 	_show_params("")
@@ -1128,6 +1402,10 @@ func _on_add_layer_pressed() -> void:
 	if project == null:
 		return
 	var frames := maxi(int(_frame_count.value) if is_instance_valid(_frame_count) else 1, 1)
+	# A big animated graph takes a moment, so show what is going on first.
+	if is_instance_valid(_status):
+		_status.text = "正在生成 %d 帧…" % frames
+		await get_tree().process_frame
 	var images: Array[Image] = []
 	if graph.uses_time():
 		# One image per frame, so the layer animates along the timeline.
@@ -1166,12 +1444,27 @@ static func _update_shader_layer(project: Project, layer_index: int, images: Arr
 		if not (cel is PixelCel):
 			continue
 		var replaced: ImageExtended = (cel as PixelCel).image
-		var incoming := ImageExtended.create_from_image(images[f], project.is_indexed())
+		var incoming := _make_cel_image(images[f], project)
 		project.undo_redo.add_do_method(_set_cel_image.bind(cel, incoming))
 		project.undo_redo.add_undo_method(_set_cel_image.bind(cel, replaced))
 	project.undo_redo.add_do_method(Global.undo_or_redo.bind(false))
 	project.undo_redo.add_undo_method(Global.undo_or_redo.bind(true))
 	project.undo_redo.commit_action()
+
+
+## Builds the cel image of the project. Indexed projects map colours to the
+## palette, so the indices are converted too and transparency is restored
+## afterwards, otherwise the map would be index 0 everywhere and alpha would be
+## replaced by the nearest palette colour.
+static func _make_cel_image(image: Image, project: Project) -> ImageExtended:
+	var result := ImageExtended.create_from_image(image, project.is_indexed())
+	if result.is_indexed:
+		result.convert_rgb_to_indexed()
+		for y in result.get_height():
+			for x in result.get_width():
+				if image.get_pixel(x, y).a < 0.5:
+					result.set_pixel(x, y, Color(0, 0, 0, 0))
+	return result
 
 
 static func _set_cel_image(cel: PixelCel, image: ImageExtended) -> void:
@@ -1206,7 +1499,7 @@ static func _add_animated_layer(
 		if not (cel is PixelCel):
 			continue
 		var image: Image = images[mini(f, images.size() - 1)]
-		(cel as PixelCel).image = ImageExtended.create_from_image(image, project.is_indexed())
+		(cel as PixelCel).image = _make_cel_image(image, project)
 		cel.update_texture()
 
 	var current_layer: BaseLayer = project.layers[project.current_layer]
@@ -1259,6 +1552,19 @@ func _apply_layout() -> void:
 func _input(event: InputEvent) -> void:
 	if not visible or not is_instance_valid(_graph_edit):
 		return
+	if event is InputEventKey and event.pressed and not event.echo:
+		var key := event as InputEventKey
+		if key.ctrl_pressed and key.keycode == KEY_Z:
+			if key.shift_pressed:
+				_redo()
+			else:
+				_undo()
+			get_viewport().set_input_as_handled()
+			return
+		if key.ctrl_pressed and key.keycode == KEY_Y:
+			_redo()
+			get_viewport().set_input_as_handled()
+			return
 	if event is InputEventScreenTouch:
 		var touch := event as InputEventScreenTouch
 		if touch.pressed:
