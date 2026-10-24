@@ -2660,7 +2660,10 @@ func _build_canvas_line_section(id: String, params: Dictionary) -> void:
 	_add_slider("羽化", 0.0, 0.2, 0.005, float(params.get("soft", 0.0)), params, "soft")
 	_add_check("闭合填充（路径需闭合）", bool(params.get("fill", false)), params, "fill")
 	var curve_hint := Label.new()
-	curve_hint.text = "线宽曲线：横轴是从起点到终点的位置，纵轴是线宽倍率，拖动圆点调整。"
+	curve_hint.text = (
+		"线宽曲线：横轴是从起点到终点的位置，纵轴是线宽倍率。拖动圆点调整，"
+		+ "浅色面积就是这条线的实际粗细；也可以直接点下面的预设。"
+	)
 	curve_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	curve_hint.add_theme_font_size_override("font_size", 13)
 	_params_target.add_child(curve_hint)
@@ -2673,14 +2676,40 @@ func _add_width_profile(id: String, params: Dictionary) -> void:
 	var curve := ShaderWidthCurveScript.new()
 	curve.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	curve.set_profile(params.get("profile", []))
-	curve.changed.connect(
-		func(values: Array) -> void:
-			_push_undo("%s:profile" % id)
-			_mark_preview_dirty(id)
-			params["profile"] = values
-			_schedule_preview()
-	)
+	var apply := func(values: Array) -> void:
+		_push_undo("%s:profile" % id)
+		_mark_preview_dirty(id)
+		params["profile"] = values
+		_schedule_preview()
+	curve.changed.connect(apply)
 	_params_target.add_child(curve)
+	# One tap for the shapes that would otherwise take several careful drags.
+	var presets := {
+		"均匀": [1.0, 1.0, 1.0, 1.0, 1.0],
+		"锥形": [1.0, 0.86, 0.62, 0.34, 0.08],
+		"反锥": [0.08, 0.34, 0.62, 0.86, 1.0],
+		"两头细": [0.12, 0.66, 1.0, 0.66, 0.12],
+	}
+	# Wraps on its own, so the row still fits a phone in portrait.
+	var row := HFlowContainer.new()
+	row.add_theme_constant_override("h_separation", 4)
+	row.add_theme_constant_override("v_separation", 4)
+	for label: String in presets.keys():
+		var preset: Array = (presets[label] as Array).duplicate()
+		row.add_child(
+			_make_button(
+				label,
+				func() -> void: curve.set_values(preset),
+				"把线宽曲线设成「%s」" % label,
+				Vector2(0, 34)
+			)
+		)
+	row.add_child(
+		_make_button(
+			"反向", func() -> void: curve.reverse(), "把线宽曲线左右翻转", Vector2(0, 34)
+		)
+	)
+	_params_target.add_child(row)
 
 
 ## Crop rectangle of the imported art, with a preview of what the node really

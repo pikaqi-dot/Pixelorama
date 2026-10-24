@@ -2201,21 +2201,32 @@ func _canvas_path_image(
 
 
 ## Samples the width profile of a stroke. The array holds evenly spaced values
-## from the start of the curve to its end, so five numbers give four straight
-## ramps.
+## from the start of the curve to its end. A Catmull-Rom spline runs through
+## them, so five numbers give a taper that curves instead of five straight ramps
+## with a kink at every number. The ends repeat their neighbour, which keeps the
+## first and last sample flat, and the result is clamped because a spline can
+## overshoot a sharp change.
 static func profile_at(profile: Array, t: float) -> float:
-	if profile.is_empty():
+	var count := profile.size()
+	if count <= 0:
 		return 1.0
-	if profile.size() == 1:
+	if count == 1:
 		return clampf(float(profile[0]), 0.0, 1.0)
-	var position := clampf(t, 0.0, 1.0) * float(profile.size() - 1)
-	var index := mini(int(floorf(position)), profile.size() - 2)
+	var position := clampf(t, 0.0, 1.0) * float(count - 1)
+	var index := mini(int(floorf(position)), count - 2)
 	var ratio := position - float(index)
-	return lerpf(
-		clampf(float(profile[index]), 0.0, 1.0),
-		clampf(float(profile[index + 1]), 0.0, 1.0),
-		ratio
+	var p0 := clampf(float(profile[maxi(index - 1, 0)]), 0.0, 1.0)
+	var p1 := clampf(float(profile[index]), 0.0, 1.0)
+	var p2 := clampf(float(profile[index + 1]), 0.0, 1.0)
+	var p3 := clampf(float(profile[mini(index + 2, count - 1)]), 0.0, 1.0)
+	var square := ratio * ratio
+	var value := 0.5 * (
+		(2.0 * p1)
+		+ (-p0 + p2) * ratio
+		+ (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * square
+		+ (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * square * ratio
 	)
+	return clampf(value, 0.0, 1.0)
 
 
 ## Rasterises the recursive tree at [param size] and caches it per generated
