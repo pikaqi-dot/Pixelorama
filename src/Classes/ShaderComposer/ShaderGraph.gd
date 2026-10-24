@@ -2,9 +2,11 @@ class_name ShaderGraph
 extends RefCounted
 ## A tiny node graph that turns procedural nodes into a pixel image.
 ##
-## Every node produces a single grayscale value between 0 and 1 for a pixel. The
-## [code]output[/code] node turns that value into a color with a three stop ramp
-## and a limited number of steps, which keeps the result pixel art friendly.
+## Every node produces a single value between 0 and 1 for a pixel. A node can own
+## a colour, and that colour travels down the wires to the [code]output[/code] node,
+## which only closes the graph and says how the result meets the layer. A branch
+## without a colour is drawn in grey, and a branch that drops the colour (a mask,
+## a density, a canvas read as transparency) starts a grey picture again.
 
 ## Node types and how many inputs they take.
 const NODE_TYPES := {
@@ -696,8 +698,13 @@ static func default_params(type: String) -> Dictionary:
 				"stamp": 0.3,
 				# Value the opaque part of the brush is stamped with. The brush
 				# only supplies its shape, so this is where the stamps get their
-				# step on the output ramp.
+				# brightness.
 				"level": 1.0,
+				# The colour the stamps are painted in, and the flag that says
+				# whether this node owns a colour at all. A colour travels down the
+				# chain from here, which is why the output node needs none.
+				"tint": false,
+				"color": Color(1.0, 1.0, 1.0, 1.0),
 				"angle": 0.0,
 				"angle_random": 180.0,
 				"scale_min": 0.7,
@@ -902,17 +909,11 @@ static func default_params(type: String) -> Dictionary:
 			return {"op": 0, "amount": 0.5, "steps": 4}
 		"blend":
 			return {"op": 0, "factor": 0.5}
+		# The output only closes the graph: it says how the artwork meets the layer,
+		# a solid block or an overlay with transparency. Colour is not decided here,
+		# the node that paints a pixel carries it down the chain.
 		"output":
-			return {
-				"steps": 2,
-				"color_a": Color(0.09, 0.09, 0.12, 1.0),
-				"color_mid": Color(0.45, 0.45, 0.5, 1.0),
-				"color_b": Color(0.95, 0.95, 0.98, 1.0),
-				"mid_position": 0.5,
-				"transparent": false,
-				"alpha_cut": 0.0,
-				"alpha_from_value": false,
-			}
+			return {"transparent": false, "alpha_cut": 0.0, "alpha_from_value": false}
 	return {}
 
 
@@ -966,17 +967,24 @@ func _begin_generation(size: Vector2i) -> Dictionary:
 		return {"image": image, "size": size, "done": true}
 	var output := get_node_by_id(output_id)
 	var output_params: Dictionary = params_for(output)
-	var color_a: Color = output_params["color_a"]
+	var source := _input_id(output, 0)
+	# Old graphs decided the colour at the output, so a ramp saved there is still
+	# honoured. New ones carry the colour on the node that paints it, and the whole
+	# picture is that colour where that node is the one feeding the output.
+	var legacy := output_params.has("color_a") and output_params.has("color_b")
+	var color_a: Color = output_params.get("color_a", Color.WHITE)
 	return {
 		"image": image,
 		"size": size,
 		"done": false,
 		"row": 0,
-		"source": _input_id(output, 0),
-		"steps": maxi(int(output_params["steps"]), 2),
+		"source": source,
+		"tint": source_colour(source),
+		"ramp": legacy,
+		"steps": maxi(int(output_params.get("steps", 2)), 2),
 		"color_a": color_a,
 		"color_mid": output_params.get("color_mid", color_a),
-		"color_b": output_params["color_b"],
+		"color_b": output_params.get("color_b", color_a),
 		"mid_position": clampf(float(output_params.get("mid_position", 0.5)), 0.05, 0.95),
 		# A transparent background turns the layer into an overlay instead of a
 		# full rectangle, which is what particles and glows need.
@@ -991,6 +999,8 @@ func _paint_rows(state: Dictionary, from_row: int, to_row: int) -> void:
 	var image: Image = state["image"]
 	var size: Vector2i = state["size"]
 	var source: String = state["source"]
+	var tint: Variant = state["tint"]
+	var use_ramp: bool = state["ramp"]
 	var steps: int = state["steps"]
 	var color_a: Color = state["color_a"]
 	var color_mid: Color = state["color_mid"]
@@ -1005,12 +1015,75 @@ func _paint_rows(state: Dictionary, from_row: int, to_row: int) -> void:
 			if transparent and value <= alpha_cut:
 				image.set_pixel(x, y, Color(0.0, 0.0, 0.0, 0.0))
 				continue
-			var step := floori(value * steps)
-			var ramp := clampf(float(step) / float(steps - 1), 0.0, 1.0)
-			var color := _ramp_color(color_a, color_mid, color_b, mid_position, ramp)
+			var color: Color
+			if tint == null:
+				if use_ramp:
+					# Graphs saved before the colour moved into the nodes keep
+					# their three stop ramp, so old artwork still looks the same.
+					var step := floori(value * steps)
+					var ramp := clampf(float(step) / float(steps - 1), 0.0, 1.0)
+					color = _ramp_color(color_a, color_mid, color_b, mid_position, ramp)
+				else:
+					color = Color(value, value, value, 1.0)
+			else:
+				# The colour of the branch, darkened by how much the pixel covers,
+				# which is what keeps soft edges and glows readable.
+				var base: Color = tint
+				color = Color(base.r * value, base.g * value, base.b * value, 1.0)
 			if transparent and alpha_from_value:
 				color.a = value
 			image.set_pixel(x, y, color)
+
+
+## Colour a branch carries, or null when it carries none. A node that owns a
+## colour hands it to everything downstream, so the output node needs no colour
+## settings of its own. A blend mixes the colours of both of its branches.
+func source_colour(node_id: String) -> Variant:
+	return _colour_of(node_id, 0)
+
+
+func _colour_of(node_id: String, depth: int) -> Variant:
+	if node_id.is_empty() or depth > 32:
+		return null
+	var node := get_node_by_id(node_id)
+	if node.is_empty():
+		return null
+	var params: Dictionary = params_for(node)
+	var own: Variant = own_colour(params)
+	if own != null:
+		return own
+	var node_type := str(node["type"])
+	if own_colour_stops(node, params):
+		# Reading a canvas through its transparency gives coverage, not a picture,
+		# so a colour does not travel through it.
+		return null
+	if node_type == "blend":
+		var from_a: Variant = _colour_of(_input_id(node, 0), depth + 1)
+		var from_b: Variant = _colour_of(_input_id(node, 1), depth + 1)
+		if from_a == null:
+			return from_b
+		if from_b == null:
+			return from_a
+		return (from_a as Color).lerp(from_b as Color, clampf(float(params.get("factor", 0.5)), 0.0, 1.0))
+	return _colour_of(_input_id(node, 0), depth + 1)
+
+
+## Colour a node declares for itself, or null. Any node can carry one, which is
+## what lets a scatter paint its stamps green without a colour on the output.
+static func own_colour(params: Dictionary) -> Variant:
+	if not params.has("color") or not bool(params.get("tint", false)):
+		return null
+	return params["color"]
+
+
+## True when a node turns its input into coverage, which is not a picture, so no
+## colour passes through it.
+static func own_colour_stops(node: Dictionary, params: Dictionary) -> bool:
+	if str(node["type"]) != "pixel_art":
+		return false
+	if int(params.get("source", 0)) == 1:
+		return false
+	return int(params.get("channel", 0)) != 0
 
 
 static func _ramp_color(a: Color, mid: Color, b: Color, mid_position: float, t: float) -> Color:
@@ -1657,7 +1730,7 @@ func _eval(node_id: String, uv: Vector2, size: Vector2i, depth: int) -> float:
 		return clampf(bloom_source + bloom_halo, 0.0, 1.0)
 	elif node_type == "color_adjust":
 		# Value space grading: exposure, contrast, brightness, gamma, then mix.
-		# Hue and saturation belong to the ramp of the output node instead.
+		# Hue and saturation belong to the colour the branch carries instead.
 		var adjust_source := clampf(
 			_eval(_input_id(node, 0), uv, size, depth + 1), 0.0, 1.0
 		)
@@ -2044,24 +2117,17 @@ static func _path_point_at(flat: PackedVector2Array, t: float) -> Dictionary:
 
 ## Preview of what one node outputs, used by the frame under the nodes in the
 ## graph editor and by the picture in the side panel. It evaluates the node the
-## same way the generator does, and maps that value through the ramp of the node
-## itself, wherever the node carries a colour.
+## same way the generator does, and paints it in the colour the branch carries.
 func preview_node(node_id: String, size: Vector2i) -> Image:
 	_resolve_animations()
-	# Every node is previewed in its own colour, and only the output node has one.
-	# A node without a ramp is a plain value field, so it is drawn white on a
-	# transparent background rather than borrowing the colour of another node,
-	# which used to paint the whole graph in the palette of the output.
-	var ramp := _node_ramp(node_id)
-	var grey := ramp.is_empty()
-	var steps := maxi(int(ramp.get("steps", 2)), 2)
-	var color_a: Color = ramp.get("color_a", Color.WHITE)
-	var color_mid: Color = ramp.get("color_mid", color_a)
-	var color_b: Color = ramp.get("color_b", Color.WHITE)
-	var mid_position := float(ramp.get("mid_position", 0.5))
-	var transparent := bool(ramp.get("transparent", false))
-	var fade := transparent and bool(ramp.get("alpha_from_value", false))
-	var alpha_cut := maxf(float(ramp.get("alpha_cut", 0.0)), PREVIEW_EMPTY)
+	# The colour is the one the branch carries: a node that owns a colour paints
+	# with it, and every node downstream inherits it, which is what makes a colour
+	# of a scatter visible under the filters behind it. A branch without a colour
+	# is a plain value field, so it is drawn white on a transparent background
+	# rather than borrowing the palette of another node.
+	var tint: Variant = source_colour(node_id)
+	var fade := _preview_fades_alpha()
+	var alpha_cut := _preview_alpha_cut()
 	# Written into one byte buffer and handed to the image at the end. A preview
 	# is rebuilt on every edit and every playback tick, so per pixel set_pixel
 	# calls are the difference between smooth and laggy on a phone.
@@ -2072,14 +2138,14 @@ func preview_node(node_id: String, size: Vector2i) -> Image:
 		for x in size.x:
 			var value := clampf(_eval(node_id, Vector2(x, y), size, 0), 0.0, 1.0)
 			if value > alpha_cut:
-				var color := Color(value, value, value, 1.0)
-				if not grey:
-					var position := clampf(
-						float(floori(value * steps)) / float(steps - 1), 0.0, 1.0
-					)
-					color = _ramp_color(color_a, color_mid, color_b, mid_position, position)
-					if fade:
-						color.a = value
+				var color: Color
+				if tint == null:
+					color = Color(value, value, value, 1.0)
+				else:
+					var base: Color = tint
+					color = Color(base.r * value, base.g * value, base.b * value, 1.0)
+				if fade:
+					color.a = value
 				# to_rgba32 packs red in the highest byte, so it is written out in
 				# the RGBA order the image expects.
 				var packed := color.to_rgba32()
@@ -2091,29 +2157,27 @@ func preview_node(node_id: String, size: Vector2i) -> Image:
 	return Image.create_from_data(size.x, size.y, false, Image.FORMAT_RGBA8, bytes)
 
 
-## Colour ramp the node itself defines, read without generating a picture. Only
-## the output node has one today, so the rest of the graph is previewed white: a
-## preview never takes the colour of a node the user did not colour.
-func _node_ramp(node_id: String) -> Dictionary:
-	var node := get_node_by_id(node_id)
-	if node.is_empty():
-		return {}
-	var params: Dictionary = params_for(node)
-	if not params.has("color_a") or not params.has("color_b"):
-		return {}
-	var color_a: Color = params["color_a"]
-	return {
-		"steps": maxi(int(params.get("steps", 2)), 2),
-		"color_a": color_a,
-		"color_mid": params.get("color_mid", color_a),
-		"color_b": params["color_b"],
-		"mid_position": clampf(float(params.get("mid_position", 0.5)), 0.05, 0.95),
-		# A transparent ramp is what makes a preview a shape instead of a
-		# rectangle, so both switches are read here too.
-		"transparent": bool(params.get("transparent", false)),
-		"alpha_cut": clampf(float(params.get("alpha_cut", 0.0)), 0.0, 1.0),
-		"alpha_from_value": bool(params.get("alpha_from_value", false)),
-	}
+## Value below which a preview leaves a pixel transparent. The output says where
+## the artwork is cut, which is what makes a preview a shape instead of a
+## rectangle, so that threshold is read here too.
+func _preview_alpha_cut() -> float:
+	var output_id := output_node_id()
+	if output_id.is_empty():
+		return PREVIEW_EMPTY
+	var params: Dictionary = params_for(get_node_by_id(output_id))
+	if not bool(params.get("transparent", false)):
+		return PREVIEW_EMPTY
+	return maxf(clampf(float(params.get("alpha_cut", 0.0)), 0.0, 1.0), PREVIEW_EMPTY)
+
+
+## True when the previews should fade with the value instead of drawing every
+## covered pixel solid.
+func _preview_fades_alpha() -> bool:
+	var output_id := output_node_id()
+	if output_id.is_empty():
+		return false
+	var params: Dictionary = params_for(get_node_by_id(output_id))
+	return bool(params.get("transparent", false)) and bool(params.get("alpha_from_value", false))
 
 
 ## Cache key of a rasterised node image. The size is part of the key, so the
@@ -2710,7 +2774,7 @@ func _stamp_source(
 	var size_vec := Vector2(size)
 	# The brush shape is resolved once per stamp. A pixel_art layer supplies its
 	# opacity only, so the colours of the artwork never leak into the pattern and
-	# the output ramp stays in charge of the colour.
+	# the colour of the scatter node stays in charge.
 	var mask_image: Image = null
 	var mask_crop := Rect2i()
 	var source_node := get_node_by_id(source_id)
@@ -3203,6 +3267,8 @@ static func describe(node: Dictionary) -> String:
 			var level := float(params.get("level", 1.0))
 			if not is_equal_approx(level, 1.0):
 				scatter_text += " · 亮度 %.2f" % level
+			if bool(params.get("tint", false)):
+				scatter_text += " · 上色"
 			return scatter_text
 		"particles":
 			return "%d 颗 · %.1fpx" % [
@@ -3324,7 +3390,7 @@ static func describe(node: Dictionary) -> String:
 		"blend":
 			return BLEND_OPS[int(params["op"])]
 		"output":
-			return "%d steps" % int(params["steps"])
+			return "透明输出" if bool(params.get("transparent", false)) else "实心底"
 	return ""
 
 
@@ -3377,7 +3443,7 @@ func uses_time() -> bool:
 
 
 ## Replaces the graph with a ready made animated pixel sea: two travelling waves
-## added to some noise, posterized and mapped to a deep to light blue ramp.
+## added to some noise, posterized and painted in a deep blue.
 func build_ocean_preset() -> void:
 	nodes.clear()
 	groups.clear()
@@ -3417,21 +3483,16 @@ func build_ocean_preset() -> void:
 	get_node_by_id(noise)["params"].merge({"scale": 4.0, "octaves": 2, "seed": 7}, true)
 	get_node_by_id(foam)["params"].merge({"op": 0, "factor": 0.16}, true)
 	get_node_by_id(post)["params"].merge({"op": 6, "steps": 5}, true)
-	get_node_by_id(out)["params"].merge(
-		{
-			"steps": 5,
-			"color_a": Color(0.04, 0.13, 0.32, 1.0),
-			"color_mid": Color(0.13, 0.38, 0.6, 1.0),
-			"color_b": Color(0.62, 0.91, 0.97, 1.0),
-			"mid_position": 0.5,
-		},
-		true
+	# The colour now lives on the node that paints the picture and travels down
+	# from there, so the output needs no colour settings of its own.
+	get_node_by_id(post)["params"].merge(
+		{"tint": true, "color": Color(0.13, 0.38, 0.6, 1.0)}, true
 	)
 
 
 ## Replaces the graph with a pixel tree that grows along the animation: the tree
-## node reveals one generation of branches per frame, and the ramp goes from dark
-## bark to bright leaves.
+## node reveals one generation of branches per frame, and it carries the bark
+## colour for the whole picture.
 func build_tree_preset() -> void:
 	nodes.clear()
 	groups.clear()
@@ -3460,13 +3521,11 @@ func build_tree_preset() -> void:
 		},
 		true
 	)
+	get_node_by_id(tree)["params"].merge(
+		{"tint": true, "color": Color(0.34, 0.24, 0.1, 1.0)}, true
+	)
 	get_node_by_id(out)["params"].merge(
 		{
-			"steps": 4,
-			"color_a": Color(0.16, 0.1, 0.06, 1.0),
-			"color_mid": Color(0.34, 0.24, 0.1, 1.0),
-			"color_b": Color(0.62, 0.83, 0.35, 1.0),
-			"mid_position": 0.55,
 			# A tree is usually dropped onto an existing drawing, so the empty
 			# part stays transparent instead of becoming a rectangle.
 			"transparent": true,
@@ -3537,17 +3596,10 @@ func build_path_growth_preset() -> void:
 		},
 		true
 	)
-	get_node_by_id(out)["params"].merge(
-		{
-			"steps": 4,
-			"color_a": Color(0.12, 0.24, 0.09, 1.0),
-			"color_mid": Color(0.35, 0.68, 0.24, 1.0),
-			"color_b": Color(0.78, 0.95, 0.55, 1.0),
-			"mid_position": 0.5,
-			"transparent": true,
-		},
-		true
+	get_node_by_id(canvas)["params"].merge(
+		{"tint": true, "color": Color(0.35, 0.68, 0.24, 1.0)}, true
 	)
+	get_node_by_id(out)["params"].merge({"transparent": true}, true)
 
 
 ## Content that appears from the bottom up: a gradient turned into a moving
@@ -3592,17 +3644,10 @@ func build_mask_growth_preset() -> void:
 		true
 	)
 	get_node_by_id(blend)["params"].merge({"op": 2, "factor": 1.0}, true)
-	get_node_by_id(out)["params"].merge(
-		{
-			"steps": 4,
-			"color_a": Color(0.08, 0.16, 0.28, 1.0),
-			"color_mid": Color(0.28, 0.62, 0.78, 1.0),
-			"color_b": Color(0.85, 0.97, 1.0, 1.0),
-			"mid_position": 0.5,
-			"transparent": true,
-		},
-		true
+	get_node_by_id(blend)["params"].merge(
+		{"tint": true, "color": Color(0.28, 0.62, 0.78, 1.0)}, true
 	)
+	get_node_by_id(out)["params"].merge({"transparent": true}, true)
 
 
 ## A pixel bush built from the current layer: the layer is the brush, and a soft
@@ -3688,17 +3733,10 @@ func build_scatter_preset(layer_material := true) -> void:
 		},
 		true
 	)
-	get_node_by_id(out)["params"].merge(
-		{
-			"steps": 4,
-			"color_a": Color(0.09, 0.18, 0.11, 1.0),
-			"color_mid": Color(0.22, 0.45, 0.27, 1.0),
-			"color_b": Color(0.46, 0.75, 0.4, 1.0),
-			"mid_position": 0.55,
-			"transparent": true,
-		},
-		true
+	get_node_by_id(scatter)["params"].merge(
+		{"tint": true, "color": Color(0.22, 0.45, 0.27, 1.0)}, true
 	)
+	get_node_by_id(out)["params"].merge({"transparent": true}, true)
 
 
 ## Leaves growing along a vine: the path is both the stem and the placement for
@@ -3832,14 +3870,7 @@ func build_vine_preset() -> void:
 		true
 	)
 	get_node_by_id(blend)["params"].merge({"op": 1, "factor": 1.0}, true)
-	get_node_by_id(out)["params"].merge(
-		{
-			"steps": 4,
-			"color_a": Color(0.1, 0.24, 0.12, 1.0),
-			"color_mid": Color(0.26, 0.55, 0.24, 1.0),
-			"color_b": Color(0.62, 0.88, 0.42, 1.0),
-			"mid_position": 0.55,
-			"transparent": true,
-		},
-		true
+	get_node_by_id(blend)["params"].merge(
+		{"tint": true, "color": Color(0.26, 0.55, 0.24, 1.0)}, true
 	)
+	get_node_by_id(out)["params"].merge({"transparent": true}, true)

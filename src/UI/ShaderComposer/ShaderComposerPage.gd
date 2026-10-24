@@ -1983,7 +1983,8 @@ func _show_params(id: String) -> void:
 				+ "「沿画布」接画布（或任何分支），笔刷只落在它的不透明区域上——"
 				+ "画布的线是用路径生长出来的时候，这一撒就跟着动画一起长。"
 				+ "笔刷只取不透明的形状，像素画本身的颜色不参与，"
-				+ "盖章的颜色由输出节点的渐变和下面的「亮度」决定。"
+				+ "盖章的明暗由下面的「亮度」决定，颜色则打开「上色」自己选，"
+				+ "并沿着连线一路传给后面的节点和输出。"
 			)
 			scatter_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 			scatter_hint.add_theme_font_size_override("font_size", 13)
@@ -2027,6 +2028,13 @@ func _show_params(id: String) -> void:
 			_add_slider(
 				"亮度", 0.0, 1.0, 0.01, float(params.get("level", 1.0)), params, "level"
 			)
+			# The colour belongs to this node: it travels down the chain to the
+			# output, so the artwork does not need a palette on the output node.
+			_add_check("上色", bool(params.get("tint", false)), params, "tint", true)
+			if bool(params.get("tint", false)):
+				_add_color(
+					"颜色", params.get("color", Color(1.0, 1.0, 1.0)), params, "color"
+				)
 			_begin_section("随机", true)
 			_add_slider(
 				"角度", -180.0, 180.0, 1.0, float(params.get("angle", 0.0)), params, "angle"
@@ -2468,24 +2476,11 @@ func _show_params(id: String) -> void:
 			_add_option("混合", ShaderGraphScript.BLEND_OPS, int(params["op"]), params, "op")
 			_add_slider("比例", 0.0, 1.0, 0.01, float(params["factor"]), params, "factor")
 		"output":
-			_add_number("色阶", 2, 32, 1, int(params["steps"]), params, "steps")
-			_add_color("颜色 A", params["color_a"], params, "color_a")
-			_add_color(
-				"颜色 中", params.get("color_mid", params["color_a"]), params, "color_mid"
-			)
-			_add_color("颜色 B", params["color_b"], params, "color_b")
-			_add_slider(
-				"中间位置",
-				0.05,
-				0.95,
-				0.01,
-				float(params.get("mid_position", 0.5)),
-				params,
-				"mid_position"
-			)
 			var output_hint := Label.new()
 			output_hint.text = (
-				"透明背景让图层变成叠加层：数值低于阈值的像素完全透明，适合光效、粒子、烟。"
+				"输出只负责收口，不带颜色：颜色由画出内容的节点自己带（比如散布的「上色」），"
+				+ "并沿着连线一路传下来。"
+				+ "透明背景让图层变成叠加层：数值低于阈值的像素完全透明，适合光效、粒子、烟。"
 			)
 			output_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 			output_hint.add_theme_font_size_override("font_size", 13)
