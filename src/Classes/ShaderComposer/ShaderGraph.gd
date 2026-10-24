@@ -506,6 +506,10 @@ static func default_params(type: String) -> Dictionary:
 				"seed": 3,
 				"growth": 1.0,
 				"animate": false,
+				"ease": 0.4,
+				"lean": 0.0,
+				"sway": 0.0,
+				"sway_speed": 0.5,
 				"depth": 5,
 				"branches": 2,
 				"spread": 34.0,
@@ -1571,13 +1575,18 @@ func _path_image(node: Dictionary, size: Vector2i) -> Image:
 ## outward, one generation of branches at a time.
 func _tree_image(node: Dictionary, size: Vector2i) -> Image:
 	var params: Dictionary = node["params"]
+	var phase := clampf(time, 0.0, 1.0)
 	var amount := clampf(float(params.get("growth", 1.0)), 0.0, 1.0)
 	if bool(params.get("animate", false)):
-		amount *= clampf(time, 0.0, 1.0)
+		# Blend between a linear and a smoothstep clock, so the tree slows down
+		# as it reaches its final size instead of stopping abruptly.
+		var eased := phase * phase * (3.0 - 2.0 * phase)
+		amount *= lerpf(phase, eased, clampf(float(params.get("ease", 0.4)), 0.0, 1.0))
 	# The shape parameters belong in the key: editing them has to rebuild the
-	# image even when the growth did not move.
-	var key := "tree:%s:%d:%.4f:%dx%d" % [
-		node["id"], var_to_str(params).hash(), amount, size.x, size.y
+	# image even when the growth did not move. The phase is in there for the
+	# sway, which bends the tree without changing the growth.
+	var key := "tree:%s:%d:%.4f:%.3f:%dx%d" % [
+		node["id"], var_to_str(params).hash(), amount, phase, size.x, size.y
 	]
 	if _path_cache.has(key):
 		return _path_cache[key]
@@ -1597,12 +1606,18 @@ func _tree_image(node: Dictionary, size: Vector2i) -> Image:
 			"leaves": bool(params.get("leaves", true)),
 			"leaf_size": clampf(float(params.get("leaf_size", 1.0)), 0.2, 3.0),
 			"soft": clampf(float(params.get("soft", 0.0)) * shortest, 0.0, 2.5),
+			"sway": clampf(float(params.get("sway", 0.0)), 0.0, 1.0),
+			"sway_speed": clampf(float(params.get("sway_speed", 0.5)), 0.05, 4.0),
+			"phase": phase,
 		}
 		var rng := RandomNumberGenerator.new()
 		rng.seed = int(params.get("seed", 3))
 		var base := Vector2(float(size.x) * 0.5, float(size.y) * 0.99)
 		var thickness := maxf(float(params.get("width", 0.045)) * shortest * 0.5, 0.6)
-		_grow_branch(image, base, -PI * 0.5, shortest * 0.3, thickness, 0, state, rng, amount)
+		var lean := deg_to_rad(float(params.get("lean", 0.0)))
+		_grow_branch(
+			image, base, -PI * 0.5 + lean, shortest * 0.3, thickness, 0, state, rng, amount
+		)
 	_path_cache[key] = image
 	return image
 
@@ -1646,8 +1661,22 @@ func _grow_branch(
 	var brightness := lerpf(0.42, 0.74, float(level) / float(maxi(depth, 1)))
 	var soft: float = float(state["soft"])
 	var turn := curve * 0.8 / float(steps)
-	var point := from_point
+	# Wind bends the branches without touching the growth, and it bends the tips
+	# more than the trunk because every level adds its own offset.
+	var sway: float = float(state["sway"])
 	var angle := direction
+	if sway > 0.0:
+		var depth_factor := float(level + 1) / float(depth + 1)
+		angle += (
+			sin(
+				float(state["phase"]) * TAU * float(state["sway_speed"])
+				+ float(level) * 0.8
+			)
+			* sway
+			* 0.18
+			* depth_factor
+		)
+	var point := from_point
 	for step in drawn:
 		var along := float(step) / float(steps)
 		angle += turn
@@ -2052,8 +2081,13 @@ func uses_time() -> bool:
 			return true
 		if node["type"] == "echo" and bool(node["params"].get("animated", false)):
 			return true
-		if node["type"] == "tree" and bool(node["params"].get("animate", false)):
-			return true
+		if node["type"] == "tree":
+			var tree_params: Dictionary = node["params"]
+			# Sway alone already needs one image per frame, even without growth.
+			if bool(tree_params.get("animate", false)):
+				return true
+			if float(tree_params.get("sway", 0.0)) > 0.0:
+				return true
 		if node["type"] == "pixel_art" and int(node["params"].get("frame_mode", 0)) == 2:
 			return true
 	return false
@@ -2128,6 +2162,9 @@ func build_tree_preset() -> void:
 			"seed": 3,
 			"growth": 1.0,
 			"animate": true,
+			"ease": 0.5,
+			"sway": 0.22,
+			"sway_speed": 0.6,
 			"depth": 5,
 			"branches": 2,
 			"spread": 32.0,

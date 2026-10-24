@@ -122,6 +122,22 @@ func smooth_all() -> void:
 	points_changed.emit(payload())
 
 
+## Flips the direction of travel, which is what decides where a Follow Path
+## pattern starts and which way it moves. The in and out handles swap with the
+## vertices, so the curve keeps its exact shape.
+func reverse_points() -> void:
+	_entries.reverse()
+	for index in _entries.size():
+		var entry: Dictionary = _entries[index]
+		var swap: Vector2 = entry["in"]
+		entry["in"] = entry["out"]
+		entry["out"] = swap
+		_entries[index] = entry
+	_selected = -1
+	queue_redraw()
+	points_changed.emit(payload())
+
+
 func set_phase(value: float) -> void:
 	phase = fposmod(value, 1.0)
 	queue_redraw()

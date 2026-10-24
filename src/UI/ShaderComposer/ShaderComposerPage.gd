@@ -1109,6 +1109,9 @@ func _show_params(id: String) -> void:
 				"animate",
 				true
 			)
+			_add_slider(
+				"生长缓动", 0.0, 1.0, 0.05, float(params.get("ease", 0.4)), params, "ease"
+			)
 			_begin_section("形态", true)
 			_add_number("深度", 1, 7, 1, int(params.get("depth", 5)), params, "depth")
 			_add_number("每节分叉", 1, 4, 1, int(params.get("branches", 2)), params, "branches")
@@ -1123,12 +1126,27 @@ func _show_params(id: String) -> void:
 			_add_slider("粗细", 0.005, 0.15, 0.005, float(params.get("width", 0.045)), params, "width")
 			_add_slider("收细", 0.4, 0.95, 0.01, float(params.get("taper", 0.72)), params, "taper")
 			_add_slider("弯曲", 0.0, 2.0, 0.05, float(params.get("bend", 0.35)), params, "bend")
+			_add_slider(
+				"树干倾斜", -60.0, 60.0, 1.0, float(params.get("lean", 0.0)), params, "lean"
+			)
 			_add_slider("柔边", 0.0, 0.2, 0.005, float(params.get("soft", 0.0)), params, "soft")
 			_end_section()
 			_begin_section("树叶", true)
 			_add_check("启用", bool(params.get("leaves", true)), params, "leaves", true)
 			_add_slider(
 				"叶大小", 0.3, 2.5, 0.05, float(params.get("leaf_size", 1.0)), params, "leaf_size"
+			)
+			_end_section()
+			_begin_section("风", false)
+			_add_slider("风力", 0.0, 1.0, 0.01, float(params.get("sway", 0.0)), params, "sway")
+			_add_slider(
+				"摆动速度",
+				0.1,
+				3.0,
+				0.05,
+				float(params.get("sway_speed", 0.5)),
+				params,
+				"sway_speed"
 			)
 			_end_section()
 		"path":
@@ -1768,11 +1786,14 @@ func _add_path_editor(params: Dictionary, bezier := false) -> void:
 		editor.remove_selected()
 	var smooth_points := func() -> void:
 		editor.smooth_all()
+	var reverse_path := func() -> void:
+		editor.reverse_points()
 	var reset_path := func() -> void:
 		editor.reset_to_square()
 	var buttons := HBoxContainer.new()
 	buttons.add_child(_make_button("删除选中点", remove_point))
 	buttons.add_child(_make_button("平滑全部", smooth_points, "按相邻顶点重算切线，变成顺滑曲线"))
+	buttons.add_child(_make_button("反转路径", reverse_path, "把顶点顺序倒过来，改变运动方向"))
 	buttons.add_child(_make_button("重置路径", reset_path, "回到默认的方形路径"))
 	_params_box.add_child(buttons)
 	if bezier:
