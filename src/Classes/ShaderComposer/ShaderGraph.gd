@@ -560,6 +560,9 @@ static func default_params(type: String) -> Dictionary:
 				"color_mid": Color(0.45, 0.45, 0.5, 1.0),
 				"color_b": Color(0.95, 0.95, 0.98, 1.0),
 				"mid_position": 0.5,
+				"transparent": false,
+				"alpha_cut": 0.0,
+				"alpha_from_value": false,
 			}
 	return {}
 
@@ -581,13 +584,24 @@ func generate(size: Vector2i) -> Image:
 	var color_mid: Color = output_params.get("color_mid", color_a)
 	var color_b: Color = output_params["color_b"]
 	var mid_position := clampf(float(output_params.get("mid_position", 0.5)), 0.05, 0.95)
+	# A transparent background turns the layer into an overlay instead of a full
+	# rectangle, which is what particles and glows need.
+	var transparent := bool(output_params.get("transparent", false))
+	var alpha_cut := clampf(float(output_params.get("alpha_cut", 0.0)), 0.0, 1.0)
+	var alpha_from_value := bool(output_params.get("alpha_from_value", false))
 	var source := _input_id(output, 0)
 	for y in size.y:
 		for x in size.x:
 			var value := clampf(_eval(source, Vector2(x, y), size, 0), 0.0, 1.0)
+			if transparent and value <= alpha_cut:
+				image.set_pixel(x, y, Color(0.0, 0.0, 0.0, 0.0))
+				continue
 			var step := floori(value * steps)
 			var ramp := clampf(float(step) / float(steps - 1), 0.0, 1.0)
-			image.set_pixel(x, y, _ramp_color(color_a, color_mid, color_b, mid_position, ramp))
+			var color := _ramp_color(color_a, color_mid, color_b, mid_position, ramp)
+			if transparent and alpha_from_value:
+				color.a = value
+			image.set_pixel(x, y, color)
 	return image
 
 

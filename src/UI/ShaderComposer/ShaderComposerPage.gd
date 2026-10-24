@@ -396,11 +396,12 @@ func _dissolve_group(group_id: String) -> void:
 ## Puts the selected nodes into a new group that can then be collapsed.
 func _on_group_pressed() -> void:
 	if _selected_ids.size() < 2:
-		_status.text = "先选中两个以上节点再组合"
+		# The status line is rewritten by the preview, so use the app notification.
+		Global.notification_label("先选中两个以上节点再组合")
 		return
 	var group_id: String = graph.add_group(_selected_ids)
 	if group_id.is_empty():
-		_status.text = "选中的节点已经在别的组里"
+		Global.notification_label("选中的节点已经在别的组里")
 		return
 	_selected_ids.clear()
 	_refresh_graph()
@@ -858,6 +859,29 @@ func _show_params(id: String) -> void:
 				float(params.get("mid_position", 0.5)),
 				params,
 				"mid_position"
+			)
+			var output_hint := Label.new()
+			output_hint.text = (
+				"透明背景让图层变成叠加层：数值低于阈值的像素完全透明，适合光效、粒子、烟。"
+			)
+			output_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+			output_hint.add_theme_font_size_override("font_size", 13)
+			_params_box.add_child(output_hint)
+			_add_check("透明背景", bool(params.get("transparent", false)), params, "transparent")
+			_add_slider(
+				"透明阈值",
+				0.0,
+				1.0,
+				0.01,
+				float(params.get("alpha_cut", 0.0)),
+				params,
+				"alpha_cut"
+			)
+			_add_check(
+				"按数值取透明度",
+				bool(params.get("alpha_from_value", false)),
+				params,
+				"alpha_from_value"
 			)
 
 
