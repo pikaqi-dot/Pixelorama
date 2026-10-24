@@ -33,6 +33,8 @@ const PREVIEW_SLICE_MSEC := 12.0
 ## Time one frame may spend on node thumbnails. They are drawn a few at a time
 ## instead of all at once after every preview refresh.
 const THUMB_BUDGET_MSEC := 4.0
+## More room for thumbnails while playing, where every moving node is queued.
+const THUMB_BUDGET_PLAYBACK_MSEC := 8.0
 ## Minimum height of every interactive row, which keeps it usable with a finger.
 const TOUCH_SIZE := 40
 const TOUCH_FONT_SIZE := 15
@@ -62,6 +64,9 @@ const PATH_POPUP_RATIO := 0.9
 const PATH_EDITOR_MIN_HEIGHT := 110
 ## Side of the preview drawn in the frame under every node, in pixels.
 const NODE_PREVIEW_SIZE := 56
+## Smaller thumbnails while the animation plays, so the moving nodes still fit
+## in a frame and stay in step with the main preview.
+const NODE_PREVIEW_SIZE_PLAYBACK := 36
 ## Height of the cropped source preview in the pixel_art panel, in pixels.
 const SOURCE_PREVIEW_HEIGHT := 120
 
@@ -705,7 +710,12 @@ func _make_node_preview(node: Dictionary) -> Control:
 func _process(_delta: float) -> void:
 	if _thumb_queue.is_empty() or not visible:
 		return
-	var deadline := Time.get_ticks_usec() + int(THUMB_BUDGET_MSEC * 1000.0)
+	if _preview_busy:
+		# A sliced generation is mid-frame; rasterising a thumbnail now would
+		# make it rebuild its cached nodes at the thumbnail size.
+		return
+	var budget := THUMB_BUDGET_PLAYBACK_MSEC if _is_playing() else THUMB_BUDGET_MSEC
+	var deadline := Time.get_ticks_usec() + int(budget * 1000.0)
 	var index := 0
 	while index < _thumb_queue.size() and Time.get_ticks_usec() < deadline:
 		var node_id: String = _thumb_queue[index]
@@ -761,8 +771,11 @@ func _refresh_node_preview(node_id: String, entry: Dictionary) -> void:
 	var thumb: TextureRect = entry["thumb"]
 	if not is_instance_valid(thumb) or graph.get_node_by_id(node_id).is_empty():
 		return
+	# Playback draws smaller thumbnails, which is the difference between the
+	# moving branch keeping up and falling a whole second behind.
+	var side := NODE_PREVIEW_SIZE_PLAYBACK if _is_playing() else NODE_PREVIEW_SIZE
 	thumb.texture = ImageTexture.create_from_image(
-		graph.preview_node(node_id, Vector2i(NODE_PREVIEW_SIZE, NODE_PREVIEW_SIZE))
+		graph.preview_node(node_id, Vector2i(side, side))
 	)
 
 
@@ -3066,7 +3079,7 @@ func _refresh_preview() -> void:
 	# There is one thumbnail per node, so they are spread over several frames
 	# while playing instead of competing with the main preview.
 	if playing:
-		_refresh_one_node_preview()
+		_queue_animated_previews()
 	else:
 		_refresh_node_previews()
 	if is_instance_valid(_preview_big) and _preview_popup.visible:
@@ -3097,22 +3110,27 @@ func _is_playing() -> bool:
 	return is_instance_valid(_play_timer) and not _play_timer.is_stopped()
 
 
-## Queues one visible thumbnail, taking turns. While the animation plays this is
-## the only thumbnail work, so it never competes with the main preview.
-func _refresh_one_node_preview() -> void:
+## Queues every moving node at once while the clock runs. Only the nodes that
+## read the time need a new picture, and queuing them together keeps them in
+## step with the preview instead of refreshing one node per frame.
+func _queue_animated_previews() -> void:
 	if _node_previews.is_empty():
 		return
-	var ids: Array = _node_previews.keys()
-	for _step in ids.size():
-		_thumb_index = (_thumb_index + 1) % ids.size()
-		var node_id: String = ids[_thumb_index]
-		var entry: Dictionary = _node_previews[node_id]
-		var frame: Control = entry["frame"]
+	var moving: Array[String] = graph.time_dependent_ids()
+	if moving.is_empty():
+		return
+	# A queue longer than everything it has to show means the drain cannot keep
+	# up; starting over is better than painting stale frames first.
+	var limit := maxi(moving.size() * 2 + 8, 16)
+	if _thumb_queue.size() > limit:
+		_thumb_queue.clear()
+	for node_id in moving:
+		var entry: Dictionary = _node_previews.get(node_id, {})
+		var frame: Control = entry.get("frame", null)
 		if not is_instance_valid(frame) or not frame.visible:
 			continue
 		if not _thumb_queue.has(node_id):
 			_thumb_queue.append(node_id)
-		return
 
 
 func _on_play_pressed() -> void:

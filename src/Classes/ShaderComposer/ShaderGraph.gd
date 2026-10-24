@@ -221,6 +221,10 @@ var _noise_checked: Dictionary = {}
 ## them away, which is why they can be keyed by node id alone.
 var _raster_time := -1.0
 ## Bounds of the non empty part of a branch, rebuilt for every generated image.
+## Resolution the images in [member _path_cache] were built at. A thumbnail is
+## generated at another size than the preview, so the rasters have to be rebuilt
+## instead of being read at the wrong scale.
+var _raster_size := Vector2i.ZERO
 var _bounds_cache := {}
 var _bayer_cache := {}
 ## Rasterised paths and the project layers read by the input nodes, per generate.
@@ -528,6 +532,39 @@ func downstream_ids(id: String) -> Array[String]:
 					result.append(node_id)
 					pending.append(node_id)
 					break
+	return result
+
+
+## Ids of the nodes whose picture moves with the clock: the ones that read the
+## time or carry an animation, plus everything downstream of them. Branches that
+## do not read the clock keep the thumbnail they already have, which is what
+## keeps playback cheap and the thumbnails in step with the preview.
+func time_dependent_ids() -> Array[String]:
+	var seeds: Array[String] = []
+	for node: Dictionary in nodes:
+		var node_id := str(node["id"])
+		var params: Dictionary = node["params"]
+		match str(node["type"]):
+			"time", "particles":
+				seeds.append(node_id)
+			"tree":
+				if bool(params.get("animate", false)):
+					seeds.append(node_id)
+			"pixel_art":
+				# A canvas that follows the animation shows another cel per frame.
+				if int(params.get("frame_mode", 0)) == 2:
+					seeds.append(node_id)
+		var anim: Variant = params.get("anim", null)
+		if anim is Dictionary and not (anim as Dictionary).is_empty():
+			if not seeds.has(node_id):
+				seeds.append(node_id)
+	var result: Array[String] = []
+	for seed in seeds:
+		if not result.has(seed):
+			result.append(seed)
+		for other in downstream_ids(seed):
+			if not result.has(other):
+				result.append(other)
 	return result
 
 
@@ -887,6 +924,7 @@ func _begin_generation(size: Vector2i) -> Dictionary:
 	_source_cache.clear()
 	# Resolved once per frame, so an animated parameter costs a lookup per pixel.
 	_resolve_animations()
+	_raster_size = size
 	var image := Image.create_empty(size.x, size.y, false, Image.FORMAT_RGBA8)
 	var output_id := output_node_id()
 	if output_id.is_empty():
@@ -959,6 +997,7 @@ func _resolve_animations() -> void:
 	# node id is enough to find them again inside the pixel loop.
 	if not is_equal_approx(time, _raster_time):
 		_raster_time = time
+		_raster_size = Vector2i.ZERO
 		_path_cache.clear()
 	for node: Dictionary in nodes:
 		var node_id := str(node["id"])
@@ -1971,12 +2010,25 @@ static func _path_point_at(flat: PackedVector2Array, t: float) -> Dictionary:
 ## the picture always matches that branch of the graph.
 func preview_node(node_id: String, size: Vector2i) -> Image:
 	_resolve_animations()
+	# Thumbnails use another resolution than the preview, so the rasterised nodes
+	# are rebuilt at this size instead of being read at the wrong scale.
+	_ensure_raster_size(size)
 	var image := Image.create_empty(size.x, size.y, false, Image.FORMAT_RGBA8)
 	for y in size.y:
 		for x in size.x:
 			var value := clampf(_eval(node_id, Vector2(x, y), size, 0), 0.0, 1.0)
 			image.set_pixel(x, y, Color(value, value, value, 1.0))
 	return image
+
+
+## Rasterised node images belong to one resolution. Reading them from another
+## size would show a cropped corner of the bigger picture, so they are thrown
+## away when the size changes.
+func _ensure_raster_size(size: Vector2i) -> void:
+	if size == _raster_size:
+		return
+	_raster_size = size
+	_path_cache.clear()
 
 
 ## Rasterises the stroke of a path node at [param size] and caches it, so the
