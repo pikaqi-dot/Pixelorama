@@ -100,6 +100,8 @@ var _stage: HBoxContainer
 ## Column of the output picture, narrowed on small screens so the graph keeps
 ## most of the width.
 var _output_column: VBoxContainer
+## Canvas size the preview boxes were last fitted to.
+var _preview_canvas_size := Vector2i.ZERO
 ## Tapping the small preview opens it at a readable size.
 var _preview_popup: PopupPanel
 var _preview_big: TextureRect
@@ -3156,6 +3158,10 @@ func _refresh_preview() -> void:
 	var project := Global.current_project
 	if project == null:
 		return
+	if project.size != _preview_canvas_size:
+		# A resized canvas changes the shape of both preview boxes.
+		_preview_canvas_size = project.size
+		_apply_layout()
 	if _preview_busy:
 		# The running pass picks up the newest state when it ends, so stacking
 		# another full generation here would only add work.
@@ -3532,6 +3538,23 @@ func _make_button(
 	return button
 
 
+## Box of a preview that keeps the aspect of the project canvas, so the picture
+## fits exactly instead of being padded inside a square.
+func _preview_box(width: float, max_height: float) -> Vector2:
+	var canvas := Vector2i(64, 64)
+	var project := Global.current_project
+	if project != null:
+		canvas = project.size
+	if canvas.x <= 0 or canvas.y <= 0:
+		canvas = Vector2i(64, 64)
+	var ratio := float(canvas.x) / float(canvas.y)
+	var height := width / ratio
+	if height > max_height:
+		height = max_height
+		width = height * ratio
+	return Vector2(roundf(width), roundf(height))
+
+
 ## Puts the parameters beside the graph when there is room, and below it on a
 ## narrow screen, so the page stays usable on a phone in portrait.
 func _apply_layout() -> void:
@@ -3544,7 +3567,13 @@ func _apply_layout() -> void:
 		var preview_side := 96 if narrow else 150
 		_output_column.custom_minimum_size = Vector2(preview_side, 0)
 		if is_instance_valid(_preview):
-			_preview.custom_minimum_size = Vector2(preview_side, preview_side)
+			# The box follows the canvas aspect, so a wide or tall project is
+			# shown without letterboxing and without taking a square of space.
+			_preview.custom_minimum_size = _preview_box(
+				preview_side, maxf(size.y * 0.5, 110.0)
+			)
+	if is_instance_valid(_node_preview):
+		_node_preview.custom_minimum_size = _preview_box(150.0, maxf(size.y * 0.3, 90.0))
 	if _zen_mode:
 		# The graph is hidden, so the parameters can use the whole height.
 		_graph_edit.custom_minimum_size = Vector2.ZERO
