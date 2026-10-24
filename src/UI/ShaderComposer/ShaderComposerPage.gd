@@ -978,6 +978,7 @@ func _build_preset_menu() -> void:
 	root.add_item("生长树", 3)
 	root.add_item("路径生长", 4)
 	root.add_item("遮罩生长", 5)
+	root.add_item("散布灌木", 6)
 	root.add_separator()
 	root.add_item("保存当前图…", 2)
 	var saved := _list_presets()
@@ -1023,6 +1024,9 @@ func _on_preset_pressed(id: int) -> void:
 		return
 	if id == 5:
 		_on_mask_growth_preset_pressed()
+		return
+	if id == 6:
+		_on_scatter_preset_pressed()
 		return
 	if id == 2:
 		_show_preset_dialog()
@@ -1476,6 +1480,57 @@ func _show_params(id: String) -> void:
 			)
 			_add_slider("柔边", 0.0, 0.2, 0.005, float(params.get("soft", 0.0)), params, "soft")
 			_end_section()
+		"scatter":
+			var scatter_hint := Label.new()
+			scatter_hint.text = (
+				"把输入 1 当作笔刷，在范围内按随机角度和大小盖章，"
+				+ "适合把像素画图层里的叶片、石头、碎石铺成灌木和苔藓。"
+				+ "输入 2 可选，当作密度遮罩：越亮的位置越容易放下笔刷。"
+			)
+			scatter_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+			scatter_hint.add_theme_font_size_override("font_size", 13)
+			_params_box.add_child(scatter_hint)
+			_add_number("数量", 1, 256, 1, int(params.get("amount", 24)), params, "amount")
+			_add_slider(
+				"范围", 0.0, 1.5, 0.01, float(params.get("spread", 0.6)), params, "spread"
+			)
+			_add_slider(
+				"笔刷大小", 0.02, 0.6, 0.01, float(params.get("stamp", 0.3)), params, "stamp"
+			)
+			_begin_section("随机", true)
+			_add_slider(
+				"角度", -180.0, 180.0, 1.0, float(params.get("angle", 0.0)), params, "angle"
+			)
+			_add_slider(
+				"角度随机",
+				0.0,
+				180.0,
+				1.0,
+				float(params.get("angle_random", 180.0)),
+				params,
+				"angle_random"
+			)
+			_add_slider(
+				"最小缩放",
+				0.25,
+				2.0,
+				0.05,
+				float(params.get("scale_min", 0.7)),
+				params,
+				"scale_min"
+			)
+			_add_slider(
+				"最大缩放",
+				0.25,
+				2.0,
+				0.05,
+				float(params.get("scale_max", 1.3)),
+				params,
+				"scale_max"
+			)
+			_add_number("种子", 0, 9999, 1, int(params.get("seed", 1)), params, "seed")
+			_end_section()
+			_add_check("对齐像素", bool(params.get("align", true)), params, "align")
 		"path":
 			var path_hint := Label.new()
 			path_hint.text = (
@@ -2749,6 +2804,19 @@ func _on_mask_growth_preset_pressed() -> void:
 	graph.build_mask_growth_preset()
 	if is_instance_valid(_phase):
 		_phase.set_value_no_signal(1.0)
+	_selected_id = ""
+	_show_params("")
+	_refresh_graph()
+	_refresh_preview()
+
+
+## Builds a pixel bush: the current layer is the brush, scattered inside a soft
+## shape so the leaves clump instead of covering the whole canvas.
+func _on_scatter_preset_pressed() -> void:
+	_push_undo()
+	graph.build_scatter_preset()
+	if is_instance_valid(_phase):
+		_phase.set_value_no_signal(0.0)
 	_selected_id = ""
 	_show_params("")
 	_refresh_graph()

@@ -21,6 +21,9 @@ const NODE_TYPES := {
 	# A seeded pixel particle system. Positions are worked out from the phase
 	# instead of being simulated, so any frame can be rendered on its own.
 	"particles": {"label": "像素粒子", "inputs": 0},
+	# Stamps the first input over the canvas at random angles and sizes. The
+	# brush is usually a pixel_art layer, so a leaf turns into a bush.
+	"scatter": {"label": "散布", "inputs": 2},
 	# Input nodes: one draws a vector path, the other reads the project's layers.
 	"path": {"label": "路径", "inputs": 0},
 	"pixel_art": {"label": "像素画", "inputs": 0},
@@ -70,6 +73,7 @@ const SECOND_INPUT_LABELS := {
 	"outline": "遮罩",
 	"glow": "遮罩",
 	"bloom": "遮罩",
+	"scatter": "密度",
 }
 
 const NOISE_TYPES := ["Simplex", "Simplex Smooth", "Perlin", "Cellular", "Value"]
@@ -122,6 +126,7 @@ const NODE_GROUPS := [
 			"shape",
 			"tree",
 			"particles",
+			"scatter",
 		],
 	},
 	{"label": "输入", "types": ["path", "pixel_art"]},
@@ -611,6 +616,18 @@ static func default_params(type: String) -> Dictionary:
 				"leaf_size": 1.0,
 				"soft": 0.0,
 			}
+		"scatter":
+			return {
+				"amount": 24,
+				"spread": 0.6,
+				"stamp": 0.3,
+				"angle": 0.0,
+				"angle_random": 180.0,
+				"scale_min": 0.7,
+				"scale_max": 1.3,
+				"seed": 1,
+				"align": true,
+			}
 		"particles":
 			return {
 				"seed": 1,
@@ -1046,6 +1063,11 @@ func _eval(node_id: String, uv: Vector2, size: Vector2i, depth: int) -> float:
 		if uv.x < 0.0 or uv.y < 0.0 or uv.x >= float(size.x) or uv.y >= float(size.y):
 			return 0.0
 		return _particles_image(node, params, size).get_pixel(int(uv.x), int(uv.y)).r
+	elif node_type == "scatter":
+		# Rasterised once per generated image, so this is a lookup like a path.
+		if uv.x < 0.0 or uv.y < 0.0 or uv.x >= float(size.x) or uv.y >= float(size.y):
+			return 0.0
+		return _scatter_image(node, params, size, depth).get_pixel(int(uv.x), int(uv.y)).r
 	elif node_type == "constant":
 		return clampf(float(params.get("value", 0.5)), 0.0, 1.0)
 	elif node_type == "shape":
@@ -2175,6 +2197,101 @@ func _particles_image(node: Dictionary, params: Dictionary, size: Vector2i) -> I
 	return image
 
 
+## Stamps the brush of the first input over the canvas at random angles and sizes
+## and caches the result per generated image. The brush is the whole source node,
+## so a pixel_art layer holding a single leaf turns into a bush.
+func _scatter_image(
+	node: Dictionary, params: Dictionary, size: Vector2i, depth: int
+) -> Image:
+	var key := str(node["id"])
+	if _path_cache.has(key):
+		return _path_cache[key]
+	var image := Image.create_empty(size.x, size.y, false, Image.FORMAT_RGBA8)
+	image.fill(Color(0.0, 0.0, 0.0, 0.0))
+	var source_id := _input_id(node, 0)
+	var density_id := _input_id(node, 1)
+	if source_id.is_empty():
+		_path_cache[key] = image
+		return image
+	var amount := clampi(int(params.get("amount", 24)), 1, 256)
+	var shortest := float(mini(size.x, size.y))
+	var spread := clampf(float(params.get("spread", 0.6)), 0.0, 1.5)
+	var stamp := maxf(float(params.get("stamp", 0.3)), 0.01)
+	var angle := deg_to_rad(float(params.get("angle", 0.0)))
+	var angle_random := deg_to_rad(clampf(float(params.get("angle_random", 180.0)), 0.0, 180.0))
+	var scale_min := maxf(float(params.get("scale_min", 0.7)), 0.05)
+	var scale_max := maxf(float(params.get("scale_max", 1.3)), scale_min)
+	var align := bool(params.get("align", true))
+	var rng := RandomNumberGenerator.new()
+	rng.seed = int(params.get("seed", 1))
+	# Keep the aspect of a layer brush, so a wide leaf stays wide.
+	var footprint := Vector2(shortest * stamp, shortest * stamp)
+	var source_node := get_node_by_id(source_id)
+	if not source_node.is_empty() and str(source_node["type"]) == "pixel_art":
+		var brush := _source_image(source_node, params_for(source_node))
+		if brush != null and not brush.is_empty():
+			var aspect := float(brush.get_width()) / float(maxi(brush.get_height(), 1))
+			if aspect >= 1.0:
+				footprint.y = footprint.x / aspect
+			else:
+				footprint.x = footprint.y * aspect
+	var center := Vector2(size) * 0.5
+	var reach := Vector2(shortest * spread * 0.5, shortest * spread * 0.5)
+	for _index in amount:
+		# Every random value is taken before the density test, so hiding one
+		# stamp does not reshuffle the rest of the field.
+		var across := rng.randf_range(-1.0, 1.0)
+		var down := rng.randf_range(-1.0, 1.0)
+		var rotation := angle + deg_to_rad(rng.randf_range(-angle_random, angle_random))
+		var scale := rng.randf_range(scale_min, scale_max)
+		var chance := rng.randf()
+		var position := center + Vector2(across * reach.x, down * reach.y)
+		if align:
+			position = position.round()
+		if not density_id.is_empty() and _eval(density_id, position, size, depth + 1) < chance:
+			continue
+		_stamp_source(image, source_id, position, rotation, scale, footprint, size, depth)
+	_path_cache[key] = image
+	return image
+
+
+## Draws one brush stamp. Every destination pixel is mapped back into the brush,
+## so rotation and scaling stay pixel exact instead of smearing the brush.
+func _stamp_source(
+	image: Image,
+	source_id: String,
+	position: Vector2,
+	rotation: float,
+	scale: float,
+	footprint: Vector2,
+	size: Vector2i,
+	depth: int
+) -> void:
+	var scaled := footprint * maxf(scale, 0.01)
+	var reach := int(ceil(scaled.length() * 0.5)) + 1
+	var center := Vector2i(roundi(position.x), roundi(position.y))
+	var size_vec := Vector2(size)
+	for offset_y in range(-reach, reach + 1):
+		var y := center.y + offset_y
+		if y < 0 or y >= size.y:
+			continue
+		for offset_x in range(-reach, reach + 1):
+			var x := center.x + offset_x
+			if x < 0 or x >= size.x:
+				continue
+			# -0.5..0.5 across the brush, then rotated back into brush space.
+			var local := Vector2(float(offset_x), float(offset_y)) / scaled
+			var brush_local := local.rotated(-rotation)
+			if absf(brush_local.x) > 0.5 or absf(brush_local.y) > 0.5:
+				continue
+			var uv := (brush_local + Vector2(0.5, 0.5)) * size_vec
+			var value := clampf(_eval(source_id, uv, size, depth + 1), 0.0, 1.0)
+			if value <= 0.0:
+				continue
+			if value > image.get_pixel(x, y).r:
+				image.set_pixel(x, y, Color(value, value, value, 1.0))
+
+
 ## Birth point of a particle, in pixels. The two random values are shared by all
 ## the modes, so switching the mode does not reshuffle the whole field.
 static func _particle_spawn(
@@ -2457,6 +2574,10 @@ static func describe(node: Dictionary) -> String:
 			return "深 %d · %d 叉" % [
 				int(params.get("depth", 5)), int(params.get("branches", 2))
 			]
+		"scatter":
+			return "%d 枚 · %.0f%%" % [
+				int(params.get("amount", 24)), float(params.get("stamp", 0.3)) * 100.0
+			]
 		"particles":
 			return "%d 颗 · %.1fpx" % [
 				int(params.get("count", 48)), float(params.get("size", 1.5))
@@ -2565,6 +2686,7 @@ func is_expensive() -> bool:
 	const HEAVY := [
 		"echo",
 		"tree",
+		"scatter",
 		"blur",
 		"outline",
 		"glow",
@@ -2819,6 +2941,58 @@ func build_mask_growth_preset() -> void:
 			"color_mid": Color(0.28, 0.62, 0.78, 1.0),
 			"color_b": Color(0.85, 0.97, 1.0, 1.0),
 			"mid_position": 0.5,
+			"transparent": true,
+		},
+		true
+	)
+
+
+## A pixel bush built from the current layer: the layer is the brush, and a soft
+## shape decides where the leaves may land, so they clump instead of carpeting
+## the whole canvas.
+func build_scatter_preset() -> void:
+	nodes.clear()
+	groups.clear()
+	_noise_cache.clear()
+	_noise_signature.clear()
+	var brush := add_node("pixel_art", Vector2(20, 40))
+	var area := add_node("shape", Vector2(20, 260))
+	var scatter := add_node("scatter", Vector2(240, 60))
+	var out := add_node("output", Vector2(560, 60))
+	connect_nodes(brush, scatter, 0)
+	connect_nodes(area, scatter, 1)
+	connect_nodes(scatter, out, 0)
+	get_node_by_id(area)["params"].merge(
+		{
+			"kind": 0,
+			"center_x": 0.5,
+			"center_y": 0.55,
+			"size": 0.62,
+			"soft": 0.55,
+		},
+		true
+	)
+	get_node_by_id(scatter)["params"].merge(
+		{
+			"amount": 36,
+			"spread": 1.0,
+			"stamp": 0.22,
+			"angle": 0.0,
+			"angle_random": 180.0,
+			"scale_min": 0.7,
+			"scale_max": 1.4,
+			"seed": 4,
+			"align": true,
+		},
+		true
+	)
+	get_node_by_id(out)["params"].merge(
+		{
+			"steps": 4,
+			"color_a": Color(0.09, 0.18, 0.11, 1.0),
+			"color_mid": Color(0.22, 0.45, 0.27, 1.0),
+			"color_b": Color(0.46, 0.75, 0.4, 1.0),
+			"mid_position": 0.55,
 			"transparent": true,
 		},
 		true
