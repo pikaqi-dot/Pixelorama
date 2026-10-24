@@ -324,6 +324,7 @@ func _build_ui() -> void:
 	_node_menu.add_item("断开输入", 2)
 	_node_menu.add_item("组合选中", 3)
 	_node_menu.add_item("编辑路径…", 4)
+	_node_menu.add_item("旁路此节点", 5)
 	_node_menu.id_pressed.connect(_on_node_menu_pressed)
 	add_child(_node_menu)
 
@@ -531,12 +532,22 @@ func _make_graph_node(node: Dictionary) -> GraphNode:
 	graph_node.title = ShaderGraphScript.NODE_TYPES[node["type"]]["label"]
 	graph_node.position_offset = node.get("position", Vector2.ZERO)
 	graph_node.gui_input.connect(_on_graph_node_input.bind(str(node["id"])))
+	# The title carries the accent of its group, so a big graph reads by colour.
+	var group_color: Color = ShaderGraphScript.NODE_GROUP_COLORS.get(
+		ShaderGraphScript.group_of_type(str(node["type"])), PORT_COLOR
+	)
+	graph_node.add_theme_color_override("title_color", group_color)
 	var input_count := int(ShaderGraphScript.NODE_TYPES[node["type"]]["inputs"])
 	graph_node.set_slot(0, input_count >= 1, 0, PORT_COLOR, true, 0, PORT_COLOR)
 	var description := Label.new()
 	description.text = ShaderGraphScript.describe(node)
 	description.add_theme_font_size_override("font_size", 12)
 	graph_node.add_child(description)
+	if bool(node.get("bypass", false)):
+		# A bypassed node is still visible, so it can be switched back on, but the
+		# whole node is dimmed to make it obvious that it does nothing right now.
+		description.text += "（已旁路）"
+		graph_node.modulate = Color(1.0, 1.0, 1.0, 0.6)
 	if input_count >= 2:
 		# Every slot needs its own child, otherwise the second input port does not
 		# exist and connections to it are dropped. The label says what the port
@@ -777,6 +788,19 @@ func _on_multi_select_pressed() -> void:
 		_selected_ids.clear()
 		if not _selected_id.is_empty():
 			_selected_ids.append(_selected_id)
+
+
+## Switches a node off without deleting it: its first input goes straight
+## through, so a step can be compared on and off with one tap.
+func _toggle_bypass(node_id: String) -> void:
+	var node: Dictionary = graph.get_node_by_id(node_id)
+	if node.is_empty():
+		return
+	_push_undo("%s:bypass" % node_id)
+	node["bypass"] = not bool(node.get("bypass", false))
+	_refresh_graph()
+	_show_params(node_id)
+	_schedule_preview()
 
 
 func _on_copy_pressed() -> void:
@@ -1191,6 +1215,46 @@ func _show_params(id: String) -> void:
 			_add_check("反向", bool(params["invert"]), params, "invert")
 		"checker":
 			_add_slider("格子 (px)", 1.0, 64.0, 1.0, float(params["cell"]), params, "cell")
+		"shape":
+			var shape_hint := Label.new()
+			shape_hint.text = (
+				"基础图形，用来做遮罩：接到描边、发光、混合或运算节点上使用。"
+				+ "按距离场绘制，所以柔边在每种形状上表现一致。"
+			)
+			shape_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+			shape_hint.add_theme_font_size_override("font_size", 13)
+			_params_box.add_child(shape_hint)
+			_add_option(
+				"形状",
+				ShaderGraphScript.SHAPE_KINDS,
+				int(params.get("kind", 0)),
+				params,
+				"kind",
+				true
+			)
+			_begin_section("位置与大小", true)
+			_add_slider("中心 X", 0.0, 1.0, 0.01, float(params.get("center_x", 0.5)), params, "center_x")
+			_add_slider("中心 Y", 0.0, 1.0, 0.01, float(params.get("center_y", 0.5)), params, "center_y")
+			_add_slider("大小", 0.02, 1.5, 0.01, float(params.get("size", 0.35)), params, "size")
+			_add_slider(
+				"旋转", -180.0, 180.0, 1.0, float(params.get("angle", 0.0)), params, "angle"
+			)
+			_add_slider("柔边", 0.0, 0.2, 0.005, float(params.get("soft", 0.02)), params, "soft")
+			_end_section()
+			_add_check("反向", bool(params.get("invert", false)), params, "invert")
+			if int(params.get("kind", 0)) == 4:
+				_begin_section("星形", true)
+				_add_number("角数", 3, 12, 1, int(params.get("points", 5)), params, "points")
+				_add_slider(
+					"内半径", 0.05, 0.95, 0.01, float(params.get("inner", 0.45)), params, "inner"
+				)
+				_end_section()
+			elif int(params.get("kind", 0)) == 5:
+				_begin_section("圆环", true)
+				_add_slider(
+					"环宽", 0.01, 0.5, 0.01, float(params.get("thickness", 0.18)), params, "thickness"
+				)
+				_end_section()
 		"tree":
 			var tree_hint := Label.new()
 			tree_hint.text = (
@@ -1834,6 +1898,8 @@ func _on_node_menu_pressed(id: int) -> void:
 			_on_group_pressed()
 		4:
 			_open_path_editor(_hold_id)
+		5:
+			_toggle_bypass(_hold_id)
 
 
 ## Tracks press and release on a node, so a hold of half a second (without
@@ -1857,6 +1923,16 @@ func _on_graph_node_input(event: InputEvent, node_id: String) -> void:
 					== ShaderGraphScript.PATH_CUSTOM
 				)
 			_node_menu.set_item_disabled(4, not editable)
+			# A node without inputs has nothing to pass through, so it cannot be
+			# bypassed; for the others the entry says what tapping it would do.
+			var has_input := false
+			var node_type := str(node.get("type", ""))
+			if ShaderGraphScript.NODE_TYPES.has(node_type):
+				has_input = int(ShaderGraphScript.NODE_TYPES[node_type]["inputs"]) >= 1
+			_node_menu.set_item_disabled(5, not has_input)
+			_node_menu.set_item_text(
+				5, "启用此节点" if bool(node.get("bypass", false)) else "旁路此节点"
+			)
 			return
 		var held := Time.get_ticks_msec() - _hold_start
 		if _hold_id == node_id and not _hold_moved and held >= HOLD_MENU_MSEC:

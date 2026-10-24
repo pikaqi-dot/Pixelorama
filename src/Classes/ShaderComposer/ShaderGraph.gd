@@ -13,6 +13,8 @@ const NODE_TYPES := {
 	"radial": {"label": "径向", "inputs": 0},
 	"checker": {"label": "棋盘", "inputs": 0},
 	"constant": {"label": "常量", "inputs": 0},
+	# A single primitive, sized and rotated. Useful as a mask for the filters.
+	"shape": {"label": "图形", "inputs": 0},
 	# A recursive tree, rasterised once per frame. Growth reveals it level by
 	# level, which is what makes the growing animation possible.
 	"tree": {"label": "树木", "inputs": 0},
@@ -85,6 +87,8 @@ const BLEND_OPS := ["Mix", "Add", "Multiply", "Screen", "Difference"]
 const POLAR_MODES := ["矩形 → 极坐标", "极坐标 → 矩形"]
 const ECHO_MODES := ["最大值（拖影）", "平均值（残影）"]
 const PATH_SHAPES := ["圆形", "水平", "垂直", "正弦", "方形", "8 字", "自定义"]
+## Primitives of the shape node.
+const SHAPE_KINDS := ["圆形", "方形", "三角形", "菱形", "星形", "圆环"]
 ## Where the pixel particles are born.
 const PARTICLE_SPAWN := ["底部升起", "顶部下落", "中心爆发", "全画布"]
 const PARTICLE_SHAPES := ["方形", "圆形"]
@@ -107,7 +111,16 @@ const NODE_GROUPS := [
 	{
 		"label": "生成",
 		"types":
-		["noise", "gradient", "radial", "checker", "constant", "tree", "particles"],
+		[
+			"noise",
+			"gradient",
+			"radial",
+			"checker",
+			"constant",
+			"shape",
+			"tree",
+			"particles",
+		],
 	},
 	{"label": "输入", "types": ["path", "pixel_art"]},
 	{"label": "动态", "types": ["time", "wave"]},
@@ -158,6 +171,17 @@ const NODE_GROUPS := [
 	},
 	{"label": "合成", "types": ["math", "blend", "output"]},
 ]
+## Accent of every group, reused for the node titles so a large graph can be read
+## by colour instead of by reading every label.
+const NODE_GROUP_COLORS := {
+	"生成": Color(0.55, 0.82, 1.0),
+	"输入": Color(0.55, 0.95, 0.75),
+	"动态": Color(1.0, 0.84, 0.45),
+	"变换": Color(0.76, 0.7, 1.0),
+	"变形": Color(1.0, 0.66, 0.76),
+	"滤镜": Color(0.66, 0.94, 0.6),
+	"合成": Color(0.96, 0.76, 0.56),
+}
 ## Coordinates closer than this to a pixel are treated as that pixel. Only used to
 ## cancel the floating point noise of rotations by right angles.
 const SNAP_STEP := 0.000001
@@ -490,6 +514,15 @@ static func second_input_label(type: String) -> String:
 	return str(SECOND_INPUT_LABELS.get(type, "输入 2"))
 
 
+## Group of the add menu a type belongs to, or an empty string. The page colours
+## the node titles with the accent of their group.
+static func group_of_type(type: String) -> String:
+	for group: Dictionary in NODE_GROUPS:
+		if (group["types"] as Array).has(type):
+			return str(group["label"])
+	return ""
+
+
 static func default_params(type: String) -> Dictionary:
 	match type:
 		"noise":
@@ -506,6 +539,19 @@ static func default_params(type: String) -> Dictionary:
 			}
 		"checker":
 			return {"cell": 8.0}
+		"shape":
+			return {
+				"kind": 0,
+				"center_x": 0.5,
+				"center_y": 0.5,
+				"size": 0.35,
+				"angle": 0.0,
+				"soft": 0.02,
+				"invert": false,
+				"points": 5,
+				"inner": 0.45,
+				"thickness": 0.18,
+			}
 		"constant":
 			return {"value": 0.5}
 		"tree":
@@ -770,6 +816,13 @@ func _eval(node_id: String, uv: Vector2, size: Vector2i, depth: int) -> float:
 	if node.is_empty():
 		return 0.0
 	var params: Dictionary = node["params"]
+	if bool(node.get("bypass", false)):
+		# A bypassed node hands its first input straight through, which is how a
+		# step gets switched off without rewiring the graph.
+		var passthrough := _input_id(node, 0)
+		if passthrough.is_empty():
+			return 0.0
+		return _eval(passthrough, uv, size, depth + 1)
 	var size_vec := Vector2(size)
 	var normalized := uv / size_vec
 	match str(node["type"]):
@@ -791,6 +844,39 @@ func _eval(node_id: String, uv: Vector2, size: Vector2i, depth: int) -> float:
 			var cell := maxf(float(params["cell"]), 1.0)
 			var odd := (floori(uv.x / cell) + floori(uv.y / cell)) % 2
 			return 1.0 if odd == 1 else 0.0
+		"shape":
+			# Every primitive is a distance to its border, so one softness setting
+			# works for all of them and the edges stay anti aliased.
+			var shape_center := Vector2(
+				float(params.get("center_x", 0.5)), float(params.get("center_y", 0.5))
+			)
+			var shape_size := maxf(float(params.get("size", 0.35)), 0.01)
+			var shape_offset := (normalized - shape_center) / shape_size
+			shape_offset = shape_offset.rotated(-deg_to_rad(float(params.get("angle", 0.0))))
+			var shape_distance := 0.0
+			match int(params.get("kind", 0)):
+				1:  # 方形
+					shape_distance = maxf(absf(shape_offset.x), absf(shape_offset.y)) - 1.0
+				2:  # 三角形（尖角朝上）
+					shape_distance = _polygon_distance(shape_offset.rotated(PI * 0.5), 3)
+				3:  # 菱形
+					shape_distance = absf(shape_offset.x) + absf(shape_offset.y) - 1.0
+				4:  # 星形
+					shape_distance = shape_offset.length() - _star_radius(
+						shape_offset,
+						int(params.get("points", 5)),
+						float(params.get("inner", 0.45))
+					)
+				5:  # 圆环
+					shape_distance = (
+						absf(shape_offset.length() - 1.0)
+						- maxf(float(params.get("thickness", 0.18)), 0.01)
+					)
+				_:
+					shape_distance = shape_offset.length() - 1.0
+			var shape_soft := maxf(float(params.get("soft", 0.02)), 0.0005)
+			var shape_value := clampf(0.5 - shape_distance / (shape_soft * 2.0), 0.0, 1.0)
+			return 1.0 - shape_value if bool(params.get("invert", false)) else shape_value
 		"constant":
 			return clampf(float(params.get("value", 0.5)), 0.0, 1.0)
 		"tree":
@@ -1354,6 +1440,33 @@ func _sample(
 	elif sampled.y < 0.0 or sampled.y >= float(size.y):
 		return 0.0
 	return clampf(_eval(_input_id(node, slot), sampled, size, depth + 1), 0.0, 1.0)
+
+
+## Distance to the border of a regular polygon with [param sides] sides and an
+## inradius of one, negative inside. [param offset] is centred on the polygon.
+static func _polygon_distance(offset: Vector2, sides: int) -> float:
+	var count := maxi(sides, 3)
+	var step := TAU / float(count)
+	var corner := fposmod(atan2(offset.y, offset.x), step) - step * 0.5
+	return offset.length() * cos(corner) - cos(step * 0.5)
+
+
+## Radius of the star with [param points] spikes in the direction of
+## [param offset]. The edge between a spike and a valley is a straight line, so
+## the star has sharp points instead of the petals a linear blend would give.
+static func _star_radius(offset: Vector2, points: int, inner: float) -> float:
+	var step := TAU / float(maxi(points, 3))
+	var half := step * 0.5
+	var angle := absf(fposmod(atan2(offset.y, offset.x), step))
+	if angle > half:
+		angle = step - angle
+	var ratio := clampf(inner, 0.05, 0.95)
+	var sine := sin(half)
+	var cosine := cos(half)
+	var denominator := sine * ratio * cos(angle) + (1.0 - cosine * ratio) * sin(angle)
+	if absf(denominator) < 0.0001:
+		return 1.0
+	return sine * ratio / denominator
 
 
 ## Maps a coordinate around the middle of its axis, so scaling keeps the content
@@ -2120,6 +2233,10 @@ static func describe(node: Dictionary) -> String:
 			return "r %.2f" % float(params["radius"])
 		"checker":
 			return "cell %d px" % int(params["cell"])
+		"shape":
+			return str(
+				SHAPE_KINDS[clampi(int(params.get("kind", 0)), 0, SHAPE_KINDS.size() - 1)]
+			)
 		"tree":
 			return "深 %d · %d 叉" % [
 				int(params.get("depth", 5)), int(params.get("branches", 2))
