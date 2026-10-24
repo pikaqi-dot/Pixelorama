@@ -96,6 +96,10 @@ var _node_previews: Dictionary = {}
 ## Nodes whose preview frame the user folded away. Open is the default.
 var _preview_collapsed: Dictionary = {}
 var _preview: TextureRect
+## Last generated picture. The output node's preview is a resize of it, which
+## saves a second full pass over the graph for the thumbnail that is always on
+## screen.
+var _preview_image: Image
 ## Picture of the node selected in the side panel, and the area that holds it
 ## with its backdrop.
 var _node_preview: TextureRect
@@ -861,7 +865,7 @@ func _make_node_preview(node: Dictionary) -> Control:
 	}
 	if not collapsed:
 		thumb.texture = ImageTexture.create_from_image(
-			graph.preview_node(node_id, Vector2i(NODE_PREVIEW_SIZE, NODE_PREVIEW_SIZE))
+			_node_picture(node_id, NODE_PREVIEW_SIZE)
 		)
 	return column
 
@@ -927,6 +931,18 @@ func _toggle_node_preview(node_id: String) -> void:
 		_refresh_node_preview(node_id, entry)
 
 
+## Picture of one node, at [param side] pixels. The output node's picture is the
+## generated image itself, so it is resized from the last generation instead of
+## evaluating the whole graph a second time for every thumbnail refresh.
+func _node_picture(node_id: String, side: int) -> Image:
+	var source := _preview_image
+	if source != null and not source.is_empty() and node_id == graph.output_node_id():
+		var copy := source.duplicate() as Image
+		copy.resize(side, side, Image.INTERPOLATE_NEAREST)
+		return copy
+	return graph.preview_node(node_id, Vector2i(side, side))
+
+
 ## Picture of the node selected in the side panel. It is bigger than the
 ## thumbnails so a parameter change can be judged without zooming the graph.
 func _refresh_selected_preview() -> void:
@@ -936,7 +952,7 @@ func _refresh_selected_preview() -> void:
 		_node_preview.texture = null
 		return
 	_node_preview.texture = ImageTexture.create_from_image(
-		graph.preview_node(_selected_id, Vector2i(SELECTED_PREVIEW_SIZE, SELECTED_PREVIEW_SIZE))
+		_node_picture(_selected_id, SELECTED_PREVIEW_SIZE)
 	)
 
 
@@ -948,9 +964,7 @@ func _refresh_node_preview(node_id: String, entry: Dictionary) -> void:
 	# Playback draws smaller thumbnails, which is the difference between the
 	# moving branch keeping up and falling a whole second behind.
 	var side := NODE_PREVIEW_SIZE_PLAYBACK if _is_playing() else NODE_PREVIEW_SIZE
-	thumb.texture = ImageTexture.create_from_image(
-		graph.preview_node(node_id, Vector2i(side, side))
-	)
+	thumb.texture = ImageTexture.create_from_image(_node_picture(node_id, side))
 
 
 ## Repaints the thumbnail of one node right now, and the side panel picture when
@@ -3420,8 +3434,12 @@ func _show_big_preview() -> void:
 	_preview_popup.popup_centered(Vector2i(maxi(side, 220), maxi(side, 220)))
 
 
+## Asks for a new preview a moment later, so a slider that fires on every pixel
+## does not start a generation per event. A timer that is already running is left
+## alone: restarting it on every change would hold the picture back until the
+## finger stops, which made dragging feel like it did not update at all.
 func _schedule_preview() -> void:
-	if is_instance_valid(_preview_timer):
+	if is_instance_valid(_preview_timer) and _preview_timer.is_stopped():
 		_preview_timer.start()
 
 
@@ -3478,6 +3496,7 @@ func _refresh_preview() -> void:
 	if not is_instance_valid(_preview):
 		_preview_busy = false
 		return
+	_preview_image = image
 	_preview.texture = ImageTexture.create_from_image(image)
 	# A clock or a live source changes every thumbnail; without them only the
 	# branches touched by the edit need a new picture.

@@ -199,6 +199,11 @@ const SNAP_STEP := 0.000001
 ## pixels transparent, so the backdrop of the frame shows through instead of a
 ## black block that hides what the node actually covers.
 const PREVIEW_EMPTY := 0.004
+## How many different raster sizes are kept at once. A thumbnail, the picture in
+## the side panel and the main preview each use their own size, so keeping them
+## apart saves rebuilding every stroke and particle field whenever the size
+## changes. More distinct sizes than this drop everything, which bounds the memory.
+const RASTER_SIZES_MAX := 3
 
 ## Nodes of the graph, as dictionaries: id, type, position, params, inputs.
 var nodes: Array[Dictionary] = []
@@ -222,17 +227,15 @@ var _eval_nodes: Dictionary = {}
 ## once instead of once per pixel.
 var _noise_checked: Dictionary = {}
 ## Time the images in [member _path_cache] were built at. A new frame throws
-## them away, which is why they can be keyed by node id alone.
+## them away, so they only have to be keyed by node id and size.
 var _raster_time := -1.0
 ## Bounds of the non empty part of a branch, rebuilt for every generated image.
-## Resolution the images in [member _path_cache] were built at. A thumbnail is
-## generated at another size than the preview, so the rasters have to be rebuilt
-## instead of being read at the wrong scale.
-var _raster_size := Vector2i.ZERO
 var _bounds_cache := {}
 var _bayer_cache := {}
 ## Rasterised paths and the project layers read by the input nodes, per generate.
 var _path_cache := {}
+## Sizes currently held in [member _path_cache], so the cache can stay bounded.
+var _raster_sizes := {}
 var _source_cache := {}
 
 
@@ -925,10 +928,10 @@ func _begin_generation(size: Vector2i) -> Dictionary:
 	size = Vector2i(maxi(size.x, 1), maxi(size.y, 1))
 	_bounds_cache.clear()
 	_path_cache.clear()
+	_raster_sizes.clear()
 	_source_cache.clear()
 	# Resolved once per frame, so an animated parameter costs a lookup per pixel.
 	_resolve_animations()
-	_raster_size = size
 	var image := Image.create_empty(size.x, size.y, false, Image.FORMAT_RGBA8)
 	var output_id := output_node_id()
 	if output_id.is_empty():
@@ -998,11 +1001,11 @@ func _resolve_animations() -> void:
 	_eval_nodes.clear()
 	_noise_checked.clear()
 	# Cached strokes, trees and particle fields only last for one frame, so a
-	# node id is enough to find them again inside the pixel loop.
+	# node id plus the size is enough to find them again inside the pixel loop.
 	if not is_equal_approx(time, _raster_time):
 		_raster_time = time
-		_raster_size = Vector2i.ZERO
 		_path_cache.clear()
+		_raster_sizes.clear()
 	for node: Dictionary in nodes:
 		var node_id := str(node["id"])
 		var params: Dictionary = node["params"]
@@ -2015,11 +2018,6 @@ static func _path_point_at(flat: PackedVector2Array, t: float) -> Dictionary:
 ## node, so the picture always matches that branch of the graph.
 func preview_node(node_id: String, size: Vector2i) -> Image:
 	_resolve_animations()
-	# Thumbnails use another resolution than the preview, so the rasterised nodes
-	# are rebuilt at this size instead of being read at the wrong scale.
-	_ensure_raster_size(size)
-	var image := Image.create_empty(size.x, size.y, false, Image.FORMAT_RGBA8)
-	image.fill(Color(0.0, 0.0, 0.0, 0.0))
 	# Colour is not only decided at the output, every node feeds the same ramp, so
 	# a preview is shown in the colour that value ends up with. Only a graph with
 	# no output node falls back to a grey picture.
@@ -2033,21 +2031,33 @@ func preview_node(node_id: String, size: Vector2i) -> Image:
 	var transparent := bool(ramp.get("transparent", false))
 	var fade := transparent and bool(ramp.get("alpha_from_value", false))
 	var alpha_cut := maxf(float(ramp.get("alpha_cut", 0.0)), PREVIEW_EMPTY)
+	# Written into one byte buffer and handed to the image at the end. A preview
+	# is rebuilt on every edit and every playback tick, so per pixel set_pixel
+	# calls are the difference between smooth and laggy on a phone.
+	var bytes := PackedByteArray()
+	bytes.resize(size.x * size.y * 4)
+	var index := 0
 	for y in size.y:
 		for x in size.x:
 			var value := clampf(_eval(node_id, Vector2(x, y), size, 0), 0.0, 1.0)
-			if value <= alpha_cut:
-				# Nothing here, so the backdrop of the preview shows through.
-				continue
-			if grey:
-				image.set_pixel(x, y, Color(value, value, value, 1.0))
-				continue
-			var position := clampf(float(floori(value * steps)) / float(steps - 1), 0.0, 1.0)
-			var color := _ramp_color(color_a, color_mid, color_b, mid_position, position)
-			if fade:
-				color.a = value
-			image.set_pixel(x, y, color)
-	return image
+			if value > alpha_cut:
+				var color := Color(value, value, value, 1.0)
+				if not grey:
+					var position := clampf(
+						float(floori(value * steps)) / float(steps - 1), 0.0, 1.0
+					)
+					color = _ramp_color(color_a, color_mid, color_b, mid_position, position)
+					if fade:
+						color.a = value
+				# to_rgba32 packs red in the highest byte, so it is written out in
+				# the RGBA order the image expects.
+				var packed := color.to_rgba32()
+				bytes[index] = (packed >> 24) & 0xFF
+				bytes[index + 1] = (packed >> 16) & 0xFF
+				bytes[index + 2] = (packed >> 8) & 0xFF
+				bytes[index + 3] = packed & 0xFF
+			index += 4
+	return Image.create_from_data(size.x, size.y, false, Image.FORMAT_RGBA8, bytes)
 
 
 ## Ramp of the output node, read without generating a picture. The previews use it
@@ -2074,20 +2084,23 @@ func _preview_ramp() -> Dictionary:
 	}
 
 
-## Rasterised node images belong to one resolution. Reading them from another
-## size would show a cropped corner of the bigger picture, so they are thrown
-## away when the size changes.
-func _ensure_raster_size(size: Vector2i) -> void:
-	if size == _raster_size:
-		return
-	_raster_size = size
-	_path_cache.clear()
+## Cache key of a rasterised node image. The size is part of the key, so the
+## thumbnail, the side panel picture and the main preview do not throw each
+## other's rasters away whenever the size changes, which used to rebuild every
+## stroke, tree and particle field several times per frame.
+func _raster_key(node_id: String, size: Vector2i) -> String:
+	if not _raster_sizes.has(size):
+		if _raster_sizes.size() >= RASTER_SIZES_MAX:
+			_path_cache.clear()
+			_raster_sizes.clear()
+		_raster_sizes[size] = true
+	return "%s@%dx%d" % [node_id, size.x, size.y]
 
 
 ## Rasterises the stroke of a path node at [param size] and caches it, so the
 ## per pixel evaluation is just a lookup.
 func _path_image(node: Dictionary, params: Dictionary, size: Vector2i) -> Image:
-	var key := str(node["id"])
+	var key := _raster_key(str(node["id"]), size)
 	if _path_cache.has(key):
 		return _path_cache[key]
 	var image := rasterise_path(params, size)
@@ -2145,7 +2158,7 @@ func _canvas_path_value(
 func _canvas_path_image(
 	node: Dictionary, params: Dictionary, size: Vector2i, depth: int
 ) -> Image:
-	var key := str(node["id"])
+	var key := _raster_key(str(node["id"]), size)
 	if _path_cache.has(key):
 		return _path_cache[key]
 	var image := Image.create_empty(size.x, size.y, false, Image.FORMAT_RGBA8)
@@ -2247,7 +2260,7 @@ func _tree_image(node: Dictionary, params: Dictionary, size: Vector2i) -> Image:
 	# The shape parameters belong in the key: editing them has to rebuild the
 	# image even when the growth did not move. The phase is in there for the
 	# sway, which bends the tree without changing the growth.
-	var key := str(node["id"])
+	var key := _raster_key(str(node["id"]), size)
 	if _path_cache.has(key):
 		return _path_cache[key]
 	var image := Image.create_empty(size.x, size.y, false, Image.FORMAT_RGBA8)
@@ -2392,7 +2405,7 @@ static func particles_animate(params: Dictionary) -> bool:
 ## the sequence loops exactly.
 func _particles_image(node: Dictionary, params: Dictionary, size: Vector2i) -> Image:
 	var phase := clampf(time, 0.0, 1.0)
-	var key := str(node["id"])
+	var key := _raster_key(str(node["id"]), size)
 	if _path_cache.has(key):
 		return _path_cache[key]
 	var image := Image.create_empty(size.x, size.y, false, Image.FORMAT_RGBA8)
@@ -2468,7 +2481,7 @@ func _particles_image(node: Dictionary, params: Dictionary, size: Vector2i) -> I
 func _scatter_image(
 	node: Dictionary, params: Dictionary, size: Vector2i, depth: int
 ) -> Image:
-	var key := str(node["id"])
+	var key := _raster_key(str(node["id"]), size)
 	if _path_cache.has(key):
 		return _path_cache[key]
 	var image := Image.create_empty(size.x, size.y, false, Image.FORMAT_RGBA8)
