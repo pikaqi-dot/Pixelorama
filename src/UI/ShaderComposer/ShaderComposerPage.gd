@@ -13,6 +13,7 @@ const ShaderGraphScript := preload("res://src/Classes/ShaderComposer/ShaderGraph
 const ShaderPathEditorScript := preload("res://src/UI/ShaderComposer/ShaderPathEditor.gd")
 const ShaderValueChangerScript := preload("res://src/UI/ShaderComposer/ShaderValueChanger.gd")
 const ShaderWidthCurveScript := preload("res://src/UI/ShaderComposer/ShaderWidthCurve.gd")
+const ShaderCanvasEditorScript := preload("res://src/UI/ShaderComposer/ShaderCanvasEditor.gd")
 
 const PORT_COLOR := Color(0.55, 0.8, 1.0)
 const PREVIEW_LIMIT := 256
@@ -73,6 +74,10 @@ var _params_hint: Label
 var _path_popup: PopupPanel
 var _path_popup_node := ""
 var _path_editor
+## Small drawing window of a canvas node, and the node it paints for.
+var _canvas_popup: PopupPanel
+var _canvas_editor
+var _canvas_node_id := ""
 ## Preview frame, thumbnail and toggle button of every node, by node id.
 var _node_previews: Dictionary = {}
 ## Nodes whose preview frame the user folded away. Open is the default.
@@ -2380,6 +2385,16 @@ func _build_canvas_image_section(id: String, params: Dictionary) -> void:
 	)
 	_add_check("反相", bool(params.get("invert", false)), params, "invert")
 	_build_source_crop_section(id, params)
+	_params_target.add_child(
+		_make_button(
+			"绘画窗口…", func() -> void: _open_canvas_editor(id), "在画布大小的窗口里直接画材质"
+		)
+	)
+	var draw_hint := Label.new()
+	draw_hint.text = "窗口按画布大小打开，只有铅笔、橡皮、填充、方形、圆形，只用白色；完成后写回这个节点读取的图层。"
+	draw_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	draw_hint.add_theme_font_size_override("font_size", 13)
+	_params_target.add_child(draw_hint)
 
 
 ## Stroke controls of a canvas node in path mode.
@@ -2510,6 +2525,102 @@ func _reset_source_crop(node_id: String, params: Dictionary) -> void:
 	_mark_preview_dirty(node_id)
 	_schedule_preview()
 	call_deferred("_show_params", node_id)
+
+
+## Opens the small drawing window of a canvas node. It paints into the same layer
+## the node reads, so the material can be made without leaving the composer.
+func _open_canvas_editor(node_id: String) -> void:
+	var node: Dictionary = graph.get_node_by_id(node_id)
+	if node.is_empty():
+		return
+	var cel: BaseCel = graph.source_cel(node)
+	if cel == null or cel.get_image() == null:
+		Global.notification_label("这个节点读不到图层内容")
+		return
+	if not is_instance_valid(_canvas_editor):
+		_canvas_popup = PopupPanel.new()
+		_canvas_popup.transparent_bg = false
+		add_child(_canvas_popup)
+		var frame := MarginContainer.new()
+		for side in ["left", "right", "top", "bottom"]:
+			frame.add_theme_constant_override("margin_" + side, 12)
+		_canvas_popup.add_child(frame)
+		_canvas_editor = ShaderCanvasEditorScript.new()
+		_canvas_editor.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		_canvas_editor.size_flags_vertical = Control.SIZE_EXPAND_FILL
+		frame.add_child(_canvas_editor)
+		_canvas_editor.finished.connect(_finish_canvas_editor)
+		_canvas_popup.popup_hide.connect(_finish_canvas_editor)
+	_canvas_node_id = node_id
+	_canvas_editor.setup(cel.get_image().duplicate())
+	_popup_canvas_editor()
+
+
+## Sizes the drawing window to the canvas, inside the visible part of the screen.
+## The board keeps the aspect of the artwork, so the pixels are drawn square.
+func _popup_canvas_editor() -> void:
+	if not is_instance_valid(_canvas_popup) or not is_instance_valid(_canvas_editor):
+		return
+	var visible := _visible_popup_rect()
+	var room := Vector2i(mini(visible.size.x, int(size.x)), mini(visible.size.y, int(size.y)))
+	var image_size: Vector2i = _canvas_editor.image_size()
+	if image_size.x <= 0 or image_size.y <= 0:
+		image_size = Vector2i(64, 64)
+	var room_for_board := Vector2(room) * Vector2(0.86, 0.72)
+	var factor := minf(
+		room_for_board.x / float(image_size.x), room_for_board.y / float(image_size.y)
+	)
+	factor = maxf(factor, 1.0)
+	var target := Vector2i(
+		mini(int(float(image_size.x) * factor) + 26, room.x),
+		mini(int(float(image_size.y) * factor) + 160, room.y)
+	)
+	_canvas_popup.popup_centered_clamped(target, 0.95)
+
+
+## Closes the drawing window and writes what was drawn into the layer, as one
+## undo step, so the drawing can be undone like any other edit.
+func _finish_canvas_editor() -> void:
+	if not is_instance_valid(_canvas_editor):
+		return
+	var editor = _canvas_editor
+	var node_id := _canvas_node_id
+	_canvas_editor = null
+	_canvas_node_id = ""
+	if is_instance_valid(_canvas_popup):
+		_canvas_popup.hide()
+		_canvas_popup.queue_free()
+		_canvas_popup = null
+	if node_id.is_empty() or not editor.is_modified():
+		return
+	var image: Image = editor.take_result()
+	if image != null:
+		_write_canvas_image(node_id, image)
+
+
+## Puts the painted buffer back into the cel the node reads.
+func _write_canvas_image(node_id: String, image: Image) -> void:
+	var node: Dictionary = graph.get_node_by_id(node_id)
+	var project := Global.current_project
+	if node.is_empty() or project == null:
+		return
+	var cel: BaseCel = graph.source_cel(node)
+	if cel == null or not cel is PixelCel:
+		return
+	var replaced = cel.get_image()
+	var incoming := _make_cel_image(image, project)
+	project.undo_redo.create_action("绘制画布材质")
+	project.undo_redo.add_do_method(_set_cel_image.bind(cel, incoming))
+	project.undo_redo.add_undo_method(_set_cel_image.bind(cel, replaced))
+	project.undo_redo.add_do_method(Global.undo_or_redo.bind(false))
+	project.undo_redo.add_undo_method(Global.undo_or_redo.bind(true))
+	project.undo_redo.commit_action()
+	graph.clear_source_cache()
+	_mark_preview_dirty(node_id)
+	_schedule_preview()
+	# The crop preview and the reported source size both follow the layer.
+	if _selected_id == node_id:
+		call_deferred("_show_params", node_id)
 
 
 ## Opens the path window from the side panel. The control points live in a large

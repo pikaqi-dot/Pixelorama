@@ -2649,10 +2649,21 @@ func _source_image(node: Dictionary, params: Dictionary) -> Image:
 	var key := str(node["id"])
 	if _source_cache.has(key):
 		return _source_cache[key]
+	var cel := source_cel(node)
+	var image: Image = null
+	if cel != null:
+		image = cel.get_image()
+	_source_cache[key] = image
+	return image
+
+
+## Cel a canvas node reads. The small drawing window paints into the same cel,
+## so what is drawn there becomes the material of the node.
+func source_cel(node: Dictionary) -> BaseCel:
 	var project = Global.current_project
 	if project == null or project.frames.is_empty() or project.layers.is_empty():
-		_source_cache[key] = null
 		return null
+	var params: Dictionary = params_for(node)
 	var frame_index := clampi(project.current_frame, 0, project.frames.size() - 1)
 	match int(params.get("frame_mode", 0)):
 		1:
@@ -2662,11 +2673,15 @@ func _source_image(node: Dictionary, params: Dictionary) -> Image:
 			frame_index = clampi(int(floorf(time * float(frame_count))), 0, frame_count - 1)
 	var layer_index := clampi(int(params.get("layer", 0)), 0, project.layers.size() - 1)
 	var cel = project.frames[frame_index].cels[layer_index]
-	var image: Image = null
 	if cel is BaseCel:
-		image = (cel as BaseCel).get_image()
-	_source_cache[key] = image
-	return image
+		return cel
+	return null
+
+
+## Drops the cached layer images, so the preview reads the artwork again after
+## the drawing window painted into it.
+func clear_source_cache() -> void:
+	_source_cache.clear()
 
 
 ## The layer behind a pixel_art node, for the editor preview.
