@@ -200,7 +200,6 @@ class Board extends Control:
 	## Side of the square brush the pencil and the eraser stamp, in pixels.
 	var brush_size := 1
 	var image: Image
-	var texture: ImageTexture
 
 	var _scale := 1.0
 	var _origin := Vector2.ZERO
@@ -224,13 +223,8 @@ class Board extends Control:
 
 	func set_image(source: Image) -> void:
 		image = source
-		if image == null:
-			texture = null
-			queue_redraw()
-			return
-		if image.get_format() != Image.FORMAT_RGBA8:
+		if image != null and image.get_format() != Image.FORMAT_RGBA8:
 			image.convert(Image.FORMAT_RGBA8)
-		texture = ImageTexture.create_from_image(image)
 		_layout()
 		queue_redraw()
 
@@ -255,10 +249,34 @@ class Board extends Control:
 
 	func _draw() -> void:
 		draw_rect(Rect2(Vector2.ZERO, size), Color(0.09, 0.1, 0.12))
-		if texture == null:
+		if image == null:
 			return
 		var rect := _image_rect()
-		draw_texture_rect(texture, rect, false)
+		# The pixels are drawn straight from the image, one run of equal pixels at
+		# a time. That keeps them exactly as painted: no texture filtering, no alpha
+		# surprises, and a one pixel mark stays one square.
+		draw_rect(rect, Color(0.12, 0.13, 0.16))
+		for y in image.get_height():
+			var x := 0
+			while x < image.get_width():
+				var color := image.get_pixel(x, y)
+				if color.a <= 0.0:
+					x += 1
+					continue
+				var run_start := x
+				x += 1
+				while x < image.get_width():
+					var neighbour := image.get_pixel(x, y)
+					if neighbour.a <= 0.0 or not neighbour.is_equal_approx(color):
+						break
+					x += 1
+				draw_rect(
+					Rect2(
+						rect.position + Vector2(run_start, y) * _scale,
+						Vector2(x - run_start, 1) * _scale
+					),
+					color
+				)
 		draw_rect(rect, Color(0.4, 0.44, 0.52), false, 1.0)
 		if _shaping:
 			_draw_preview(rect)
@@ -403,10 +421,6 @@ class Board extends Control:
 
 
 	func _refresh() -> void:
-		if image != null:
-			# A fresh texture per change is the reliable path: updating an existing
-			# one in place can leave stale pixels on some renderers.
-			texture = ImageTexture.create_from_image(image)
 		queue_redraw()
 
 

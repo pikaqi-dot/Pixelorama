@@ -2697,16 +2697,41 @@ static func _stamp_segment(
 
 
 ## The project layer picked by a pixel_art node, cached for this generation.
+## A pixel cel only stores the rectangle that was painted, together with an
+## offset, so the cel is composed onto a canvas sized image here. Reading the cel
+## image directly would treat a one pixel cel as the whole artwork.
 func _source_image(node: Dictionary, params: Dictionary) -> Image:
 	var key := str(node["id"])
 	if _source_cache.has(key):
 		return _source_cache[key]
 	var cel := source_cel(node)
 	var image: Image = null
-	if cel != null:
-		image = cel.get_image()
+	var project = Global.current_project
+	if cel != null and project != null:
+		var source: Image = cel.get_image()
+		if source != null and not source.is_empty():
+			var canvas: Vector2i = project.size
+			if source.get_width() == canvas.x and source.get_height() == canvas.y:
+				image = source
+			else:
+				image = _compose_cel(source, cel.offset, canvas)
 	_source_cache[key] = image
 	return image
+
+
+## Draws a cel image onto a transparent canvas sized picture at [param offset],
+## which is how the drawing area shows it.
+static func _compose_cel(source: Image, offset: Vector2i, canvas: Vector2i) -> Image:
+	var composed := Image.create_empty(
+		maxi(canvas.x, 1), maxi(canvas.y, 1), false, Image.FORMAT_RGBA8
+	)
+	composed.fill(Color(0.0, 0.0, 0.0, 0.0))
+	var layer := source
+	if source.get_format() != Image.FORMAT_RGBA8:
+		layer = source.duplicate()
+		layer.convert(Image.FORMAT_RGBA8)
+	composed.blend_rect(layer, Rect2i(Vector2i.ZERO, layer.get_size()), offset)
+	return composed
 
 
 ## Cel a canvas node reads. The small drawing window paints into the same cel,

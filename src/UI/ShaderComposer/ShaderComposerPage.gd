@@ -2745,7 +2745,11 @@ func _open_canvas_editor(node_id: String) -> void:
 	if node.is_empty():
 		return
 	var cel: BaseCel = graph.source_cel(node)
-	if cel == null or cel.get_image() == null:
+	if cel == null or not cel is PixelCel:
+		Global.notification_label("这个节点读取的图层不能直接绘制（不是像素图层）")
+		return
+	var painted: Image = graph.source_image(node)
+	if painted == null or painted.is_empty():
 		Global.notification_label("这个节点读不到图层内容")
 		return
 	if not is_instance_valid(_canvas_editor):
@@ -2763,7 +2767,9 @@ func _open_canvas_editor(node_id: String) -> void:
 		_canvas_editor.finished.connect(_finish_canvas_editor)
 		_canvas_popup.popup_hide.connect(_finish_canvas_editor)
 	_canvas_node_id = node_id
-	_canvas_editor.setup(cel.get_image().duplicate())
+	# The window always works at canvas size, because a cel only stores the
+	# rectangle it painted plus an offset.
+	_canvas_editor.setup(painted.duplicate())
 	_popup_canvas_editor()
 
 
@@ -2818,11 +2824,15 @@ func _write_canvas_image(node_id: String, image: Image) -> void:
 	var cel: BaseCel = graph.source_cel(node)
 	if cel == null or not cel is PixelCel:
 		return
-	var replaced = cel.get_image()
+	var pixel_cel := cel as PixelCel
+	var replaced_image = pixel_cel.get_image()
+	var replaced_offset: Vector2i = pixel_cel.offset
 	var incoming := _make_cel_image(image, project)
 	project.undo_redo.create_action("绘制画布材质")
-	project.undo_redo.add_do_method(_set_cel_image.bind(cel, incoming))
-	project.undo_redo.add_undo_method(_set_cel_image.bind(cel, replaced))
+	project.undo_redo.add_do_method(_set_canvas_cel.bind(pixel_cel, incoming, Vector2i.ZERO))
+	project.undo_redo.add_undo_method(
+		_set_canvas_cel.bind(pixel_cel, replaced_image, replaced_offset)
+	)
 	project.undo_redo.add_do_method(Global.undo_or_redo.bind(false))
 	project.undo_redo.add_undo_method(Global.undo_or_redo.bind(true))
 	project.undo_redo.commit_action()
@@ -3595,6 +3605,14 @@ static func _make_cel_image(image: Image, project: Project) -> ImageExtended:
 
 
 static func _set_cel_image(cel: PixelCel, image: ImageExtended) -> void:
+	cel.image = image
+	cel.update_texture()
+
+
+## Writes a canvas sized image into a pixel cel and resets its offset. The
+## drawing window works in canvas space, so the cel has to match it.
+static func _set_canvas_cel(cel: PixelCel, image: ImageExtended, offset: Vector2i) -> void:
+	cel.offset = offset
 	cel.image = image
 	cel.update_texture()
 
