@@ -59,6 +59,10 @@ var _param_filter := ""
 var _param_filter_edit: LineEdit
 ## Saved graph presets, and the small dialog used to name them.
 var _preset_menu: MenuButton
+## Secondary actions, so the toolbar stays short on a phone.
+var _more_menu: MenuButton
+## Hides the graph to give the parameters the whole page.
+var _zen_mode := false
 var _preset_paths: Array[String] = []
 var _preset_dialog: ConfirmationDialog
 var _preset_name: LineEdit
@@ -129,7 +133,7 @@ func close_page() -> void:
 	if is_instance_valid(_play_timer):
 		_play_timer.stop()
 	if is_instance_valid(_play_button):
-		_play_button.text = "▶ 播放"
+		_play_button.text = "▶"
 	_editing_layer = null
 	_graph_fingers.clear()
 	_graph_gesture = false
@@ -182,37 +186,36 @@ func _build_ui() -> void:
 	var toolbar := HFlowContainer.new()
 	root.add_child(toolbar)
 	_add_menu = MenuButton.new()
-	_add_menu.text = "＋ 添加节点"
+	_add_menu.text = "＋节点"
 	_add_menu.custom_minimum_size = Vector2(0, TOUCH_SIZE)
 	_add_menu.add_theme_font_size_override("font_size", TOUCH_FONT_SIZE)
 	_build_add_menu()
 	toolbar.add_child(_add_menu)
-	toolbar.add_child(_make_button("复制选中", _on_copy_pressed))
-	toolbar.add_child(_make_button("删除选中", _on_delete_pressed))
-	toolbar.add_child(_make_button("组合选中", _on_group_pressed, "把选中的节点放进一个可折叠的组"))
 	toolbar.add_child(_make_button("多选", _on_multi_select_pressed, "打开后连续点节点即可多选"))
+	toolbar.add_child(_make_button("组合", _on_group_pressed, "把选中的节点放进一个可折叠的组"))
 	toolbar.add_child(_make_button("撤销", _undo, "Ctrl+Z"))
 	toolbar.add_child(_make_button("重做", _redo, "Ctrl+Y"))
-	toolbar.add_child(_make_button("刷新预览", _refresh_preview))
+	_more_menu = MenuButton.new()
+	_more_menu.text = "更多"
+	_more_menu.custom_minimum_size = Vector2(0, TOUCH_SIZE)
+	_more_menu.add_theme_font_size_override("font_size", TOUCH_FONT_SIZE)
+	_build_more_menu()
+	toolbar.add_child(_more_menu)
 	_preset_menu = MenuButton.new()
 	_preset_menu.text = "预设"
 	_preset_menu.custom_minimum_size = Vector2(0, TOUCH_SIZE)
 	_preset_menu.add_theme_font_size_override("font_size", TOUCH_FONT_SIZE)
 	_build_preset_menu()
 	toolbar.add_child(_preset_menu)
-	_play_button = _make_button("▶ 播放", _on_play_pressed, "循环播放预览")
+	_play_button = _make_button("▶", _on_play_pressed, "循环播放预览")
 	toolbar.add_child(_play_button)
-	var frames_label := Label.new()
-	frames_label.text = "帧数"
-	frames_label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
-	frames_label.add_theme_font_size_override("font_size", 14)
-	toolbar.add_child(frames_label)
 	_frame_count = SpinBox.new()
 	_frame_count.min_value = 1
 	_frame_count.max_value = 60
 	_frame_count.step = 1
 	_frame_count.value = 8
-	_frame_count.custom_minimum_size = Vector2(90, TOUCH_SIZE)
+	_frame_count.tooltip_text = "生成多少帧"
+	_frame_count.custom_minimum_size = Vector2(78, TOUCH_SIZE)
 	_frame_count.add_theme_font_size_override("font_size", TOUCH_FONT_SIZE)
 	toolbar.add_child(_frame_count)
 	_status = Label.new()
@@ -420,12 +423,13 @@ func _make_group_node(group: Dictionary) -> GraphNode:
 		for index in range(1, incoming.size()):
 			graph_node.set_slot(index, true, index, PORT_COLOR, false, 0, PORT_COLOR)
 	var row := HBoxContainer.new()
+	# 32 px tall, so the buttons are still comfortable for a finger.
 	row.add_child(
 		_make_button(
 			"展开" if collapsed else "折叠",
 			func() -> void: _toggle_group(str(group["id"])),
 			"",
-			Vector2(0, 26)
+			Vector2(0, 32)
 		)
 	)
 	if collapsed:
@@ -434,7 +438,7 @@ func _make_group_node(group: Dictionary) -> GraphNode:
 				"解散",
 				func() -> void: _dissolve_group(str(group["id"])),
 				"拆掉这个组，节点都保留",
-				Vector2(0, 26)
+				Vector2(0, 32)
 			)
 		)
 	graph_node.add_child(row)
@@ -642,6 +646,57 @@ func _on_copy_pressed() -> void:
 	_selected_id = copy
 	_show_params(copy)
 	_schedule_preview()
+
+
+## Secondary actions live here, so the main toolbar still fits a portrait phone.
+func _build_more_menu() -> void:
+	var popup := _more_menu.get_popup()
+	popup.clear()
+	popup.add_item("复制选中", 0)
+	popup.add_item("删除选中", 1)
+	popup.add_item("刷新预览", 2)
+	popup.add_item("断开选中输入", 3)
+	popup.add_separator()
+	popup.add_check_item("放大参数面板", 4)
+	popup.set_item_checked(popup.get_item_index(4), _zen_mode)
+	if not popup.id_pressed.is_connected(_on_more_pressed):
+		popup.id_pressed.connect(_on_more_pressed)
+
+
+func _on_more_pressed(id: int) -> void:
+	match id:
+		0:
+			_on_copy_pressed()
+		1:
+			_on_delete_pressed()
+		2:
+			_refresh_preview()
+		3:
+			_disconnect_selected()
+		4:
+			_toggle_zen()
+			_build_more_menu()
+
+
+## Touch friendly way to drop a wire: dragging one off a port is fiddly with a
+## finger, so the menu can clear the inputs of the selected node.
+func _disconnect_selected() -> void:
+	if _selected_id.is_empty() or graph.get_node_by_id(_selected_id).is_empty():
+		return
+	_push_undo()
+	graph.disconnect_input(_selected_id, 0)
+	graph.disconnect_input(_selected_id, 1)
+	_refresh_graph()
+	_schedule_preview()
+
+
+## Hides the graph so the parameter list gets the whole height, which a phone
+## needs for something like Mesh Warp with its ten sliders.
+func _toggle_zen() -> void:
+	_zen_mode = not _zen_mode
+	if is_instance_valid(_graph_edit):
+		_graph_edit.visible = not _zen_mode
+	_apply_layout()
 
 
 ## Builds the preset menu: two built in presets, the save entry and the files the
@@ -1455,10 +1510,10 @@ func _on_play_pressed() -> void:
 	if _play_timer.is_stopped():
 		_play_timer.wait_time = 1.0 / maxf(PREVIEW_FPS, 1.0)
 		_play_timer.start()
-		_play_button.text = "⏸ 暂停"
+		_play_button.text = "⏸"
 	else:
 		_play_timer.stop()
-		_play_button.text = "▶ 播放"
+		_play_button.text = "▶"
 
 
 func _advance_playback() -> void:
@@ -1622,6 +1677,11 @@ func _apply_layout() -> void:
 		return
 	var narrow := size.x < NARROW_WIDTH
 	_body.vertical = narrow
+	if _zen_mode:
+		# The graph is hidden, so the parameters can use the whole height.
+		_graph_edit.custom_minimum_size = Vector2.ZERO
+		_side.custom_minimum_size = Vector2(0, 200)
+		return
 	if narrow:
 		_graph_edit.custom_minimum_size = Vector2(0, 220)
 		_side.custom_minimum_size = Vector2(0, 260)
@@ -1636,6 +1696,10 @@ func _input(event: InputEvent) -> void:
 	if not visible or not is_instance_valid(_graph_edit):
 		return
 	if event is InputEventKey and event.pressed and not event.echo:
+		# Never steal Ctrl+Z from the filter or the preset name field.
+		var focused := get_viewport().gui_get_focus_owner()
+		if focused is LineEdit or focused is TextEdit:
+			return
 		var key := event as InputEventKey
 		if key.ctrl_pressed and key.keycode == KEY_Z:
 			if key.shift_pressed:

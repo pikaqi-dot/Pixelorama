@@ -13,7 +13,8 @@ signal points_changed(points: Array)
 const HANDLE_RADIUS := 8.0
 ## Radius in pixels that still counts as hitting a handle, sized for fingers.
 const HANDLE_TOUCH := 20.0
-const BEZIER_TOUCH := 14.0
+## Handles get a slightly wider touch area, they are the fiddliest target here.
+const BEZIER_TOUCH := 18.0
 const SAMPLE_STEPS := 16
 
 ## Control points, always stored as {point, in, out} dictionaries.
@@ -174,7 +175,7 @@ func _draw() -> void:
 				var tip := _to_local((entry["point"] as Vector2) + offset)
 				var active: bool = index == _selected and _dragging_handle == key
 				draw_line(origin, tip, _handle_line, 2.0 if active else 1.0, true)
-				draw_circle(tip, 4.0, _handle_selected if active else _handle_line)
+				draw_circle(tip, 5.0, _handle_selected if active else _handle_line)
 	for index in _entries.size():
 		draw_circle(
 			_to_local(_entries[index]["point"]),
