@@ -1571,10 +1571,18 @@ static func _bezier_point(
 ## Rasterises the stroke of a path node at [param size] and caches it, so the
 ## per pixel evaluation is just a lookup.
 func _path_image(node: Dictionary, size: Vector2i) -> Image:
-	var key := "%s:%dx%d" % [node["id"], size.x, size.y]
+	var params: Dictionary = node["params"]
+	var key := "%s:%d:%dx%d" % [node["id"], var_to_str(params).hash(), size.x, size.y]
 	if _path_cache.has(key):
 		return _path_cache[key]
-	var params: Dictionary = node["params"]
+	var image := rasterise_path(params, size)
+	_path_cache[key] = image
+	return image
+
+
+## Draws a path node without touching the cache, so the thumbnail on the node can
+## be refreshed as soon as the control points change in the path window.
+func rasterise_path(params: Dictionary, size: Vector2i) -> Image:
 	var image := Image.create_empty(size.x, size.y, false, Image.FORMAT_RGBA8)
 	image.fill(Color(0.0, 0.0, 0.0, 0.0))
 	var closed := bool(params.get("closed", false))
@@ -1592,7 +1600,6 @@ func _path_image(node: Dictionary, size: Vector2i) -> Image:
 			var span := maxi(int(ceil(from_point.distance_to(to_point) * 2.0)), 1)
 			for step in span + 1:
 				_stamp_disc(image, from_point.lerp(to_point, float(step) / span), radius, soft)
-	_path_cache[key] = image
 	return image
 
 

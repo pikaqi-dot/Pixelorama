@@ -34,12 +34,20 @@ const GRAPH_SOURCE := "res://src/Classes/ShaderComposer/ShaderGraph.gd"
 const SOURCE_REFRESH_MSEC := 600
 ## How long a press on a node has to last to open the context menu.
 const HOLD_MENU_MSEC := 500
+## The path window takes most of the screen, the control points need the room.
+const PATH_POPUP_RATIO := 0.9
+## Side of the thumbnail drawn on a path node, in pixels.
+const PATH_THUMB_SIZE := 72
 
 var graph: RefCounted
 var _graph_edit: GraphEdit
 var _params_box: VBoxContainer
 var _params_hint: Label
-## Path editor shown in the parameters when Follow Path uses a custom shape.
+## The large path window and the node it edits, plus the thumbnails on the path
+## nodes. The editor is only alive while the window is open.
+var _path_popup: PopupPanel
+var _path_popup_node := ""
+var _path_thumbs: Dictionary = {}
 var _path_editor
 var _preview: TextureRect
 ## Tapping the small preview opens it at a readable size.
@@ -312,6 +320,7 @@ func _build_ui() -> void:
 	_node_menu.add_item("删除节点", 1)
 	_node_menu.add_item("断开输入", 2)
 	_node_menu.add_item("组合选中", 3)
+	_node_menu.add_item("编辑路径…", 4)
 	_node_menu.id_pressed.connect(_on_node_menu_pressed)
 	add_child(_node_menu)
 
@@ -381,6 +390,8 @@ func _refresh_graph() -> void:
 				if not group.is_empty():
 					group["position"] = (child as GraphNode).position_offset
 	_graph_edit.clear_connections()
+	# The thumbnails belong to the nodes being rebuilt, so the map starts over.
+	_path_thumbs.clear()
 	for child in _graph_edit.get_children():
 		if child is GraphNode:
 			_graph_edit.remove_child(child)
@@ -523,6 +534,9 @@ func _make_graph_node(node: Dictionary) -> GraphNode:
 	description.text = ShaderGraphScript.describe(node)
 	description.add_theme_font_size_override("font_size", 12)
 	graph_node.add_child(description)
+	if str(node["type"]) == "path":
+		# A path is easier to recognise from a picture than from its points.
+		graph_node.add_child(_make_path_thumb(node))
 	if input_count >= 2:
 		# Every slot needs its own child, otherwise the second input port does not
 		# exist and connections to it are dropped. The label says what the port
@@ -536,6 +550,22 @@ func _make_graph_node(node: Dictionary) -> GraphNode:
 		second_input.custom_minimum_size = Vector2(0, 14)
 		graph_node.add_child(second_input)
 	return graph_node
+
+
+## Thumbnail of a path node. It is drawn from the same rasteriser as the graph,
+## so what the node shows is exactly what the branch produces.
+func _make_path_thumb(node: Dictionary) -> TextureRect:
+	var thumb := TextureRect.new()
+	thumb.custom_minimum_size = Vector2(PATH_THUMB_SIZE, PATH_THUMB_SIZE)
+	thumb.texture_filter = CanvasItem.TEXTURE_FILTER_NEAREST
+	thumb.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+	thumb.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
+	thumb.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	thumb.texture = ImageTexture.create_from_image(
+		graph.rasterise_path(node["params"], Vector2i(PATH_THUMB_SIZE, PATH_THUMB_SIZE))
+	)
+	_path_thumbs[str(node["id"])] = thumb
+	return thumb
 
 
 func _on_connection_request(from_node: StringName, from_port: int, to_node: StringName, to_port: int) -> void:
@@ -1058,7 +1088,6 @@ func _on_node_deselected(node: Node) -> void:
 
 ## Builds the parameter controls of [param id] in the side panel.
 func _show_params(id: String) -> void:
-	_path_editor = null
 	_params_target = _params_box
 	_param_sections.clear()
 	for child in _params_box.get_children():
@@ -1205,7 +1234,7 @@ func _show_params(id: String) -> void:
 			path_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 			path_hint.add_theme_font_size_override("font_size", 13)
 			_params_box.add_child(path_hint)
-			_add_path_editor(params, true)
+			_add_path_button(id)
 			_add_check("闭合", bool(params.get("closed", false)), params, "closed", true)
 			_add_check("填充（需闭合）", bool(params.get("fill", false)), params, "fill")
 			_add_slider("线宽", 0.01, 0.3, 0.005, float(params["width"]), params, "width")
@@ -1391,7 +1420,7 @@ func _show_params(id: String) -> void:
 				true
 			)
 			if int(params["shape"]) == ShaderGraphScript.PATH_CUSTOM:
-				_add_path_editor(params)
+				_add_path_button(id)
 			else:
 				_add_slider("半径", 0.05, 1.0, 0.01, float(params["radius"]), params, "radius")
 			_add_slider("圈数", 0.25, 4.0, 0.25, float(params["loops"]), params, "loops")
@@ -1731,6 +1760,8 @@ func _on_node_menu_pressed(id: int) -> void:
 			if not _selected_ids.has(_hold_id):
 				_selected_ids.append(_hold_id)
 			_on_group_pressed()
+		4:
+			_open_path_editor(_hold_id)
 
 
 ## Tracks press and release on a node, so a hold of half a second (without
@@ -1745,6 +1776,15 @@ func _on_graph_node_input(event: InputEvent, node_id: String) -> void:
 			_hold_start = Time.get_ticks_msec()
 			_hold_position = button.global_position
 			_hold_moved = false
+			# The path entry only makes sense for a node that owns control points.
+			var node: Dictionary = graph.get_node_by_id(node_id)
+			var editable := str(node.get("type", "")) == "path"
+			if str(node.get("type", "")) == "follow_path":
+				editable = (
+					int((node["params"] as Dictionary).get("shape", 0))
+					== ShaderGraphScript.PATH_CUSTOM
+				)
+			_node_menu.set_item_disabled(4, not editable)
 			return
 		var held := Time.get_ticks_msec() - _hold_start
 		if _hold_id == node_id and not _hold_moved and held >= HOLD_MENU_MSEC:
@@ -1802,73 +1842,142 @@ func _add_option(
 	_params_target.add_child(row)
 
 
-## Control point editor for a custom Follow Path.
-func _add_path_editor(params: Dictionary, bezier := false) -> void:
-	var stored: Array = params.get("points", [])
-	if bezier:
-		if stored.size() < 2:
-			stored = ShaderPathEditorScript.default_bezier()
-			params["points"] = stored
-	else:
-		if stored.size() < 2:
-			# Graphs saved before the editor existed get the default loop.
-			stored = ShaderPathEditorScript.default_points()
-			params["points"] = stored
-	var editor := ShaderPathEditorScript.new()
-	if bezier:
-		editor.set_bezier(stored, bool(params.get("closed", false)))
-	else:
-		editor.set_points(stored, float(params.get("phase", 0.0)))
-	if bezier and bool(params.get("closed", false)):
-		# The editor gives a closed path a tangent across the seam, so the node
-		# takes the repaired handles instead of generating a visible corner.
-		params["points"] = editor.payload()
-	editor.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	editor.custom_minimum_size = Vector2(0, 200)
-	editor.points_changed.connect(
-		func(new_points: Array) -> void:
-			_push_undo("%s:points" % _selected_id)
-			params["points"] = new_points
-			_schedule_preview()
-	)
-	_params_box.add_child(editor)
-	_path_editor = editor
-	var remove_point := func() -> void:
-		editor.remove_selected()
-	var smooth_points := func() -> void:
-		editor.smooth_all()
-	var reverse_path := func() -> void:
-		editor.reverse_points()
-	var reset_path := func() -> void:
-		editor.reset_to_square()
-	var buttons := HBoxContainer.new()
-	buttons.add_child(_make_button("删除选中点", remove_point))
-	buttons.add_child(_make_button("平滑全部", smooth_points, "按相邻顶点重算切线，变成顺滑曲线"))
-	buttons.add_child(_make_button("反转路径", reverse_path, "把顶点顺序倒过来，改变运动方向"))
-	buttons.add_child(_make_button("重置路径", reset_path, "回到默认的方形路径"))
-	_params_box.add_child(buttons)
-	if bezier:
-		# A real bezier vertex has collinear handles, so dragging one mirrors the
-		# other unless the user asks for a corner.
-		var mirror_row := HBoxContainer.new()
-		var mirror_check := CheckBox.new()
-		mirror_check.text = "对称手柄"
-		mirror_check.button_pressed = editor.smooth_handles
-		mirror_check.custom_minimum_size = Vector2(0, TOUCH_SIZE)
-		mirror_check.add_theme_font_size_override("font_size", TOUCH_FONT_SIZE)
-		mirror_check.toggled.connect(
-			func(pressed: bool) -> void: editor.smooth_handles = pressed
-		)
-		mirror_row.add_child(mirror_check)
-		_params_box.add_child(mirror_row)
+## Opens the path window from the side panel. The control points live in a large
+## separate window, so the panel stays short and the node only shows a thumbnail.
+func _add_path_button(id: String) -> void:
+	var row := HBoxContainer.new()
+	row.add_child(_make_button("编辑路径…", func() -> void: _open_path_editor(id)))
+	_params_box.add_child(row)
 	var hint := Label.new()
-	hint.text = (
-		"点空白处新增一个贝塞尔顶点（自动带上切线，直接是曲线）；"
-		+ "点在线条上会把顶点插进那一段。拖动顶点移动，拖小圆点改曲率，长按顶点删除。"
-	)
+	hint.text = "节点上显示缩略图；点上面的按钮打开大窗口编辑控制点。"
 	hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	hint.add_theme_font_size_override("font_size", 13)
 	_params_box.add_child(hint)
+
+
+## Builds the separate path window. It is recreated on every opening, so it
+## always starts from the current points of one node.
+func _open_path_editor(node_id: String) -> void:
+	var node: Dictionary = graph.get_node_by_id(node_id)
+	if node.is_empty():
+		return
+	if _path_popup_node == node_id and is_instance_valid(_path_popup):
+		# The same node keeps the window it already has, points and all.
+		_path_popup.popup_centered_ratio(PATH_POPUP_RATIO)
+		return
+	if is_instance_valid(_path_popup):
+		_path_popup.queue_free()
+		_path_popup = null
+	_path_popup_node = node_id
+	var type_name := str(node["type"])
+	var bezier := type_name == "path"
+	var params: Dictionary = node["params"]
+	var stored: Array = params.get("points", [])
+	if stored.size() < 2:
+		# Graphs saved before the editor existed get the default shape.
+		if bezier:
+			stored = ShaderPathEditorScript.default_bezier()
+		else:
+			stored = ShaderPathEditorScript.default_points()
+		params["points"] = stored
+
+	_path_popup = PopupPanel.new()
+	_path_popup.transparent_bg = false
+	add_child(_path_popup)
+	var frame := MarginContainer.new()
+	for side in ["left", "right", "top", "bottom"]:
+		frame.add_theme_constant_override("margin_" + side, 14)
+	_path_popup.add_child(frame)
+	var column := VBoxContainer.new()
+	column.add_theme_constant_override("separation", 10)
+	frame.add_child(column)
+
+	var title := Label.new()
+	title.text = "编辑路径 · %s" % ShaderGraphScript.NODE_TYPES[type_name]["label"]
+	title.add_theme_font_size_override("font_size", 17)
+	column.add_child(title)
+
+	var hint := Label.new()
+	if bezier:
+		hint.text = (
+			"点空白处新增顶点（自动带切线），点在线条上会插进那一段；"
+			+ "拖动顶点移动，拖小圆点改曲率，长按顶点删除。"
+		)
+	else:
+		hint.text = "点空白处新增控制点，拖动移动，长按删除；曲线由节点统一平滑。"
+	hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	hint.add_theme_font_size_override("font_size", 13)
+	column.add_child(hint)
+
+	var editor := ShaderPathEditorScript.new()
+	if bezier:
+		editor.set_bezier(stored, bool(params.get("closed", false)))
+		if bool(params.get("closed", false)):
+			# The editor gives a closed path a tangent across the seam, so the
+			# node takes the repaired handles instead of generating a corner.
+			params["points"] = editor.payload()
+	else:
+		editor.set_points(stored, float(params.get("phase", 0.0)))
+	editor.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	editor.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	editor.custom_minimum_size = Vector2(340, 300)
+	column.add_child(editor)
+	_path_editor = editor
+	editor.points_changed.connect(
+		func(new_points: Array) -> void:
+			_push_undo("%s:points" % node_id)
+			params["points"] = new_points
+			_refresh_all_path_thumbs()
+			_schedule_preview()
+	)
+
+	var buttons := HBoxContainer.new()
+	# A flow container wraps the buttons instead of squeezing them on a phone.
+	buttons.add_theme_constant_override("h_separation", 8)
+	buttons.add_theme_constant_override("v_separation", 6)
+	buttons.add_child(_make_button("删除选中点", func() -> void: editor.remove_selected()))
+	buttons.add_child(_make_button("平滑全部", func() -> void: editor.smooth_all()))
+	buttons.add_child(_make_button("反转路径", func() -> void: editor.reverse_points()))
+	buttons.add_child(_make_button("重置路径", func() -> void: editor.reset_to_square()))
+	buttons.add_child(_make_button("完成", func() -> void: _close_path_editor()))
+	column.add_child(buttons)
+
+	if bezier:
+		# A real bezier vertex has collinear handles, so dragging one mirrors the
+		# other unless the user asks for a corner.
+		var mirror := CheckBox.new()
+		mirror.text = "对称手柄（拖一侧镜像另一侧）"
+		mirror.button_pressed = editor.smooth_handles
+		mirror.custom_minimum_size = Vector2(0, TOUCH_SIZE)
+		mirror.add_theme_font_size_override("font_size", TOUCH_FONT_SIZE)
+		mirror.toggled.connect(func(pressed: bool) -> void: editor.smooth_handles = pressed)
+		column.add_child(mirror)
+
+	_path_popup.popup_centered_ratio(PATH_POPUP_RATIO)
+
+
+func _close_path_editor() -> void:
+	if is_instance_valid(_path_popup):
+		_path_popup.hide()
+	_path_popup_node = ""
+	_path_editor = null
+
+
+## Keeps the thumbnails on the path nodes in step with the control points.
+func _refresh_all_path_thumbs() -> void:
+	if _path_thumbs.is_empty():
+		return
+	for node_id: String in _path_thumbs.keys():
+		var thumb: TextureRect = _path_thumbs[node_id]
+		if not is_instance_valid(thumb):
+			_path_thumbs.erase(node_id)
+			continue
+		var node: Dictionary = graph.get_node_by_id(node_id)
+		if node.is_empty():
+			continue
+		thumb.texture = ImageTexture.create_from_image(
+			graph.rasterise_path(node["params"], Vector2i(PATH_THUMB_SIZE, PATH_THUMB_SIZE))
+		)
 
 
 func _add_slider(
@@ -2036,6 +2145,7 @@ func _refresh_preview() -> void:
 		_path_editor.set_phase(graph.time)
 	var image: Image = graph.generate(preview_size)
 	_preview.texture = ImageTexture.create_from_image(image)
+	_refresh_all_path_thumbs()
 	if is_instance_valid(_preview_big) and _preview_popup.visible:
 		_preview_big.texture = _preview.texture
 	# A graph that reads the artwork keeps following it while the user draws.
