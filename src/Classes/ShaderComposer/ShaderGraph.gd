@@ -60,6 +60,8 @@ const ECHO_MODES := ["最大值（拖影）", "平均值（残影）"]
 const PATH_SHAPES := ["圆形", "水平", "垂直", "正弦", "方形", "8 字", "自定义"]
 ## Shape index that uses the control points edited in the path editor.
 const PATH_CUSTOM := 6
+## Prefix of the ids of groups, so a group node can be told from a real node.
+const GROUP_PREFIX := "group_"
 const DITHER_SIZES_TEXT := ["2×2", "4×4", "8×8"]
 ## Bits of the Bayer matrix behind each entry of [constant DITHER_SIZES_TEXT].
 const DITHER_BITS := [1, 2, 3]
@@ -101,9 +103,13 @@ const SNAP_STEP := 0.000001
 
 ## Nodes of the graph, as dictionaries: id, type, position, params, inputs.
 var nodes: Array[Dictionary] = []
+## Collapsible groups of nodes. They are purely visual, the evaluation never
+## looks at them.
+var groups: Array[Dictionary] = []
 ## Animation phase between 0 and 1, read by the [code]time[/code] node.
 var time := 0.0
 var _next_id := 1
+var _next_group_id := 1
 var _noise_cache := {}
 var _noise_signature := {}
 ## Bounds of the non empty part of a branch, rebuilt for every generated image.
@@ -118,6 +124,8 @@ func _init() -> void:
 ## Starts over with a noise feeding an output, so the graph always has a result.
 func reset_to_default() -> void:
 	nodes.clear()
+	groups.clear()
+	_next_group_id = 1
 	_noise_cache.clear()
 	_noise_signature.clear()
 	var noise_id := add_node("noise", Vector2(40, 60))
@@ -142,17 +150,38 @@ func add_node(type: String, position := Vector2.ZERO) -> String:
 	return id
 
 
+## Removes [param id]. When it fed other nodes, its own input is wired to them in
+## its place, so deleting a step in the middle of a chain does not break it.
 func remove_node(id: String) -> void:
-	for i in range(nodes.size() - 1, -1, -1):
-		if nodes[i]["id"] == id:
-			nodes.remove_at(i)
+	var node := get_node_by_id(id)
+	if node.is_empty():
+		return
+	var upstream := _input_id(node, 0)
+	var consumers: Array = []
+	for other: Dictionary in nodes:
+		if other["id"] == id:
+			continue
+		var other_inputs: Dictionary = other["inputs"]
+		for slot: int in other_inputs.keys():
+			if str(other_inputs[slot]) == id:
+				consumers.append({"id": other["id"], "slot": slot})
+	nodes.erase(node)
 	_noise_cache.erase(id)
 	_noise_signature.erase(id)
-	for node: Dictionary in nodes:
-		var inputs: Dictionary = node["inputs"]
-		for slot in inputs.keys():
-			if inputs[slot] == id:
+	for other: Dictionary in nodes:
+		var inputs: Dictionary = other["inputs"]
+		for slot: int in inputs.keys():
+			if str(inputs[slot]) == id:
 				inputs.erase(slot)
+	for index in range(groups.size() - 1, -1, -1):
+		var members: Array = groups[index]["nodes"]
+		members.erase(id)
+		if members.is_empty():
+			groups.remove_at(index)
+	if upstream.is_empty():
+		return
+	for entry: Dictionary in consumers:
+		connect_nodes(upstream, str(entry["id"]), int(entry["slot"]))
 
 
 func get_node_by_id(id: String) -> Dictionary:
@@ -165,7 +194,12 @@ func get_node_by_id(id: String) -> Dictionary:
 ## Snapshot of the whole graph, stored on the layers this graph created so they
 ## can be edited again later.
 func to_dict() -> Dictionary:
-	return {"nodes": nodes.duplicate(true), "next_id": _next_id}
+	return {
+		"nodes": nodes.duplicate(true),
+		"next_id": _next_id,
+		"groups": groups.duplicate(true),
+		"next_group_id": _next_group_id,
+	}
 
 
 ## Restores a snapshot made by [method to_dict].
@@ -184,6 +218,114 @@ func from_dict(data: Dictionary) -> void:
 		var suffix := str(node["id"]).get_slice("_", -1)
 		if suffix.is_valid_int():
 			_next_id = maxi(_next_id, int(suffix) + 1)
+	groups.clear()
+	for entry in data.get("groups", []):
+		if entry is not Dictionary or not entry.has("id"):
+			continue
+		var group: Dictionary = (entry as Dictionary).duplicate(true)
+		var members: Array = []
+		for member in group.get("nodes", []):
+			if not get_node_by_id(str(member)).is_empty():
+				members.append(str(member))
+		if members.is_empty():
+			continue
+		group["nodes"] = members
+		if not group.has("collapsed"):
+			group["collapsed"] = false
+		if not group.has("name"):
+			group["name"] = str(group["id"])
+		groups.append(group)
+	_next_group_id = maxi(int(data.get("next_group_id", 1)), 1)
+	for group: Dictionary in groups:
+		var group_suffix := str(group["id"]).get_slice("_", -1)
+		if group_suffix.is_valid_int():
+			_next_group_id = maxi(_next_group_id, int(group_suffix) + 1)
+
+
+## Puts the given nodes into a new collapsible group. A node can only be in one
+## group, and nodes that are already grouped are skipped.
+func add_group(node_ids: Array, group_name := "") -> String:
+	var members: Array[String] = []
+	var top_left := Vector2.ZERO
+	var first := true
+	for id in node_ids:
+		var node_id := str(id)
+		if get_node_by_id(node_id).is_empty() or members.has(node_id):
+			continue
+		if not group_of_node(node_id).is_empty():
+			continue
+		members.append(node_id)
+		var position: Vector2 = get_node_by_id(node_id).get("position", Vector2.ZERO)
+		if first:
+			top_left = position
+			first = false
+		else:
+			top_left = Vector2(minf(top_left.x, position.x), minf(top_left.y, position.y))
+	if members.is_empty():
+		return ""
+	var suffix := _next_group_id
+	_next_group_id += 1
+	var group_id := "%s%d" % [GROUP_PREFIX, suffix]
+	groups.append(
+		{
+			"id": group_id,
+			"name": group_name if not group_name.is_empty() else "组 %d" % suffix,
+			"nodes": members,
+			"collapsed": false,
+			"position": top_left - Vector2(30.0, 40.0),
+		}
+	)
+	return group_id
+
+
+func get_group(group_id: String) -> Dictionary:
+	for group: Dictionary in groups:
+		if group["id"] == group_id:
+			return group
+	return {}
+
+
+## Group that [param node_id] belongs to, or an empty dictionary.
+func group_of_node(node_id: String) -> Dictionary:
+	for group: Dictionary in groups:
+		if (group["nodes"] as Array).has(node_id):
+			return group
+	return {}
+
+
+func remove_group(group_id: String) -> void:
+	for index in range(groups.size() - 1, -1, -1):
+		if groups[index]["id"] == group_id:
+			groups.remove_at(index)
+
+
+func set_group_collapsed(group_id: String, collapsed: bool) -> void:
+	var group := get_group(group_id)
+	if group.is_empty():
+		return
+	group["collapsed"] = collapsed
+
+
+## Edges that cross the border of [param group]. A collapsed group is drawn as one
+## node, and these are the connections it has to show.
+func group_edges(group: Dictionary) -> Dictionary:
+	var members := {}
+	for id: String in group["nodes"]:
+		members[id] = true
+	var incoming: Array = []
+	var outgoing: Array = []
+	for node: Dictionary in nodes:
+		var inside := members.has(node["id"])
+		var inputs: Dictionary = node["inputs"]
+		for slot: int in inputs.keys():
+			var source := str(inputs[slot])
+			if source.is_empty():
+				continue
+			if inside and not members.has(source):
+				incoming.append({"from": source, "to": node["id"], "slot": slot})
+			elif not inside and members.has(source):
+				outgoing.append({"node": node["id"], "slot": slot})
+	return {"incoming": incoming, "outgoing": outgoing}
 
 
 ## Copies [param id] with its parameters, placed next to the original. Inputs are
@@ -1060,6 +1202,7 @@ func uses_time() -> bool:
 ## added to some noise, posterized and mapped to a deep to light blue ramp.
 func build_ocean_preset() -> void:
 	nodes.clear()
+	groups.clear()
 	_noise_cache.clear()
 	_noise_signature.clear()
 	var time_id := add_node("time", Vector2(20, 80))

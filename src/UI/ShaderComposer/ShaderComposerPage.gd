@@ -26,11 +26,15 @@ var _params_hint: Label
 var _path_editor
 var _preview: TextureRect
 var _status: Label
-var _add_type: OptionButton
-## Type behind every item of the add menu, "" for the group separators.
-var _add_types: Array[String] = []
+## Categorised add menu. Picking an item adds that node straight away.
+var _add_menu: MenuButton
+## Item id of every entry in the add menu, mapped to its node type.
+var _menu_types: Dictionary = {}
+var _menu_next_id := 1
 var _preview_timer: Timer
 var _selected_id := ""
+## Nodes selected in the graph, so several of them can be grouped at once.
+var _selected_ids: Array[String] = []
 var _can_draw_before := true
 ## Animation phase shown in the preview, and how many frames a dynamic graph
 ## generates.
@@ -148,14 +152,15 @@ func _build_ui() -> void:
 
 	var toolbar := HFlowContainer.new()
 	root.add_child(toolbar)
-	_add_type = OptionButton.new()
-	_fill_add_menu()
-	_add_type.custom_minimum_size = Vector2(0, TOUCH_SIZE)
-	_add_type.add_theme_font_size_override("font_size", TOUCH_FONT_SIZE)
-	toolbar.add_child(_add_type)
-	toolbar.add_child(_make_button("添加节点", _on_add_pressed))
+	_add_menu = MenuButton.new()
+	_add_menu.text = "＋ 添加节点"
+	_add_menu.custom_minimum_size = Vector2(0, TOUCH_SIZE)
+	_add_menu.add_theme_font_size_override("font_size", TOUCH_FONT_SIZE)
+	_build_add_menu()
+	toolbar.add_child(_add_menu)
 	toolbar.add_child(_make_button("复制选中", _on_copy_pressed))
 	toolbar.add_child(_make_button("删除选中", _on_delete_pressed))
+	toolbar.add_child(_make_button("组合选中", _on_group_pressed, "把选中的节点放进一个可折叠的组"))
 	toolbar.add_child(_make_button("刷新预览", _refresh_preview))
 	toolbar.add_child(_make_button("示例：像素海面", _on_ocean_preset_pressed))
 	toolbar.add_child(_make_button("重置图", _on_reset_pressed, "回到 Noise → Output 的初始图"))
@@ -264,24 +269,141 @@ func _build_ui() -> void:
 
 
 ## Rebuilds the graph view from the data, keeping where the user put each node.
+## Nodes inside a collapsed group are hidden, and the group stands in for them.
 func _refresh_graph() -> void:
 	for child in _graph_edit.get_children():
 		if child is GraphNode:
 			var stored: Dictionary = graph.get_node_by_id(str(child.name))
 			if not stored.is_empty():
 				stored["position"] = (child as GraphNode).position_offset
+			else:
+				var group: Dictionary = graph.get_group(str(child.name))
+				if not group.is_empty():
+					group["position"] = (child as GraphNode).position_offset
 	_graph_edit.clear_connections()
 	for child in _graph_edit.get_children():
 		if child is GraphNode:
 			_graph_edit.remove_child(child)
 			child.queue_free()
+
+	var visible := {}
 	for node: Dictionary in graph.nodes:
+		if _is_hidden_by_group(str(node["id"])):
+			continue
+		visible[node["id"]] = true
 		_graph_edit.add_child(_make_graph_node(node))
+	for group: Dictionary in graph.groups:
+		_graph_edit.add_child(_make_group_node(group))
+
+	# Inner connections, only when both ends are on screen.
 	for node: Dictionary in graph.nodes:
+		if not visible.has(node["id"]):
+			continue
 		var inputs: Dictionary = node["inputs"]
 		for slot: int in inputs.keys():
-			_graph_edit.connect_node(inputs[slot], 0, node["id"], slot)
-	_status.text = "节点 %d" % graph.nodes.size()
+			var source := str(inputs[slot])
+			if source.is_empty() or not visible.has(source):
+				continue
+			_graph_edit.connect_node(source, 0, node["id"], slot)
+
+	# A collapsed group talks to the outside through its own ports.
+	for group: Dictionary in graph.groups:
+		if not bool(group.get("collapsed", false)):
+			continue
+		var edges: Dictionary = graph.group_edges(group)
+		var incoming: Array = edges["incoming"]
+		for index in incoming.size():
+			var source := str((incoming[index] as Dictionary)["from"])
+			if visible.has(source):
+				_graph_edit.connect_node(source, 0, str(group["id"]), index)
+		for entry: Dictionary in edges["outgoing"]:
+			var target := str(entry["node"])
+			if visible.has(target):
+				_graph_edit.connect_node(str(group["id"]), 0, target, int(entry["slot"]))
+
+	# Keep the multi selection across the rebuild.
+	var still_selected: Array[String] = []
+	for node_id in _selected_ids:
+		var child := _graph_edit.get_node_or_null(NodePath(node_id))
+		if child is GraphNode and visible.has(node_id):
+			(child as GraphNode).selected = true
+			still_selected.append(node_id)
+	_selected_ids = still_selected
+	_status.text = "节点 %d · 组 %d" % [graph.nodes.size(), graph.groups.size()]
+
+
+func _is_hidden_by_group(node_id: String) -> bool:
+	var group: Dictionary = graph.group_of_node(node_id)
+	return not group.is_empty() and bool(group.get("collapsed", false))
+
+
+## Stand-in for a group. Collapsed it shows the ports that cross its border,
+## expanded it is only a header with the fold button.
+func _make_group_node(group: Dictionary) -> GraphNode:
+	var collapsed := bool(group.get("collapsed", false))
+	var members: Array = group["nodes"]
+	var graph_node := GraphNode.new()
+	graph_node.name = str(group["id"])
+	graph_node.title = "%s · %d 节点" % [str(group["name"]), members.size()]
+	graph_node.position_offset = group.get("position", Vector2.ZERO)
+	if collapsed:
+		var edges: Dictionary = graph.group_edges(group)
+		var incoming: Array = edges["incoming"]
+		for index in maxi(incoming.size(), 1):
+			var port_label := Label.new()
+			port_label.text = ("输入 %d" % (index + 1)) if index < incoming.size() else " "
+			port_label.add_theme_font_size_override("font_size", 11)
+			graph_node.add_child(port_label)
+		var has_output := not (edges["outgoing"] as Array).is_empty()
+		graph_node.set_slot(0, not incoming.is_empty(), 0, PORT_COLOR, has_output, 0, PORT_COLOR)
+		for index in range(1, incoming.size()):
+			graph_node.set_slot(index, true, index, PORT_COLOR, false, 0, PORT_COLOR)
+	var row := HBoxContainer.new()
+	row.add_child(
+		_make_button(
+			"展开" if collapsed else "折叠",
+			func() -> void: _toggle_group(str(group["id"])),
+			"",
+			Vector2(0, 26)
+		)
+	)
+	if collapsed:
+		row.add_child(
+			_make_button(
+				"解散",
+				func() -> void: _dissolve_group(str(group["id"])),
+				"拆掉这个组，节点都保留",
+				Vector2(0, 26)
+			)
+		)
+	graph_node.add_child(row)
+	return graph_node
+
+
+func _toggle_group(group_id: String) -> void:
+	var group: Dictionary = graph.get_group(group_id)
+	if group.is_empty():
+		return
+	graph.set_group_collapsed(group_id, not bool(group.get("collapsed", false)))
+	_refresh_graph()
+
+
+func _dissolve_group(group_id: String) -> void:
+	graph.remove_group(group_id)
+	_refresh_graph()
+
+
+## Puts the selected nodes into a new group that can then be collapsed.
+func _on_group_pressed() -> void:
+	if _selected_ids.size() < 2:
+		_status.text = "先选中两个以上节点再组合"
+		return
+	var group_id: String = graph.add_group(_selected_ids)
+	if group_id.is_empty():
+		_status.text = "选中的节点已经在别的组里"
+		return
+	_selected_ids.clear()
+	_refresh_graph()
 
 
 func _make_graph_node(node: Dictionary) -> GraphNode:
@@ -318,41 +440,65 @@ func _on_disconnection_request(from_node: StringName, from_port: int, to_node: S
 
 
 func _on_delete_nodes_request(nodes: Array[StringName]) -> void:
+	var removed := {}
 	for node_name in nodes:
-		graph.remove_node(str(node_name))
-	if _selected_id in nodes or graph.get_node_by_id(_selected_id).is_empty():
+		var target := str(node_name)
+		removed[target] = true
+		if target.begins_with(ShaderGraphScript.GROUP_PREFIX):
+			graph.remove_group(target)
+		else:
+			graph.remove_node(target)
+		_selected_ids.erase(target)
+	if (
+		removed.has(_selected_id)
+		or (
+			graph.get_node_by_id(_selected_id).is_empty()
+			and graph.get_group(_selected_id).is_empty()
+		)
+	):
 		_selected_id = ""
 		_show_params("")
 	_refresh_graph()
 	_schedule_preview()
 
 
-## Builds the add menu from the groups, so 30 types stay readable on a phone.
-func _fill_add_menu() -> void:
-	_add_type.clear()
-	_add_types.clear()
+## Builds the add menu: every category is a submenu, and picking an entry adds
+## that node right away, which is one tap less than before on a phone.
+func _build_add_menu() -> void:
+	var root := _add_menu.get_popup()
+	root.clear()
+	for child in root.get_children():
+		if child is PopupMenu:
+			root.remove_child(child)
+			child.queue_free()
+	_menu_types.clear()
+	_menu_next_id = 1
+	var index := 0
 	for group: Dictionary in ShaderGraphScript.NODE_GROUPS:
-		_add_type.add_separator(str(group["label"]))
-		_add_types.append("")
+		var submenu := PopupMenu.new()
+		submenu.name = "group_%d" % index
+		index += 1
+		submenu.add_theme_font_size_override("font_size", TOUCH_FONT_SIZE)
 		for type: String in group["types"]:
-			_add_type.add_item(ShaderGraphScript.NODE_TYPES[type]["label"])
-			_add_types.append(type)
-	if _add_types.size() > 1:
-		_add_type.select(1)
+			var item_id := _menu_next_id
+			_menu_next_id += 1
+			_menu_types[item_id] = type
+			submenu.add_item(ShaderGraphScript.NODE_TYPES[type]["label"], item_id)
+		submenu.id_pressed.connect(_on_add_menu_pressed)
+		root.add_child(submenu)
+		root.add_submenu_item(str(group["label"]), submenu.name)
 
 
-func _on_add_pressed() -> void:
-	if _add_type.selected < 0 or _add_type.selected >= _add_types.size():
-		return
-	var type: String = _add_types[_add_type.selected]
+func _on_add_menu_pressed(item_id: int) -> void:
+	var type: String = str(_menu_types.get(item_id, ""))
 	if type.is_empty():
 		return
 	# New nodes land next to the visible area instead of on top of each other.
 	var offset := Vector2(60 + graph.nodes.size() * 24, 40 + graph.nodes.size() * 18)
-	var id: String = graph.add_node(type, offset)
+	var node_id: String = graph.add_node(type, offset)
 	_refresh_graph()
-	_selected_id = id
-	_show_params(id)
+	_selected_id = node_id
+	_show_params(node_id)
 	_schedule_preview()
 
 
@@ -379,7 +525,11 @@ func _on_reset_pressed() -> void:
 func _on_delete_pressed() -> void:
 	if _selected_id.is_empty():
 		return
-	graph.remove_node(_selected_id)
+	if _selected_id.begins_with(ShaderGraphScript.GROUP_PREFIX):
+		graph.remove_group(_selected_id)
+	else:
+		graph.remove_node(_selected_id)
+		_selected_ids.erase(_selected_id)
 	_selected_id = ""
 	_show_params("")
 	_refresh_graph()
@@ -388,12 +538,17 @@ func _on_delete_pressed() -> void:
 
 func _on_node_selected(node: Node) -> void:
 	_selected_id = str(node.name)
+	if not _selected_ids.has(_selected_id):
+		_selected_ids.append(_selected_id)
 	_show_params(_selected_id)
 
 
-func _on_node_deselected(_node: Node) -> void:
-	_selected_id = ""
-	_show_params("")
+func _on_node_deselected(node: Node) -> void:
+	var node_id := str(node.name)
+	_selected_ids.erase(node_id)
+	if _selected_id == node_id:
+		_selected_id = ""
+		_show_params("")
 
 
 ## Builds the parameter controls of [param id] in the side panel.
