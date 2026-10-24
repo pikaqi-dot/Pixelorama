@@ -2009,21 +2009,69 @@ static func _path_point_at(flat: PackedVector2Array, t: float) -> Dictionary:
 	return {"point": flat[flat.size() - 1], "direction": Vector2.RIGHT}
 
 
-## Grayscale preview of what one node outputs, used by the frame under the nodes
-## in the graph editor. It evaluates the node the same way the generator does, so
-## the picture always matches that branch of the graph.
+## Preview of what one node outputs, used by the frame under the nodes in the
+## graph editor and by the picture in the side panel. It evaluates the node the
+## same way the generator does and maps the value through the ramp of the output
+## node, so the picture always matches that branch of the graph.
 func preview_node(node_id: String, size: Vector2i) -> Image:
 	_resolve_animations()
 	# Thumbnails use another resolution than the preview, so the rasterised nodes
 	# are rebuilt at this size instead of being read at the wrong scale.
 	_ensure_raster_size(size)
 	var image := Image.create_empty(size.x, size.y, false, Image.FORMAT_RGBA8)
+	image.fill(Color(0.0, 0.0, 0.0, 0.0))
+	# Colour is not only decided at the output, every node feeds the same ramp, so
+	# a preview is shown in the colour that value ends up with. Only a graph with
+	# no output node falls back to a grey picture.
+	var ramp := _preview_ramp()
+	var grey := ramp.is_empty()
+	var steps := maxi(int(ramp.get("steps", 2)), 2)
+	var color_a: Color = ramp.get("color_a", Color.WHITE)
+	var color_mid: Color = ramp.get("color_mid", color_a)
+	var color_b: Color = ramp.get("color_b", Color.WHITE)
+	var mid_position := float(ramp.get("mid_position", 0.5))
+	var transparent := bool(ramp.get("transparent", false))
+	var fade := transparent and bool(ramp.get("alpha_from_value", false))
+	var alpha_cut := maxf(float(ramp.get("alpha_cut", 0.0)), PREVIEW_EMPTY)
 	for y in size.y:
 		for x in size.x:
 			var value := clampf(_eval(node_id, Vector2(x, y), size, 0), 0.0, 1.0)
-			var alpha := 1.0 if value > PREVIEW_EMPTY else 0.0
-			image.set_pixel(x, y, Color(value, value, value, alpha))
+			if value <= alpha_cut:
+				# Nothing here, so the backdrop of the preview shows through.
+				continue
+			if grey:
+				image.set_pixel(x, y, Color(value, value, value, 1.0))
+				continue
+			var position := clampf(float(floori(value * steps)) / float(steps - 1), 0.0, 1.0)
+			var color := _ramp_color(color_a, color_mid, color_b, mid_position, position)
+			if fade:
+				color.a = value
+			image.set_pixel(x, y, color)
 	return image
+
+
+## Ramp of the output node, read without generating a picture. The previews use it
+## so a branch is judged in the colours it will add to the artwork.
+func _preview_ramp() -> Dictionary:
+	var output_id := output_node_id()
+	if output_id.is_empty():
+		return {}
+	var params: Dictionary = params_for(get_node_by_id(output_id))
+	if not params.has("color_a") or not params.has("color_b"):
+		return {}
+	var color_a: Color = params["color_a"]
+	return {
+		"steps": maxi(int(params.get("steps", 2)), 2),
+		"color_a": color_a,
+		"color_mid": params.get("color_mid", color_a),
+		"color_b": params["color_b"],
+		"mid_position": clampf(float(params.get("mid_position", 0.5)), 0.05, 0.95),
+		# A transparent output is what makes a preview a shape instead of a
+		# rectangle, so both switches are read here too.
+		"transparent": bool(params.get("transparent", false)),
+		"alpha_cut": clampf(float(params.get("alpha_cut", 0.0)), 0.0, 1.0),
+		"alpha_from_value": bool(params.get("alpha_from_value", false)),
+	}
 
 
 ## Rasterised node images belong to one resolution. Reading them from another

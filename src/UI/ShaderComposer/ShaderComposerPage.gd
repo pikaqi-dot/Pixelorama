@@ -947,6 +947,19 @@ func _refresh_node_preview(node_id: String, entry: Dictionary) -> void:
 	)
 
 
+## Repaints the thumbnail of one node right now, and the side panel picture when
+## that node is the selected one. It skips the budget queue, so painting into the
+## layer of a canvas node is visible under that node immediately.
+func _refresh_node_now(node_id: String) -> void:
+	var entry: Dictionary = _node_previews.get(node_id, {})
+	if entry.is_empty():
+		return
+	_thumb_queue.erase(node_id)
+	_refresh_node_preview(node_id, entry)
+	if _selected_id == node_id:
+		_refresh_selected_preview()
+
+
 ## Marks a node and everything downstream of it for a thumbnail redraw. Editing
 ## one branch no longer repaints the whole graph.
 func _mark_preview_dirty(node_id: String) -> void:
@@ -2623,7 +2636,10 @@ func _build_canvas_image_section(id: String, params: Dictionary) -> void:
 		)
 	)
 	var draw_hint := Label.new()
-	draw_hint.text = "窗口按画布大小打开，只有铅笔、橡皮、填充、方形、圆形，只用白色；完成后写回这个节点读取的图层。"
+	draw_hint.text = (
+		"窗口按画布大小打开，只有铅笔、橡皮、填充、方形、圆形，只用白色；"
+		+ "完成后写回这个节点读取的图层，读同一图层（同一帧）的画布节点都会跟着变。"
+	)
 	draw_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	draw_hint.add_theme_font_size_override("font_size", 13)
 	_params_target.add_child(draw_hint)
@@ -2635,6 +2651,7 @@ func _build_canvas_line_section(id: String, params: Dictionary) -> void:
 	line_hint.text = (
 		"把「路径」节点接到输入 1，这里把曲线画成像素线条。"
 		+ "线宽按画布短边比例；下面的曲线是线宽沿路径的变化。"
+		+ "这个模式只画路径，不读图层，所以绘画窗口画的内容不会出现在这里。"
 	)
 	line_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	line_hint.add_theme_font_size_override("font_size", 13)
@@ -2857,8 +2874,12 @@ func _write_canvas_image(node_id: String, image: Image) -> void:
 	project.undo_redo.add_do_method(Global.undo_or_redo.bind(false))
 	project.undo_redo.add_undo_method(Global.undo_or_redo.bind(true))
 	project.undo_redo.commit_action()
+	# The layer changed, so every canvas node reading it has to read it again.
+	# The caches are shared, but the previews stay per node: only the node whose
+	# window was used is repainted here, the others follow the dirty queue.
 	graph.clear_source_cache()
 	_mark_preview_dirty(node_id)
+	_refresh_node_now(node_id)
 	_schedule_preview()
 	# The crop preview and the reported source size both follow the layer.
 	if _selected_id == node_id:
