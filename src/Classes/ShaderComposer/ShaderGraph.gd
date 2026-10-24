@@ -41,12 +41,27 @@ const NODE_TYPES := {
 	"warp": {"label": "扭曲", "inputs": 2},
 	# Filters read neighbouring pixels, they do not move the mapping.
 	"blur": {"label": "模糊", "inputs": 1},
-	"edge": {"label": "描边", "inputs": 1},
+	"outline": {"label": "描边", "inputs": 2},
+	"glow": {"label": "发光", "inputs": 2},
+	"bloom": {"label": "泛光", "inputs": 2},
+	"color_adjust": {"label": "颜色调整", "inputs": 1},
+	"edge": {"label": "边缘检测", "inputs": 1},
 	"dither": {"label": "抖动", "inputs": 1},
 	"pixelate": {"label": "像素化", "inputs": 1},
 	"math": {"label": "运算", "inputs": 1},
 	"blend": {"label": "混合", "inputs": 2},
 	"output": {"label": "输出", "inputs": 1},
+}
+## Text of the second input port. The same slot means different things per node,
+## and showing it in the graph saves a trip to the parameter hint on a phone.
+const SECOND_INPUT_LABELS := {
+	"blend": "B",
+	"warp": "扭曲场",
+	"follow_path": "相位",
+	"area_warp": "外部",
+	"outline": "遮罩",
+	"glow": "遮罩",
+	"bloom": "遮罩",
 }
 
 const NOISE_TYPES := ["Simplex", "Simplex Smooth", "Perlin", "Cellular", "Value"]
@@ -117,7 +132,20 @@ const NODE_GROUPS := [
 			"follow_path",
 		],
 	},
-	{"label": "滤镜", "types": ["blur", "edge", "dither", "pixelate"]},
+	{
+		"label": "滤镜",
+		"types":
+		[
+			"blur",
+			"outline",
+			"glow",
+			"bloom",
+			"color_adjust",
+			"edge",
+			"dither",
+			"pixelate",
+		],
+	},
 	{"label": "合成", "types": ["math", "blend", "output"]},
 ]
 ## Coordinates closer than this to a pixel are treated as that pixel. Only used to
@@ -254,6 +282,13 @@ func from_dict(data: Dictionary) -> void:
 		var horizontal := bool(flip_params.get("horizontal", false))
 		var vertical := bool(flip_params.get("vertical", false))
 		flip_params["axis"] = 2 if (horizontal and vertical) else (1 if vertical else 0)
+	# Blur renamed radius to size when it became directional.
+	for node: Dictionary in nodes:
+		if str(node["type"]) != "blur":
+			continue
+		var blur_params: Dictionary = node["params"]
+		if not blur_params.has("size") and blur_params.has("radius"):
+			blur_params["size"] = blur_params["radius"]
 	groups.clear()
 	for entry in data.get("groups", []):
 		if entry is not Dictionary or not entry.has("id"):
@@ -440,6 +475,11 @@ func output_node_id() -> String:
 	return ""
 
 
+## Label of the second input port of [param type], shown inside the graph node.
+static func second_input_label(type: String) -> String:
+	return str(SECOND_INPUT_LABELS.get(type, "输入 2"))
+
+
 static func default_params(type: String) -> Dictionary:
 	match type:
 		"noise":
@@ -581,7 +621,23 @@ static func default_params(type: String) -> Dictionary:
 		"kaleidoscope":
 			return {"segments": 6.0, "angle": 0.0, "mirror": true}
 		"blur":
-			return {"radius": 1.5}
+			return {"size": 1.5, "angle": 0.0, "aspect": 1.0, "mix": 1.0}
+		"outline":
+			return {"position": 0, "width": 1.0, "threshold": 0.5}
+		"glow":
+			return {"size": 3.0, "strength": 1.5, "tolerance": 0.35}
+		"bloom":
+			return {"size": 3.0, "strength": 1.0, "tolerance": 0.5}
+		"color_adjust":
+			return {
+				"brightness": 0.0,
+				"contrast": 0.0,
+				"exposure": 0.0,
+				"gamma": 1.0,
+				"value": 1.0,
+				"invert": false,
+				"mix": 1.0,
+			}
 		"edge":
 			return {"radius": 1.0, "gain": 3.0, "invert": false}
 		"dither":
@@ -1041,21 +1097,113 @@ func _eval(node_id: String, uv: Vector2, size: Vector2i, depth: int) -> float:
 				mirror_delta -= mirror_normal * mirror_distance * 2.0
 			return _sample(node, 0, mirror_center + mirror_delta, size, depth)
 		"blur":
-			# A 3×3 kernel spread over the radius, which is cheap and smooth enough
-			# for pixel work once the result is posterized.
-			var blur_radius := maxf(float(params["radius"]), 0.0)
-			if blur_radius < 0.01:
-				return clampf(_eval(_input_id(node, 0), uv, size, depth + 1), 0.0, 1.0)
+			# A 3×3 kernel spread over the size. The aspect stretches it along the
+			# angle, which is how a directional speed blur is made.
+			var blur_source := clampf(_eval(_input_id(node, 0), uv, size, depth + 1), 0.0, 1.0)
+			var blur_size := maxf(float(params.get("size", params.get("radius", 1.5))), 0.0)
+			if blur_size < 0.01:
+				return blur_source
+			var blur_angle := deg_to_rad(float(params.get("angle", 0.0)))
+			var blur_aspect := clampf(float(params.get("aspect", 1.0)), 0.1, 8.0)
+			var blur_along := Vector2.from_angle(blur_angle)
+			var blur_across := Vector2.from_angle(blur_angle + PI * 0.5)
 			var blur_total := 0.0
 			for row in 3:
 				for column in 3:
-					var blur_offset := Vector2(
-						float(column - 1) * blur_radius, float(row - 1) * blur_radius
+					var blur_offset := (
+						blur_along * float(column - 1) * blur_size * blur_aspect
+						+ blur_across * float(row - 1) * blur_size / blur_aspect
 					)
 					blur_total += clampf(
 						_eval(_input_id(node, 0), uv + blur_offset, size, depth + 1), 0.0, 1.0
 					)
-			return clampf(blur_total / 9.0, 0.0, 1.0)
+			var blurred := clampf(blur_total / 9.0, 0.0, 1.0)
+			return lerpf(blur_source, blurred, clampf(float(params.get("mix", 1.0)), 0.0, 1.0))
+		"outline":
+			# Builds a ring from the silhouette: anything above the threshold counts
+			# as shape. The ring sits on the empty side of the border (outer), on the
+			# shape side (inner), or on both (centred), so the three positions keep
+			# the same visual weight. Every neighbour has to be looked at: stopping
+			# at the first bright one would hide the inner ring of a filled block.
+			var outline_threshold := clampf(float(params.get("threshold", 0.5)), 0.0, 1.0)
+			var outline_width := maxf(float(params.get("width", 1.0)), 0.5)
+			var outline_source := clampf(
+				_eval(_input_id(node, 0), uv, size, depth + 1), 0.0, 1.0
+			)
+			var outline_inside := 1.0 if outline_source > outline_threshold else 0.0
+			var outline_any_bright := 0.0
+			var outline_any_dark := 0.0
+			for index in 8:
+				var outline_offset := (
+					Vector2.from_angle(TAU * float(index) / 8.0) * outline_width
+				)
+				var outline_sample := clampf(
+					_eval(_input_id(node, 0), uv + outline_offset, size, depth + 1), 0.0, 1.0
+				)
+				if outline_sample > outline_threshold:
+					outline_any_bright = 1.0
+				else:
+					outline_any_dark = 1.0
+			var outline_ring := 0.0
+			match int(params.get("position", 0)):
+				1:
+					outline_ring = outline_inside * outline_any_dark
+				2:
+					outline_ring = (
+						outline_inside * outline_any_dark
+						+ (1.0 - outline_inside) * outline_any_bright
+					)
+				_:
+					outline_ring = (1.0 - outline_inside) * outline_any_bright
+			return clampf(outline_ring * _mask_value(node, uv, size, depth), 0.0, 1.0)
+		"glow":
+			# Bright samples bleed outwards, and the result keeps the brighter of the
+			# two, so the shape itself stays crisp.
+			var glow_source := clampf(_eval(_input_id(node, 0), uv, size, depth + 1), 0.0, 1.0)
+			var glow_halo := _halo(
+				node,
+				uv,
+				size,
+				depth,
+				clampf(float(params.get("size", 3.0)), 0.5, 16.0),
+				clampf(float(params.get("tolerance", 0.35)), 0.0, 1.0)
+			)
+			glow_halo *= maxf(float(params.get("strength", 1.5)), 0.0)
+			glow_halo *= _mask_value(node, uv, size, depth)
+			return clampf(maxf(glow_source, glow_halo), 0.0, 1.0)
+		"bloom":
+			# Same halo, but added to the source, so highlights blow out.
+			var bloom_source := clampf(_eval(_input_id(node, 0), uv, size, depth + 1), 0.0, 1.0)
+			var bloom_halo := _halo(
+				node,
+				uv,
+				size,
+				depth,
+				clampf(float(params.get("size", 3.0)), 0.5, 16.0),
+				clampf(float(params.get("tolerance", 0.5)), 0.0, 1.0)
+			)
+			bloom_halo *= maxf(float(params.get("strength", 1.0)), 0.0)
+			bloom_halo *= _mask_value(node, uv, size, depth)
+			return clampf(bloom_source + bloom_halo, 0.0, 1.0)
+		"color_adjust":
+			# Value space grading: exposure, contrast, brightness, gamma, then mix.
+			# Hue and saturation belong to the ramp of the output node instead.
+			var adjust_source := clampf(
+				_eval(_input_id(node, 0), uv, size, depth + 1), 0.0, 1.0
+			)
+			var graded := adjust_source * pow(2.0, float(params.get("exposure", 0.0)))
+			graded = (graded - 0.5) * (1.0 + float(params.get("contrast", 0.0))) + 0.5
+			graded += float(params.get("brightness", 0.0))
+			graded *= float(params.get("value", 1.0))
+			graded = clampf(graded, 0.0, 1.0)
+			var adjust_gamma := maxf(float(params.get("gamma", 1.0)), 0.05)
+			if absf(adjust_gamma - 1.0) > 0.001:
+				graded = pow(graded, 1.0 / adjust_gamma)
+			if bool(params.get("invert", false)):
+				graded = 1.0 - graded
+			return lerpf(
+				adjust_source, graded, clampf(float(params.get("mix", 1.0)), 0.0, 1.0)
+			)
 		"edge":
 			# Difference between opposite neighbours, which outlines the branch.
 			var edge_step := maxf(float(params["radius"]), 0.5)
@@ -1418,6 +1566,40 @@ static func _fill_polygon(image: Image, flat: PackedVector2Array) -> void:
 			pair += 2
 
 
+## Value of the optional mask on the second input, 1 when nothing is connected.
+func _mask_value(node: Dictionary, uv: Vector2, size: Vector2i, depth: int) -> float:
+	var mask_id := _input_id(node, 1)
+	if mask_id.is_empty():
+		return 1.0
+	return clampf(_eval(mask_id, uv, size, depth + 1), 0.0, 1.0)
+
+
+## Average of the bright samples around [param uv], used by glow and bloom. Only
+## samples above [param tolerance] contribute, and the ring falloff softens them.
+func _halo(
+	node: Dictionary,
+	uv: Vector2,
+	size: Vector2i,
+	depth: int,
+	radius_px: float,
+	tolerance: float
+) -> float:
+	var rings := maxi(int(ceil(radius_px)), 1)
+	var total := 0.0
+	var samples := 0
+	for ring in range(1, rings + 1):
+		var falloff := 1.0 - float(ring) / float(rings + 1)
+		for index in 8:
+			var offset := Vector2.from_angle(TAU * float(index) / 8.0) * float(ring)
+			var value := clampf(
+				_eval(_input_id(node, 0), uv + offset, size, depth + 1), 0.0, 1.0
+			)
+			samples += 1
+			if value > tolerance:
+				total += value * falloff
+	return clampf(total / float(maxi(samples, 1)), 0.0, 1.0)
+
+
 static func _stamp_disc(image: Image, center: Vector2, radius: float, soft: float) -> void:
 	var extent := int(ceil(radius))
 	var middle := Vector2i(roundi(center.x), roundi(center.y))
@@ -1635,7 +1817,24 @@ static func describe(node: Dictionary) -> String:
 		"mirror":
 			return "%d° · %.2f" % [int(params["angle"]), float(params["position"])]
 		"blur":
-			return "r %.1f" % float(params["radius"])
+			return "r %.1f · %.1fx" % [
+				float(params.get("size", params.get("radius", 1.5))),
+				float(params.get("aspect", 1.0))
+			]
+		"outline":
+			var outline_positions := ["外侧", "内侧", "居中"]
+			return "%s · %d px" % [
+				outline_positions[clampi(int(params.get("position", 0)), 0, 2)],
+				int(params.get("width", 1.0))
+			]
+		"glow":
+			return "r %d · ×%.1f" % [int(params.get("size", 3.0)), float(params.get("strength", 1.5))]
+		"bloom":
+			return "r %d · ×%.1f" % [int(params.get("size", 3.0)), float(params.get("strength", 1.0))]
+		"color_adjust":
+			return "亮度 %+.2f · 对比 %+.2f" % [
+				float(params.get("brightness", 0.0)), float(params.get("contrast", 0.0))
+			]
 		"edge":
 			return "%.1f · ×%.1f" % [float(params["radius"]), float(params["gain"])]
 		"dither":
@@ -1656,7 +1855,17 @@ static func describe(node: Dictionary) -> String:
 ## True when the graph samples neighbours or does a pass over the whole branch,
 ## so the preview should be generated at a lower resolution.
 func is_expensive() -> bool:
-	const HEAVY := ["echo", "blur", "warp", "area_warp", "mesh_warp", "crop_content"]
+	const HEAVY := [
+		"echo",
+		"blur",
+		"outline",
+		"glow",
+		"bloom",
+		"warp",
+		"area_warp",
+		"mesh_warp",
+		"crop_content",
+	]
 	for node: Dictionary in nodes:
 		if HEAVY.has(str(node["type"])):
 			return true

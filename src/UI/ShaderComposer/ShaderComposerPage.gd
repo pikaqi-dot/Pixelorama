@@ -525,11 +525,16 @@ func _make_graph_node(node: Dictionary) -> GraphNode:
 	graph_node.add_child(description)
 	if input_count >= 2:
 		# Every slot needs its own child, otherwise the second input port does not
-		# exist and connections to it are dropped.
+		# exist and connections to it are dropped. The label says what the port
+		# takes (mask, B, phase...), which matters when the graph is read on a
+		# phone without hovering the tooltips.
 		graph_node.set_slot(1, true, 0, PORT_COLOR, false, 0, PORT_COLOR)
-		var spacing := Control.new()
-		spacing.custom_minimum_size = Vector2(0, 10)
-		graph_node.add_child(spacing)
+		var second_input := Label.new()
+		second_input.text = ShaderGraphScript.second_input_label(str(node["type"]))
+		second_input.add_theme_font_size_override("font_size", 11)
+		second_input.modulate = Color(1.0, 1.0, 1.0, 0.6)
+		second_input.custom_minimum_size = Vector2(0, 14)
+		graph_node.add_child(second_input)
 	return graph_node
 
 
@@ -1376,11 +1381,86 @@ func _show_params(id: String) -> void:
 			_add_check("反向半边", bool(params.get("flip_side", false)), params, "flip_side")
 		"blur":
 			var blur_hint := Label.new()
-			blur_hint.text = "3×3 模糊，半径越大越糊。配合 Output 的色阶可以做出柔边。"
+			blur_hint.text = (
+				"3×3 模糊：尺寸越大越糊；拉宽宽高比就是方向性模糊，做速度线用。"
+			)
 			blur_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 			blur_hint.add_theme_font_size_override("font_size", 13)
 			_params_box.add_child(blur_hint)
-			_add_slider("半径", 0.5, 8.0, 0.5, float(params["radius"]), params, "radius")
+			_add_slider("尺寸", 0.5, 8.0, 0.5, float(params.get("size", 1.5)), params, "size")
+			_begin_section("方向性模糊", false)
+			_add_slider("角度", 0.0, 360.0, 1.0, float(params.get("angle", 0.0)), params, "angle")
+			_add_slider("宽高比", 0.1, 4.0, 0.1, float(params.get("aspect", 1.0)), params, "aspect")
+			_end_section()
+			_add_slider("混合", 0.0, 1.0, 0.01, float(params.get("mix", 1.0)), params, "mix")
+		"outline":
+			var outline_hint := Label.new()
+			outline_hint.text = (
+				"按阈值把画面切成形状，再沿边缘生成一圈。输入 2 可接遮罩限制范围。"
+				+ "像素画建议宽度 1–2 px、阈值 0.5，接「混合（最大值）」叠到画面上做高亮描边。"
+			)
+			outline_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+			outline_hint.add_theme_font_size_override("font_size", 13)
+			_params_box.add_child(outline_hint)
+			_add_option(
+				"位置", ["外侧", "内侧", "居中"], int(params.get("position", 0)), params, "position"
+			)
+			_add_slider("宽度", 0.5, 8.0, 0.5, float(params.get("width", 1.0)), params, "width")
+			_add_slider(
+				"阈值", 0.0, 1.0, 0.01, float(params.get("threshold", 0.5)), params, "threshold"
+			)
+		"glow":
+			var glow_hint := Label.new()
+			glow_hint.text = (
+				"高于阈值的亮部向外扩散光晕，原图保持清晰。输入 2 可接遮罩限制范围。"
+			)
+			glow_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+			glow_hint.add_theme_font_size_override("font_size", 13)
+			_params_box.add_child(glow_hint)
+			_add_slider("范围", 1.0, 12.0, 0.5, float(params.get("size", 3.0)), params, "size")
+			_add_slider(
+				"强度", 0.0, 4.0, 0.05, float(params.get("strength", 1.5)), params, "strength"
+			)
+			_add_slider(
+				"阈值", 0.0, 1.0, 0.01, float(params.get("tolerance", 0.35)), params, "tolerance"
+			)
+		"bloom":
+			var bloom_hint := Label.new()
+			bloom_hint.text = "和发光类似，但光晕是叠加到原图上的，亮部会过曝成一片白光。"
+			bloom_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+			bloom_hint.add_theme_font_size_override("font_size", 13)
+			_params_box.add_child(bloom_hint)
+			_add_slider("范围", 1.0, 12.0, 0.5, float(params.get("size", 3.0)), params, "size")
+			_add_slider(
+				"强度", 0.0, 4.0, 0.05, float(params.get("strength", 1.0)), params, "strength"
+			)
+			_add_slider(
+				"阈值", 0.0, 1.0, 0.01, float(params.get("tolerance", 0.5)), params, "tolerance"
+			)
+		"color_adjust":
+			var adjust_hint := Label.new()
+			adjust_hint.text = (
+				"数值域的调色：曝光、对比、亮度、明度、伽马。"
+				+ "图本身是灰度的，色相与饱和度请改输出节点的三段色阶。"
+			)
+			adjust_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+			adjust_hint.add_theme_font_size_override("font_size", 13)
+			_params_box.add_child(adjust_hint)
+			_add_slider(
+				"亮度", -0.5, 0.5, 0.01, float(params.get("brightness", 0.0)), params, "brightness"
+			)
+			_add_slider(
+				"对比", -0.9, 3.0, 0.05, float(params.get("contrast", 0.0)), params, "contrast"
+			)
+			_begin_section("曝光与伽马", false)
+			_add_slider(
+				"曝光", -2.0, 2.0, 0.05, float(params.get("exposure", 0.0)), params, "exposure"
+			)
+			_add_slider("伽马", 0.2, 3.0, 0.05, float(params.get("gamma", 1.0)), params, "gamma")
+			_add_slider("明度", 0.0, 2.0, 0.01, float(params.get("value", 1.0)), params, "value")
+			_end_section()
+			_add_check("反相", bool(params.get("invert", false)), params, "invert")
+			_add_slider("混合", 0.0, 1.0, 0.01, float(params.get("mix", 1.0)), params, "mix")
 		"edge":
 			var edge_hint := Label.new()
 			edge_hint.text = "比较上下左右邻居，得到描边。反向可得到内部填充。"
