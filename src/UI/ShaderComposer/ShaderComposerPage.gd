@@ -27,6 +27,8 @@ const UNDO_COALESCE_MSEC := 700
 const PRESET_DIR := "user://shader_presets"
 ## How often a graph that reads the project refreshes its preview.
 const SOURCE_REFRESH_MSEC := 600
+## How long a press on a node has to last to open the context menu.
+const HOLD_MENU_MSEC := 500
 
 var graph: RefCounted
 var _graph_edit: GraphEdit
@@ -60,6 +62,16 @@ var _undo_time := 0
 ## Filters the parameter rows of the selected node.
 var _param_filter := ""
 var _param_filter_edit: LineEdit
+## Where the parameter rows go: the panel itself or the current section.
+var _params_target: VBoxContainer
+## Sections of the current node, so the filter can fold them.
+var _param_sections: Array[Dictionary] = []
+## Long press on a node opens a context menu.
+var _node_menu: PopupMenu
+var _hold_id := ""
+var _hold_start := 0
+var _hold_position := Vector2.ZERO
+var _hold_moved := false
 ## Saved graph presets, and the small dialog used to name them.
 var _preset_menu: MenuButton
 ## Secondary actions, so the toolbar stays short on a phone.
@@ -284,6 +296,16 @@ func _build_ui() -> void:
 	_params_box = VBoxContainer.new()
 	_params_box.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	params_scroll.add_child(_params_box)
+	_params_target = _params_box
+
+	_node_menu = PopupMenu.new()
+	_node_menu.add_theme_font_size_override("font_size", TOUCH_FONT_SIZE)
+	_node_menu.add_item("复制节点", 0)
+	_node_menu.add_item("删除节点", 1)
+	_node_menu.add_item("断开输入", 2)
+	_node_menu.add_item("组合选中", 3)
+	_node_menu.id_pressed.connect(_on_node_menu_pressed)
+	add_child(_node_menu)
 
 	# Scrubbing the phase is how a dynamic graph is previewed frame by frame.
 	var phase_row := HBoxContainer.new()
@@ -486,6 +508,7 @@ func _make_graph_node(node: Dictionary) -> GraphNode:
 	graph_node.name = node["id"]
 	graph_node.title = ShaderGraphScript.NODE_TYPES[node["type"]]["label"]
 	graph_node.position_offset = node.get("position", Vector2.ZERO)
+	graph_node.gui_input.connect(_on_graph_node_input.bind(str(node["id"])))
 	var input_count := int(ShaderGraphScript.NODE_TYPES[node["type"]]["inputs"])
 	graph_node.set_slot(0, input_count >= 1, 0, PORT_COLOR, true, 0, PORT_COLOR)
 	var description := Label.new()
@@ -859,6 +882,8 @@ func _on_node_deselected(node: Node) -> void:
 ## Builds the parameter controls of [param id] in the side panel.
 func _show_params(id: String) -> void:
 	_path_editor = null
+	_params_target = _params_box
+	_param_sections.clear()
 	for child in _params_box.get_children():
 		_params_box.remove_child(child)
 		child.queue_free()
@@ -974,11 +999,13 @@ func _show_params(id: String) -> void:
 			_add_slider("缩放", 0.1, 4.0, 0.05, float(params["scale"]), params, "scale")
 			_add_slider("偏移 X", -1.0, 1.0, 0.01, float(params["offset_x"]), params, "offset_x")
 			_add_slider("偏移 Y", -1.0, 1.0, 0.01, float(params["offset_y"]), params, "offset_y")
+			_begin_section("像素细节", false)
 			_add_check("位置取整", bool(params.get("round", false)), params, "round")
 			_add_check("平铺", bool(params.get("tile", false)), params, "tile")
 			_add_slider(
 				"不透明度", 0.0, 1.0, 0.01, float(params.get("alpha", 1.0)), params, "alpha"
 			)
+			_end_section()
 		"scale":
 			_add_option(
 				"模式", ShaderGraphScript.SCALE_MODES, int(params.get("mode", 0)), params, "mode", true
@@ -1094,14 +1121,23 @@ func _show_params(id: String) -> void:
 			mesh_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 			mesh_hint.add_theme_font_size_override("font_size", 13)
 			_params_box.add_child(mesh_hint)
-			_add_slider("左上 X", -0.5, 0.5, 0.01, float(params["tl_x"]), params, "tl_x")
-			_add_slider("左上 Y", -0.5, 0.5, 0.01, float(params["tl_y"]), params, "tl_y")
-			_add_slider("右上 X", -0.5, 0.5, 0.01, float(params["tr_x"]), params, "tr_x")
-			_add_slider("右上 Y", -0.5, 0.5, 0.01, float(params["tr_y"]), params, "tr_y")
-			_add_slider("左下 X", -0.5, 0.5, 0.01, float(params["bl_x"]), params, "bl_x")
-			_add_slider("左下 Y", -0.5, 0.5, 0.01, float(params["bl_y"]), params, "bl_y")
-			_add_slider("右下 X", -0.5, 0.5, 0.01, float(params["br_x"]), params, "br_x")
-			_add_slider("右下 Y", -0.5, 0.5, 0.01, float(params["br_y"]), params, "br_y")
+			# Four foldable corners, so a phone only shows one of them by default.
+			_begin_section("左上角")
+			_add_slider("X", -0.5, 0.5, 0.01, float(params["tl_x"]), params, "tl_x")
+			_add_slider("Y", -0.5, 0.5, 0.01, float(params["tl_y"]), params, "tl_y")
+			_end_section()
+			_begin_section("右上角", false)
+			_add_slider("X", -0.5, 0.5, 0.01, float(params["tr_x"]), params, "tr_x")
+			_add_slider("Y", -0.5, 0.5, 0.01, float(params["tr_y"]), params, "tr_y")
+			_end_section()
+			_begin_section("左下角", false)
+			_add_slider("X", -0.5, 0.5, 0.01, float(params["bl_x"]), params, "bl_x")
+			_add_slider("Y", -0.5, 0.5, 0.01, float(params["bl_y"]), params, "bl_y")
+			_end_section()
+			_begin_section("右下角", false)
+			_add_slider("X", -0.5, 0.5, 0.01, float(params["br_x"]), params, "br_x")
+			_add_slider("Y", -0.5, 0.5, 0.01, float(params["br_y"]), params, "br_y")
+			_end_section()
 			_add_slider(
 				"随机抖动", 0.0, 0.4, 0.01, float(params.get("randomness", 0.0)), params, "randomness"
 			)
@@ -1148,8 +1184,10 @@ func _show_params(id: String) -> void:
 			_add_slider("幅度", -0.5, 0.5, 0.01, float(params["amount"]), params, "amount")
 			_add_slider("频率", 0.1, 6.0, 0.1, float(params["scale"]), params, "scale")
 			_add_slider("相位", 0.0, 1.0, 0.01, float(params["shift"]), params, "shift")
+			_begin_section("UV 变换", false)
 			_add_slider("UV 缩放", 0.25, 4.0, 0.05, float(params.get("uv_scale", 1.0)), params, "uv_scale")
 			_add_slider("UV 偏移", -1.0, 1.0, 0.01, float(params.get("uv_shift", 0.0)), params, "uv_shift")
+			_end_section()
 		"stretch":
 			var stretch_hint := Label.new()
 			stretch_hint.text = "沿一个方向拉长，做冲刺、子弹、魔法弹的速度感。反向会同时压扁垂直方向。"
@@ -1256,13 +1294,109 @@ func _show_params(id: String) -> void:
 	_apply_param_filter()
 
 
-## Hides the parameter rows whose label does not contain the filter text.
+## Starts a foldable group of parameters. Rows added after this call go into it,
+## until [method _end_section]. Collapsed groups stay one tap away, which keeps a
+## long parameter list manageable on a phone.
+func _begin_section(title: String, expanded := true) -> void:
+	var heading := Button.new()
+	heading.text = ("▼ " if expanded else "▶ ") + title
+	heading.alignment = HORIZONTAL_ALIGNMENT_LEFT
+	heading.custom_minimum_size = Vector2(0, 36)
+	heading.add_theme_font_size_override("font_size", 14)
+	var body := VBoxContainer.new()
+	body.visible = expanded
+	heading.pressed.connect(
+		func() -> void:
+			body.visible = not body.visible
+			heading.text = ("▼ " if body.visible else "▶ ") + title
+	)
+	_params_box.add_child(heading)
+	_params_box.add_child(body)
+	_param_sections.append({"title": title, "heading": heading, "box": body})
+	_params_target = body
+
+
+func _end_section() -> void:
+	_params_target = _params_box
+
+
+## Hides the parameter rows whose label does not contain the filter text. A
+## section whose title matches keeps all of its rows and its heading.
 func _apply_param_filter() -> void:
 	if _param_filter.is_empty():
 		return
 	var needle := _param_filter.to_lower()
+	var section_boxes := {}
+	var section_headings := {}
+	for section: Dictionary in _param_sections:
+		section_boxes[section["box"]] = section
+		section_headings[section["heading"]] = section
+	for section: Dictionary in _param_sections:
+		var body: VBoxContainer = section["box"]
+		var heading: Button = section["heading"]
+		var title_hit := str(section["title"]).to_lower().contains(needle)
+		var any := title_hit
+		for row in body.get_children():
+			var matches := title_hit or _row_label(row).to_lower().contains(needle)
+			(row as CanvasItem).visible = matches
+			any = any or matches
+		body.visible = any
+		heading.visible = any
+		heading.text = ("▼ " if any else "▶ ") + str(section["title"])
 	for child in _params_box.get_children():
-		child.visible = _row_label(child).to_lower().contains(needle)
+		if section_boxes.has(child) or section_headings.has(child):
+			continue
+		(child as CanvasItem).visible = _row_label(child).to_lower().contains(needle)
+
+
+func _section_of(box: Node) -> Variant:
+	for section: Dictionary in _param_sections:
+		if section["box"] == box:
+			return section
+	return null
+
+
+## Long press on a node opens this menu. It is the touch friendly version of
+## right click, which a phone does not have.
+func _on_node_menu_pressed(id: int) -> void:
+	if _hold_id.is_empty() or graph.get_node_by_id(_hold_id).is_empty():
+		return
+	_selected_id = _hold_id
+	match id:
+		0:
+			_on_copy_pressed()
+		1:
+			_on_delete_pressed()
+		2:
+			_disconnect_selected()
+		3:
+			if not _selected_ids.has(_hold_id):
+				_selected_ids.append(_hold_id)
+			_on_group_pressed()
+
+
+## Tracks press and release on a node, so a hold of half a second (without
+## dragging) opens the context menu while a tap only selects.
+func _on_graph_node_input(event: InputEvent, node_id: String) -> void:
+	if event is InputEventMouseButton:
+		var button := event as InputEventMouseButton
+		if button.button_index != MOUSE_BUTTON_LEFT:
+			return
+		if button.pressed:
+			_hold_id = node_id
+			_hold_start = Time.get_ticks_msec()
+			_hold_position = button.global_position
+			_hold_moved = false
+			return
+		var held := Time.get_ticks_msec() - _hold_start
+		if _hold_id == node_id and not _hold_moved and held >= HOLD_MENU_MSEC:
+			_hold_id = node_id
+			_node_menu.popup(Rect2i(Vector2i(_hold_position), Vector2i.ZERO))
+		_hold_id = ""
+		return
+	if event is InputEventMouseMotion and _hold_id == node_id:
+		if (event as InputEventMouseMotion).global_position.distance_to(_hold_position) > 14.0:
+			_hold_moved = true
 
 
 static func _row_label(row: Node) -> String:
@@ -1307,7 +1441,7 @@ func _add_option(
 				call_deferred("_show_params", _selected_id)
 	)
 	row.add_child(option)
-	_params_box.add_child(row)
+	_params_target.add_child(row)
 
 
 ## Control point editor for a custom Follow Path.
@@ -1391,7 +1525,7 @@ func _add_slider(
 			display.text = _format_number(new_value, step)
 			_schedule_preview()
 	)
-	_params_box.add_child(row)
+	_params_target.add_child(row)
 
 
 func _add_number(
@@ -1424,7 +1558,7 @@ func _add_number(
 			_schedule_preview()
 	)
 	row.add_child(spin)
-	_params_box.add_child(row)
+	_params_target.add_child(row)
 
 
 func _add_check(
@@ -1444,7 +1578,7 @@ func _add_check(
 			if rebuild and not _selected_id.is_empty():
 				call_deferred("_show_params", _selected_id)
 	)
-	_params_box.add_child(check)
+	_params_target.add_child(check)
 
 
 func _add_color(label_text: String, value: Color, params: Dictionary, key: String) -> void:
@@ -1464,7 +1598,7 @@ func _add_color(label_text: String, value: Color, params: Dictionary, key: Strin
 			_schedule_preview()
 	)
 	row.add_child(picker)
-	_params_box.add_child(row)
+	_params_target.add_child(row)
 
 
 static func _format_number(value: float, step: float) -> String:
