@@ -479,6 +479,7 @@ static func default_params(type: String) -> Dictionary:
 					},
 				],
 				"closed": false,
+				"fill": false,
 				"width": 0.06,
 				"soft": 0.0,
 			}
@@ -1372,7 +1373,10 @@ func _path_image(node: Dictionary, size: Vector2i) -> Image:
 	var params: Dictionary = node["params"]
 	var image := Image.create_empty(size.x, size.y, false, Image.FORMAT_RGBA8)
 	image.fill(Color(0.0, 0.0, 0.0, 0.0))
-	var flat := flatten_path(params.get("points", []), bool(params.get("closed", false)))
+	var closed := bool(params.get("closed", false))
+	var flat := flatten_path(params.get("points", []), closed)
+	if closed and bool(params.get("fill", false)) and flat.size() >= 3:
+		_fill_polygon(image, flat)
 	if flat.size() >= 2:
 		var shortest := float(mini(size.x, size.y))
 		var radius := maxf(float(params.get("width", 0.06)) * shortest * 0.5, 0.5)
@@ -1386,6 +1390,32 @@ func _path_image(node: Dictionary, size: Vector2i) -> Image:
 				_stamp_disc(image, from_point.lerp(to_point, float(step) / span), radius, soft)
 	_path_cache[key] = image
 	return image
+
+
+## Even odd scanline fill of a closed path, in 0..1 canvas units.
+static func _fill_polygon(image: Image, flat: PackedVector2Array) -> void:
+	var scale := Vector2(image.get_width(), image.get_height())
+	var points := PackedVector2Array()
+	for point in flat:
+		points.append(point * scale)
+	var count := points.size()
+	for y in image.get_height():
+		var scan := float(y) + 0.5
+		var crossings: Array[float] = []
+		for index in count:
+			var a: Vector2 = points[index]
+			var b: Vector2 = points[(index + 1) % count]
+			if (a.y <= scan and b.y > scan) or (b.y <= scan and a.y > scan):
+				var ratio := (scan - a.y) / (b.y - a.y)
+				crossings.append(a.x + ratio * (b.x - a.x))
+		crossings.sort()
+		var pair := 0
+		while pair + 1 < crossings.size():
+			var from_x := maxi(int(ceil(crossings[pair])), 0)
+			var to_x := mini(int(floor(crossings[pair + 1])), image.get_width() - 1)
+			for x in range(from_x, to_x + 1):
+				image.set_pixel(x, y, Color(1.0, 1.0, 1.0, 1.0))
+			pair += 2
 
 
 static func _stamp_disc(image: Image, center: Vector2, radius: float, soft: float) -> void:

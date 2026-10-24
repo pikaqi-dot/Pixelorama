@@ -35,6 +35,9 @@ var _params_hint: Label
 ## Path editor shown in the parameters when Follow Path uses a custom shape.
 var _path_editor
 var _preview: TextureRect
+## Tapping the small preview opens it at a readable size.
+var _preview_popup: PopupPanel
+var _preview_big: TextureRect
 var _status: Label
 ## Categorised add menu. Picking an item adds that node straight away.
 var _add_menu: MenuButton
@@ -304,7 +307,7 @@ func _build_ui() -> void:
 	_side.add_child(phase_row)
 
 	var preview_label := Label.new()
-	preview_label.text = "预览"
+	preview_label.text = "预览（点一下放大）"
 	preview_label.add_theme_font_size_override("font_size", TOUCH_FONT_SIZE)
 	_side.add_child(preview_label)
 	_preview = TextureRect.new()
@@ -313,6 +316,9 @@ func _build_ui() -> void:
 	_preview.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
 	_preview.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
 	_preview.texture_filter = CanvasItem.TEXTURE_FILTER_NEAREST
+	_preview.mouse_filter = Control.MOUSE_FILTER_STOP
+	_preview.tooltip_text = "点一下放大预览"
+	_preview.gui_input.connect(_on_preview_input)
 	_side.add_child(_preview)
 
 	_preview_timer = Timer.new()
@@ -893,6 +899,7 @@ func _show_params(id: String) -> void:
 			_params_box.add_child(path_hint)
 			_add_path_editor(params, true)
 			_add_check("闭合", bool(params.get("closed", false)), params, "closed", true)
+			_add_check("填充（需闭合）", bool(params.get("fill", false)), params, "fill")
 			_add_slider("线宽", 0.01, 0.3, 0.005, float(params["width"]), params, "width")
 			_add_slider(
 				"羽化", 0.0, 0.2, 0.005, float(params.get("soft", 0.0)), params, "soft"
@@ -1466,6 +1473,33 @@ static func _format_number(value: float, step: float) -> String:
 	return "%.2f" % value
 
 
+## Opens the preview at a size that can actually be judged on a phone.
+func _on_preview_input(event: InputEvent) -> void:
+	if not (event is InputEventMouseButton):
+		return
+	var button := event as InputEventMouseButton
+	if not button.pressed or button.button_index != MOUSE_BUTTON_LEFT:
+		return
+	_show_big_preview()
+	get_viewport().set_input_as_handled()
+
+
+func _show_big_preview() -> void:
+	if not is_instance_valid(_preview_popup):
+		_preview_popup = PopupPanel.new()
+		_preview_big = TextureRect.new()
+		_preview_big.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+		_preview_big.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
+		_preview_big.texture_filter = CanvasItem.TEXTURE_FILTER_NEAREST
+		_preview_big.custom_minimum_size = Vector2(280, 280)
+		_preview_popup.add_child(_preview_big)
+		add_child(_preview_popup)
+	if is_instance_valid(_preview):
+		_preview_big.texture = _preview.texture
+	var side := int(minf(size.x, size.y) * 0.82)
+	_preview_popup.popup_centered(Vector2i(maxi(side, 220), maxi(side, 220)))
+
+
 func _schedule_preview() -> void:
 	if is_instance_valid(_preview_timer):
 		_preview_timer.start()
@@ -1486,6 +1520,8 @@ func _refresh_preview() -> void:
 		_path_editor.set_phase(graph.time)
 	var image: Image = graph.generate(preview_size)
 	_preview.texture = ImageTexture.create_from_image(image)
+	if is_instance_valid(_preview_big) and _preview_popup.visible:
+		_preview_big.texture = _preview.texture
 	# A graph that reads the artwork keeps following it while the user draws.
 	if is_instance_valid(_source_timer):
 		if graph.uses_source() and _source_timer.is_stopped():
