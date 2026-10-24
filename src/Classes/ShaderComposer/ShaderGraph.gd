@@ -13,6 +13,9 @@ const NODE_TYPES := {
 	"radial": {"label": "径向", "inputs": 0},
 	"checker": {"label": "棋盘", "inputs": 0},
 	"constant": {"label": "常量", "inputs": 0},
+	# A recursive tree, rasterised once per frame. Growth reveals it level by
+	# level, which is what makes the growing animation possible.
+	"tree": {"label": "树木", "inputs": 0},
 	# Input nodes: one draws a vector path, the other reads the project's layers.
 	"path": {"label": "路径", "inputs": 0},
 	"pixel_art": {"label": "像素画", "inputs": 0},
@@ -97,7 +100,7 @@ const DITHER_BITS := [1, 2, 3]
 const NODE_GROUPS := [
 	{
 		"label": "生成",
-		"types": ["noise", "gradient", "radial", "checker", "constant"],
+		"types": ["noise", "gradient", "radial", "checker", "constant", "tree"],
 	},
 	{"label": "输入", "types": ["path", "pixel_art"]},
 	{"label": "动态", "types": ["time", "wave"]},
@@ -498,6 +501,22 @@ static func default_params(type: String) -> Dictionary:
 			return {"cell": 8.0}
 		"constant":
 			return {"value": 0.5}
+		"tree":
+			return {
+				"seed": 3,
+				"growth": 1.0,
+				"animate": false,
+				"depth": 5,
+				"branches": 2,
+				"spread": 34.0,
+				"taper": 0.72,
+				"bend": 0.35,
+				"width": 0.045,
+				"randomness": 0.3,
+				"leaves": true,
+				"leaf_size": 1.0,
+				"soft": 0.0,
+			}
 		"path":
 			return {
 				"points":
@@ -746,6 +765,11 @@ func _eval(node_id: String, uv: Vector2, size: Vector2i, depth: int) -> float:
 			return 1.0 if odd == 1 else 0.0
 		"constant":
 			return clampf(float(params.get("value", 0.5)), 0.0, 1.0)
+		"tree":
+			# Rasterised once per generated image, so this is a lookup like a path.
+			if uv.x < 0.0 or uv.y < 0.0 or uv.x >= float(size.x) or uv.y >= float(size.y):
+				return 0.0
+			return _tree_image(node, size).get_pixel(int(uv.x), int(uv.y)).r
 		"path":
 			# The stroke is rasterised once per generated image, so this is a lookup.
 			if uv.x < 0.0 or uv.y < 0.0 or uv.x >= float(size.x) or uv.y >= float(size.y):
@@ -1540,6 +1564,127 @@ func _path_image(node: Dictionary, size: Vector2i) -> Image:
 	return image
 
 
+## Rasterises the recursive tree at [param size] and caches it per generated
+## image, so the per pixel evaluation stays a lookup. Growth is measured in
+## levels: a branch appears when the growth reaches its level, and its children
+## only start once the branch itself is complete. That is what makes a tree grow
+## outward, one generation of branches at a time.
+func _tree_image(node: Dictionary, size: Vector2i) -> Image:
+	var params: Dictionary = node["params"]
+	var amount := clampf(float(params.get("growth", 1.0)), 0.0, 1.0)
+	if bool(params.get("animate", false)):
+		amount *= clampf(time, 0.0, 1.0)
+	# The shape parameters belong in the key: editing them has to rebuild the
+	# image even when the growth did not move.
+	var key := "tree:%s:%d:%.4f:%dx%d" % [
+		node["id"], var_to_str(params).hash(), amount, size.x, size.y
+	]
+	if _path_cache.has(key):
+		return _path_cache[key]
+	var image := Image.create_empty(size.x, size.y, false, Image.FORMAT_RGBA8)
+	image.fill(Color(0.0, 0.0, 0.0, 0.0))
+	if amount > 0.001:
+		var shortest := float(mini(size.x, size.y))
+		var depth := clampi(int(params.get("depth", 5)), 1, 7)
+		var state := {
+			"depth": depth,
+			"span": 1.0 / float(depth + 1),
+			"branches": clampi(int(params.get("branches", 2)), 1, 4),
+			"spread": float(params.get("spread", 34.0)),
+			"taper": clampf(float(params.get("taper", 0.72)), 0.4, 0.95),
+			"bend": clampf(float(params.get("bend", 0.35)), 0.0, 2.0),
+			"randomness": clampf(float(params.get("randomness", 0.3)), 0.0, 1.0),
+			"leaves": bool(params.get("leaves", true)),
+			"leaf_size": clampf(float(params.get("leaf_size", 1.0)), 0.2, 3.0),
+			"soft": clampf(float(params.get("soft", 0.0)) * shortest, 0.0, 2.5),
+		}
+		var rng := RandomNumberGenerator.new()
+		rng.seed = int(params.get("seed", 3))
+		var base := Vector2(float(size.x) * 0.5, float(size.y) * 0.99)
+		var thickness := maxf(float(params.get("width", 0.045)) * shortest * 0.5, 0.6)
+		_grow_branch(image, base, -PI * 0.5, shortest * 0.3, thickness, 0, state, rng, amount)
+	_path_cache[key] = image
+	return image
+
+
+## Draws one branch and, once it is fully grown, its children. The random numbers
+## are taken before the growth check, so the same seed gives the same tree in
+## every frame and only the visible part changes.
+func _grow_branch(
+	image: Image,
+	from_point: Vector2,
+	direction: float,
+	length: float,
+	thickness: float,
+	level: int,
+	state: Dictionary,
+	rng: RandomNumberGenerator,
+	amount: float
+) -> void:
+	var depth: int = int(state["depth"])
+	var branches: int = int(state["branches"])
+	var variability: float = float(state["randomness"])
+	var spread := deg_to_rad(float(state["spread"]))
+	var curve := rng.randf_range(-1.0, 1.0) * float(state["bend"])
+	var child_angles: Array[float] = []
+	var child_scales: Array[float] = []
+	for index in branches:
+		var offset := 0.0
+		if branches > 1:
+			offset = float(index) / float(branches - 1) * 2.0 - 1.0
+		child_angles.append(
+			offset * spread + rng.randf_range(-1.0, 1.0) * variability * 0.3
+		)
+		child_scales.append(1.0 + rng.randf_range(-1.0, 1.0) * variability * 0.25)
+	var span: float = float(state["span"])
+	var local := clampf((amount - float(level) * span) / span, 0.0, 1.0)
+	if local <= 0.0:
+		return
+	var steps := maxi(int(ceil(length / 2.0)), 2)
+	var step_length := length / float(steps)
+	var drawn := clampi(int(ceil(float(steps) * local)), 1, steps)
+	var brightness := lerpf(0.42, 0.74, float(level) / float(maxi(depth, 1)))
+	var soft: float = float(state["soft"])
+	var turn := curve * 0.8 / float(steps)
+	var point := from_point
+	var angle := direction
+	for step in drawn:
+		var along := float(step) / float(steps)
+		angle += turn
+		var next := point + Vector2.from_angle(angle) * step_length
+		_stamp_segment(image, point, next, thickness * (1.0 - 0.45 * along), soft, brightness)
+		point = next
+	if local < 1.0:
+		# Wait for this branch to finish before the next generation appears.
+		return
+	if level >= depth:
+		if bool(state["leaves"]):
+			var leaf_radius := maxf(thickness * 2.2 * float(state["leaf_size"]), 0.9)
+			_stamp_disc(image, point, leaf_radius, soft, 1.0)
+			for index in 2:
+				var leaf_angle := TAU * (float(index + 1) / 3.0) + curve
+				_stamp_disc(
+					image,
+					point + Vector2.from_angle(leaf_angle) * leaf_radius * 0.9,
+					maxf(leaf_radius * 0.8, 0.7),
+					soft,
+					1.0
+				)
+		return
+	for index in branches:
+		_grow_branch(
+			image,
+			point,
+			angle + child_angles[index],
+			length * float(state["taper"]) * child_scales[index],
+			thickness * float(state["taper"]),
+			level + 1,
+			state,
+			rng,
+			amount
+		)
+
+
 ## Even odd scanline fill of a closed path, in 0..1 canvas units.
 static func _fill_polygon(image: Image, flat: PackedVector2Array) -> void:
 	var scale := Vector2(image.get_width(), image.get_height())
@@ -1600,7 +1745,9 @@ func _halo(
 	return clampf(total / float(maxi(samples, 1)), 0.0, 1.0)
 
 
-static func _stamp_disc(image: Image, center: Vector2, radius: float, soft: float) -> void:
+static func _stamp_disc(
+	image: Image, center: Vector2, radius: float, soft: float, brightness := 1.0
+) -> void:
 	var extent := int(ceil(radius))
 	var middle := Vector2i(roundi(center.x), roundi(center.y))
 	for offset_y in range(-extent, extent + 1):
@@ -1612,11 +1759,31 @@ static func _stamp_disc(image: Image, center: Vector2, radius: float, soft: floa
 			var distance := Vector2(offset_x, offset_y).length()
 			if distance > radius:
 				continue
-			var value := 1.0
+			var value := brightness
 			if soft > 0.0 and distance > radius - soft:
-				value = clampf((radius - distance) / soft, 0.0, 1.0)
+				value = brightness * clampf((radius - distance) / soft, 0.0, 1.0)
 			if value > image.get_pixel(x, y).r:
 				image.set_pixel(x, y, Color(value, value, value, 1.0))
+
+
+## Stamps a line of discs, the way a branch of the tree is drawn.
+static func _stamp_segment(
+	image: Image,
+	from_point: Vector2,
+	to_point: Vector2,
+	radius: float,
+	soft: float,
+	brightness: float
+) -> void:
+	var span := maxi(int(ceil(from_point.distance_to(to_point) * 2.0)), 1)
+	for step in span + 1:
+		_stamp_disc(
+			image,
+			from_point.lerp(to_point, float(step) / float(span)),
+			radius,
+			soft,
+			brightness
+		)
 
 
 ## The project layer picked by a pixel_art node, cached for this generation.
@@ -1754,6 +1921,10 @@ static func describe(node: Dictionary) -> String:
 			return "r %.2f" % float(params["radius"])
 		"checker":
 			return "cell %d px" % int(params["cell"])
+		"tree":
+			return "深 %d · %d 叉" % [
+				int(params.get("depth", 5)), int(params.get("branches", 2))
+			]
 		"constant":
 			return "%.2f" % float(params.get("value", 0.5))
 		"path":
@@ -1857,6 +2028,7 @@ static func describe(node: Dictionary) -> String:
 func is_expensive() -> bool:
 	const HEAVY := [
 		"echo",
+		"tree",
 		"blur",
 		"outline",
 		"glow",
@@ -1879,6 +2051,8 @@ func uses_time() -> bool:
 		if node["type"] == "time":
 			return true
 		if node["type"] == "echo" and bool(node["params"].get("animated", false)):
+			return true
+		if node["type"] == "tree" and bool(node["params"].get("animate", false)):
 			return true
 		if node["type"] == "pixel_art" and int(node["params"].get("frame_mode", 0)) == 2:
 			return true
@@ -1933,6 +2107,49 @@ func build_ocean_preset() -> void:
 			"color_mid": Color(0.13, 0.38, 0.6, 1.0),
 			"color_b": Color(0.62, 0.91, 0.97, 1.0),
 			"mid_position": 0.5,
+		},
+		true
+	)
+
+
+## Replaces the graph with a pixel tree that grows along the animation: the tree
+## node reveals one generation of branches per frame, and the ramp goes from dark
+## bark to bright leaves.
+func build_tree_preset() -> void:
+	nodes.clear()
+	groups.clear()
+	_noise_cache.clear()
+	_noise_signature.clear()
+	var tree := add_node("tree", Vector2(40, 60))
+	var out := add_node("output", Vector2(420, 60))
+	connect_nodes(tree, out, 0)
+	get_node_by_id(tree)["params"].merge(
+		{
+			"seed": 3,
+			"growth": 1.0,
+			"animate": true,
+			"depth": 5,
+			"branches": 2,
+			"spread": 32.0,
+			"taper": 0.74,
+			"bend": 0.4,
+			"width": 0.05,
+			"randomness": 0.3,
+			"leaves": true,
+			"leaf_size": 1.0,
+		},
+		true
+	)
+	get_node_by_id(out)["params"].merge(
+		{
+			"steps": 4,
+			"color_a": Color(0.16, 0.1, 0.06, 1.0),
+			"color_mid": Color(0.34, 0.24, 0.1, 1.0),
+			"color_b": Color(0.62, 0.83, 0.35, 1.0),
+			"mid_position": 0.55,
+			# A tree is usually dropped onto an existing drawing, so the empty
+			# part stays transparent instead of becoming a rectangle.
+			"transparent": true,
 		},
 		true
 	)

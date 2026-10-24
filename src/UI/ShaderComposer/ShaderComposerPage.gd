@@ -752,6 +752,7 @@ func _build_preset_menu() -> void:
 	_preset_paths.clear()
 	root.add_item("默认图", 0)
 	root.add_item("像素海面", 1)
+	root.add_item("生长树", 3)
 	root.add_separator()
 	root.add_item("保存当前图…", 2)
 	var saved := _list_presets()
@@ -788,6 +789,9 @@ func _on_preset_pressed(id: int) -> void:
 		return
 	if id == 1:
 		_on_ocean_preset_pressed()
+		return
+	if id == 3:
+		_on_tree_preset_pressed()
 		return
 	if id == 2:
 		_show_preset_dialog()
@@ -1086,6 +1090,47 @@ func _show_params(id: String) -> void:
 			_add_check("反向", bool(params["invert"]), params, "invert")
 		"checker":
 			_add_slider("格子 (px)", 1.0, 64.0, 1.0, float(params["cell"]), params, "cell")
+		"tree":
+			var tree_hint := Label.new()
+			tree_hint.text = (
+				"递归生长的树：每个枝头再分叉一次，生长值按层展开。"
+				+ "勾选「随预览时间生长」后，用 ▶ 预览或生成多帧就是生长动画。"
+				+ "树干用较低的值、树叶用 1.0，颜色由输出节点的三段色阶决定。"
+			)
+			tree_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+			tree_hint.add_theme_font_size_override("font_size", 13)
+			_params_box.add_child(tree_hint)
+			_add_number("种子", 0, 9999, 1, int(params.get("seed", 3)), params, "seed")
+			_add_slider("生长", 0.0, 1.0, 0.01, float(params.get("growth", 1.0)), params, "growth")
+			_add_check(
+				"随预览时间生长",
+				bool(params.get("animate", false)),
+				params,
+				"animate",
+				true
+			)
+			_begin_section("形态", true)
+			_add_number("深度", 1, 7, 1, int(params.get("depth", 5)), params, "depth")
+			_add_number("每节分叉", 1, 4, 1, int(params.get("branches", 2)), params, "branches")
+			_add_slider(
+				"分叉角度", 5.0, 90.0, 1.0, float(params.get("spread", 34.0)), params, "spread"
+			)
+			_add_slider(
+				"随机", 0.0, 1.0, 0.01, float(params.get("randomness", 0.3)), params, "randomness"
+			)
+			_end_section()
+			_begin_section("枝干", false)
+			_add_slider("粗细", 0.005, 0.15, 0.005, float(params.get("width", 0.045)), params, "width")
+			_add_slider("收细", 0.4, 0.95, 0.01, float(params.get("taper", 0.72)), params, "taper")
+			_add_slider("弯曲", 0.0, 2.0, 0.05, float(params.get("bend", 0.35)), params, "bend")
+			_add_slider("柔边", 0.0, 0.2, 0.005, float(params.get("soft", 0.0)), params, "soft")
+			_end_section()
+			_begin_section("树叶", true)
+			_add_check("启用", bool(params.get("leaves", true)), params, "leaves", true)
+			_add_slider(
+				"叶大小", 0.3, 2.5, 0.05, float(params.get("leaf_size", 1.0)), params, "leaf_size"
+			)
+			_end_section()
 		"path":
 			var path_hint := Label.new()
 			path_hint.text = (
@@ -1721,16 +1766,33 @@ func _add_path_editor(params: Dictionary, bezier := false) -> void:
 	_path_editor = editor
 	var remove_point := func() -> void:
 		editor.remove_selected()
+	var smooth_points := func() -> void:
+		editor.smooth_all()
 	var reset_path := func() -> void:
 		editor.reset_to_square()
 	var buttons := HBoxContainer.new()
 	buttons.add_child(_make_button("删除选中点", remove_point))
+	buttons.add_child(_make_button("平滑全部", smooth_points, "按相邻顶点重算切线，变成顺滑曲线"))
 	buttons.add_child(_make_button("重置路径", reset_path, "回到默认的方形路径"))
 	_params_box.add_child(buttons)
+	if bezier:
+		# A real bezier vertex has collinear handles, so dragging one mirrors the
+		# other unless the user asks for a corner.
+		var mirror_row := HBoxContainer.new()
+		var mirror_check := CheckBox.new()
+		mirror_check.text = "对称手柄"
+		mirror_check.button_pressed = editor.smooth_handles
+		mirror_check.custom_minimum_size = Vector2(0, TOUCH_SIZE)
+		mirror_check.add_theme_font_size_override("font_size", TOUCH_FONT_SIZE)
+		mirror_check.toggled.connect(
+			func(pressed: bool) -> void: editor.smooth_handles = pressed
+		)
+		mirror_row.add_child(mirror_check)
+		_params_box.add_child(mirror_row)
 	var hint := Label.new()
 	hint.text = (
-		"点空白处新增控制点，拖动移动，右键或上方按钮删除。"
-		+ "贝塞尔路径上小圆点是手柄，拖它改变曲率。"
+		"点空白处新增一个贝塞尔顶点（自动带上切线，直接是曲线）；"
+		+ "点在线条上会把顶点插进那一段。拖动顶点移动，拖小圆点改曲率，长按顶点删除。"
 	)
 	hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	hint.add_theme_font_size_override("font_size", 13)
@@ -1946,6 +2008,19 @@ func _advance_playback() -> void:
 func _on_ocean_preset_pressed() -> void:
 	_push_undo()
 	graph.build_ocean_preset()
+	_selected_id = ""
+	_show_params("")
+	_refresh_graph()
+	_refresh_preview()
+
+
+## Builds the growing pixel tree. The phase is put at the end first, so the page
+## shows the full tree and pressing play reveals how it grows.
+func _on_tree_preset_pressed() -> void:
+	_push_undo()
+	graph.build_tree_preset()
+	if is_instance_valid(_phase):
+		_phase.set_value_no_signal(1.0)
 	_selected_id = ""
 	_show_params("")
 	_refresh_graph()
