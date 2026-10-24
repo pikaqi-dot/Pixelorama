@@ -2756,8 +2756,9 @@ func _build_canvas_line_section(id: String, params: Dictionary) -> void:
 	_add_check("闭合填充（路径需闭合）", bool(params.get("fill", false)), params, "fill")
 	var curve_hint := Label.new()
 	curve_hint.text = (
-		"线宽曲线：横轴是从起点到终点的位置，纵轴是线宽倍率。拖动圆点调整，"
-		+ "浅色面积就是这条线的实际粗细；也可以直接点下面的预设。"
+		"线宽曲线：横轴是从起点到终点的位置，纵轴是线宽倍率。直接点某一列就设成那个高度，"
+		+ "按住圆点拖动不会跳动，滚轮或 −2%/+2% 可以微调最后动过的圆点。"
+		+ "浅色面积就是这条线的实际粗细，下面的预设可以一键成形。"
 	)
 	curve_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	curve_hint.add_theme_font_size_override("font_size", 13)
@@ -2802,6 +2803,24 @@ func _add_width_profile(id: String, params: Dictionary) -> void:
 	row.add_child(
 		_make_button(
 			"反向", func() -> void: curve.reverse(), "把线宽曲线左右翻转", Vector2(0, 34)
+		)
+	)
+	# A phone has no mouse wheel, so the last touched handle can also be tuned
+	# two percent at a time from here.
+	row.add_child(
+		_make_button(
+			"−2%",
+			func() -> void: curve.step_active(-0.02),
+			"微调最后拖动过的那个圆点，减 2%",
+			Vector2(0, 34)
+		)
+	)
+	row.add_child(
+		_make_button(
+			"+2%",
+			func() -> void: curve.step_active(0.02),
+			"微调最后拖动过的那个圆点，加 2%",
+			Vector2(0, 34)
 		)
 	)
 	_params_target.add_child(row)
