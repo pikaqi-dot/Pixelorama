@@ -25,6 +25,8 @@ const UNDO_LIMIT := 40
 const UNDO_COALESCE_MSEC := 700
 ## Where user made graph presets live.
 const PRESET_DIR := "user://shader_presets"
+## How often a graph that reads the project refreshes its preview.
+const SOURCE_REFRESH_MSEC := 600
 
 var graph: RefCounted
 var _graph_edit: GraphEdit
@@ -40,6 +42,8 @@ var _add_menu: MenuButton
 var _menu_types: Dictionary = {}
 var _menu_next_id := 1
 var _preview_timer: Timer
+## Keeps the preview in sync with the artwork when the graph reads a layer.
+var _source_timer: Timer
 var _selected_id := ""
 ## Nodes selected in the graph, so several of them can be grouped at once.
 var _selected_ids: Array[String] = []
@@ -120,6 +124,8 @@ func open_page(layer: BaseLayer = null) -> void:
 func close_page() -> void:
 	Global.can_draw = _can_draw_before
 	_preview_timer.stop()
+	if is_instance_valid(_source_timer):
+		_source_timer.stop()
 	if is_instance_valid(_play_timer):
 		_play_timer.stop()
 	if is_instance_valid(_play_button):
@@ -311,6 +317,11 @@ func _build_ui() -> void:
 	_preview_timer.wait_time = 0.15
 	_preview_timer.timeout.connect(_refresh_preview)
 	add_child(_preview_timer)
+
+	_source_timer = Timer.new()
+	_source_timer.wait_time = float(SOURCE_REFRESH_MSEC) / 1000.0
+	_source_timer.timeout.connect(_refresh_preview)
+	add_child(_source_timer)
 
 	_play_timer = Timer.new()
 	_play_timer.wait_time = 1.0 / PREVIEW_FPS
@@ -816,6 +827,58 @@ func _show_params(id: String) -> void:
 			_add_check("反向", bool(params["invert"]), params, "invert")
 		"checker":
 			_add_slider("格子 (px)", 1.0, 64.0, 1.0, float(params["cell"]), params, "cell")
+		"path":
+			var path_hint := Label.new()
+			path_hint.text = (
+				"矢量描边：路径用三次贝塞尔曲线连接，线宽按画布短边比例。"
+				+ "输出的是描边蒙版，接到输出节点或混合节点使用。"
+			)
+			path_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+			path_hint.add_theme_font_size_override("font_size", 13)
+			_params_box.add_child(path_hint)
+			_add_path_editor(params, true)
+			_add_check("闭合", bool(params.get("closed", false)), params, "closed", true)
+			_add_slider("线宽", 0.01, 0.3, 0.005, float(params["width"]), params, "width")
+			_add_slider(
+				"羽化", 0.0, 0.2, 0.005, float(params.get("soft", 0.0)), params, "soft"
+			)
+		"pixel_art":
+			var source_hint := Label.new()
+			source_hint.text = (
+				"读取主窗口的图层内容，预览会跟着画布自动刷新。"
+				+ "亮度通道会乘上透明度，透明处视为 0。帧号从 0 开始。"
+			)
+			source_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+			source_hint.add_theme_font_size_override("font_size", 13)
+			_params_box.add_child(source_hint)
+			var project := Global.current_project
+			var layer_names: Array = []
+			var layer_index := 0
+			if project != null:
+				for i in project.layers.size():
+					layer_names.append("%d %s" % [i + 1, project.layers[i].name])
+				layer_index = clampi(int(params.get("layer", 0)), 0, layer_names.size() - 1)
+			if layer_names.is_empty():
+				layer_names.append("无图层")
+			_add_option("图层", layer_names, layer_index, params, "layer")
+			_add_option(
+				"帧",
+				["当前帧", "指定帧", "跟随动画"],
+				int(params.get("frame_mode", 0)),
+				params,
+				"frame_mode",
+				true
+			)
+			if int(params.get("frame_mode", 0)) == 1:
+				_add_number("帧号", 0, 999, 1, int(params.get("frame", 0)), params, "frame")
+			_add_option(
+				"通道",
+				["亮度×透明度", "透明度", "反向透明度"],
+				int(params.get("channel", 0)),
+				params,
+				"channel"
+			)
+			_add_check("反相", bool(params.get("invert", false)), params, "invert")
 		"constant":
 			_add_slider("数值", 0.0, 1.0, 0.01, float(params.get("value", 0.5)), params, "value")
 		"time":
@@ -1186,14 +1249,22 @@ func _add_option(
 
 
 ## Control point editor for a custom Follow Path.
-func _add_path_editor(params: Dictionary) -> void:
+func _add_path_editor(params: Dictionary, bezier := false) -> void:
 	var stored: Array = params.get("points", [])
-	if stored.size() < 2:
-		# Graphs saved before the editor existed get the default loop.
-		stored = ShaderPathEditorScript.default_points()
-		params["points"] = stored
+	if bezier:
+		if stored.size() < 2:
+			stored = ShaderPathEditorScript.default_bezier()
+			params["points"] = stored
+	else:
+		if stored.size() < 2:
+			# Graphs saved before the editor existed get the default loop.
+			stored = ShaderPathEditorScript.default_points()
+			params["points"] = stored
 	var editor := ShaderPathEditorScript.new()
-	editor.set_points(stored, float(params.get("phase", 0.0)))
+	if bezier:
+		editor.set_bezier(stored, bool(params.get("closed", false)))
+	else:
+		editor.set_points(stored, float(params.get("phase", 0.0)))
 	editor.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	editor.custom_minimum_size = Vector2(0, 200)
 	editor.points_changed.connect(
@@ -1213,7 +1284,10 @@ func _add_path_editor(params: Dictionary) -> void:
 	buttons.add_child(_make_button("重置路径", reset_path, "回到默认的方形路径"))
 	_params_box.add_child(buttons)
 	var hint := Label.new()
-	hint.text = "点空白处新增控制点，拖动移动，右键或上方按钮删除。红点是当前相位位置。"
+	hint.text = (
+		"点空白处新增控制点，拖动移动，右键或上方按钮删除。"
+		+ "贝塞尔路径上小圆点是手柄，拖它改变曲率。"
+	)
 	hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	hint.add_theme_font_size_override("font_size", 13)
 	_params_box.add_child(hint)
@@ -1292,7 +1366,7 @@ func _add_number(
 
 
 func _add_check(
-	label_text: String, value: bool, params: Dictionary, key: String
+	label_text: String, value: bool, params: Dictionary, key: String, rebuild := false
 ) -> void:
 	var check := CheckBox.new()
 	check.text = label_text
@@ -1304,6 +1378,9 @@ func _add_check(
 			_push_undo("%s:%s" % [_selected_id, key])
 			params[key] = pressed
 			_schedule_preview()
+			# Some checkboxes change which controls are shown, like the closed path.
+			if rebuild and not _selected_id.is_empty():
+				call_deferred("_show_params", _selected_id)
 	)
 	_params_box.add_child(check)
 
@@ -1354,6 +1431,12 @@ func _refresh_preview() -> void:
 		_path_editor.set_phase(graph.time)
 	var image: Image = graph.generate(preview_size)
 	_preview.texture = ImageTexture.create_from_image(image)
+	# A graph that reads the artwork keeps following it while the user draws.
+	if is_instance_valid(_source_timer):
+		if graph.uses_source() and _source_timer.is_stopped():
+			_source_timer.start()
+		elif not graph.uses_source() and not _source_timer.is_stopped():
+			_source_timer.stop()
 	_status.text = "预览 %d×%d · 输出 %d×%d · 节点 %d · %s" % [
 		preview_size.x,
 		preview_size.y,
@@ -1364,8 +1447,8 @@ func _refresh_preview() -> void:
 	]
 
 
-## Plays the preview on a loop, which is the quickest way to judge an animated
-## graph before committing it to frames.
+## Launches the echo of earlier frames, which is the quickest way to judge an
+## animated graph before committing it.
 func _on_play_pressed() -> void:
 	if not is_instance_valid(_play_timer):
 		return

@@ -13,6 +13,9 @@ const NODE_TYPES := {
 	"radial": {"label": "径向", "inputs": 0},
 	"checker": {"label": "棋盘", "inputs": 0},
 	"constant": {"label": "常量", "inputs": 0},
+	# Input nodes: one draws a vector path, the other reads the project's layers.
+	"path": {"label": "路径", "inputs": 0},
+	"pixel_art": {"label": "像素画", "inputs": 0},
 	"time": {"label": "时间", "inputs": 0},
 	"wave": {"label": "波纹", "inputs": 1},
 	# Transform group. They all move the sampling position, so they can be
@@ -81,6 +84,7 @@ const NODE_GROUPS := [
 		"label": "生成",
 		"types": ["noise", "gradient", "radial", "checker", "constant"],
 	},
+	{"label": "输入", "types": ["path", "pixel_art"]},
 	{"label": "动态", "types": ["time", "wave"]},
 	{
 		"label": "变换",
@@ -134,6 +138,9 @@ var _noise_signature := {}
 ## Bounds of the non empty part of a branch, rebuilt for every generated image.
 var _bounds_cache := {}
 var _bayer_cache := {}
+## Rasterised paths and the project layers read by the input nodes, per generate.
+var _path_cache := {}
+var _source_cache := {}
 
 
 func _init() -> void:
@@ -451,6 +458,32 @@ static func default_params(type: String) -> Dictionary:
 			return {"cell": 8.0}
 		"constant":
 			return {"value": 0.5}
+		"path":
+			return {
+				"points":
+				[
+					{
+						"point": Vector2(0.2, 0.75),
+						"in": Vector2.ZERO,
+						"out": Vector2(0.1, -0.15),
+					},
+					{
+						"point": Vector2(0.5, 0.3),
+						"in": Vector2(-0.12, 0.12),
+						"out": Vector2(0.12, -0.12),
+					},
+					{
+						"point": Vector2(0.8, 0.75),
+						"in": Vector2(-0.1, -0.15),
+						"out": Vector2.ZERO,
+					},
+				],
+				"closed": false,
+				"width": 0.06,
+				"soft": 0.0,
+			}
+		"pixel_art":
+			return {"layer": 0, "frame_mode": 0, "frame": 0, "channel": 0, "invert": false}
 		"time":
 			return {"speed": 1.0, "offset": 0.0}
 		"wave":
@@ -580,6 +613,8 @@ func generate(size: Vector2i) -> Image:
 	size.y = maxi(size.y, 1)
 	var image := Image.create_empty(size.x, size.y, false, Image.FORMAT_RGBA8)
 	_bounds_cache.clear()
+	_path_cache.clear()
+	_source_cache.clear()
 	var output_id := output_node_id()
 	if output_id.is_empty():
 		image.fill(Color(0, 0, 0, 0))
@@ -654,6 +689,13 @@ func _eval(node_id: String, uv: Vector2, size: Vector2i, depth: int) -> float:
 			return 1.0 if odd == 1 else 0.0
 		"constant":
 			return clampf(float(params.get("value", 0.5)), 0.0, 1.0)
+		"path":
+			# The stroke is rasterised once per generated image, so this is a lookup.
+			if uv.x < 0.0 or uv.y < 0.0 or uv.x >= float(size.x) or uv.y >= float(size.y):
+				return 0.0
+			return _path_image(node, size).get_pixel(int(uv.x), int(uv.y)).r
+		"pixel_art":
+			return _source_value(node, uv, size)
 		"time":
 			# Loops of the animation and a per node offset, so several time driven
 			# parts of a graph can run out of phase.
@@ -1271,6 +1313,171 @@ func _bayer_matrix(bits: int) -> Array:
 	return matrix
 
 
+## Flattens the cubic bezier path into a polyline in 0..1 canvas units. Each entry
+## of [param points] is a dictionary with "point" and the "in" / "out" handles.
+static func flatten_path(points: Array, closed: bool, steps := 20) -> PackedVector2Array:
+	var result := PackedVector2Array()
+	var count := points.size()
+	if count == 0:
+		return result
+	if count == 1:
+		result.append(points[0]["point"])
+		return result
+	var segments := count if closed else count - 1
+	for index in segments:
+		var start_entry: Dictionary = points[index % count]
+		var end_entry: Dictionary = points[(index + 1) % count]
+		var start: Vector2 = start_entry["point"]
+		var end: Vector2 = end_entry["point"]
+		var control_a: Vector2 = start + (start_entry.get("out", Vector2.ZERO) as Vector2)
+		var control_b: Vector2 = end + (end_entry.get("in", Vector2.ZERO) as Vector2)
+		for step in steps:
+			result.append(_bezier_point(start, control_a, control_b, end, float(step) / steps))
+	result.append((points[0] if closed else points[count - 1])["point"])
+	return result
+
+
+## Point at [param t] (0..1) along the flattened path. Shared with the editor, so
+## the marker sits on the drawn curve.
+static func sample_path_point(points: Array, closed: bool, t: float) -> Vector2:
+	var flat := flatten_path(points, closed)
+	if flat.is_empty():
+		return Vector2(0.5, 0.5)
+	if flat.size() == 1:
+		return flat[0]
+	# No wrapping here: the editor marker wants 1.0 to land on the last point.
+	var scaled := clampf(t, 0.0, 1.0) * float(flat.size() - 1)
+	var index := clampi(int(floorf(scaled)), 0, flat.size() - 2)
+	return flat[index].lerp(flat[index + 1], scaled - float(index))
+
+
+static func _bezier_point(
+	start: Vector2, control_a: Vector2, control_b: Vector2, end: Vector2, t: float
+) -> Vector2:
+	var inverse := 1.0 - t
+	return (
+		start * inverse * inverse * inverse
+		+ control_a * 3.0 * inverse * inverse * t
+		+ control_b * 3.0 * inverse * t * t
+		+ end * t * t * t
+	)
+
+
+## Rasterises the stroke of a path node at [param size] and caches it, so the
+## per pixel evaluation is just a lookup.
+func _path_image(node: Dictionary, size: Vector2i) -> Image:
+	var key := "%s:%dx%d" % [node["id"], size.x, size.y]
+	if _path_cache.has(key):
+		return _path_cache[key]
+	var params: Dictionary = node["params"]
+	var image := Image.create_empty(size.x, size.y, false, Image.FORMAT_RGBA8)
+	image.fill(Color(0.0, 0.0, 0.0, 0.0))
+	var flat := flatten_path(params.get("points", []), bool(params.get("closed", false)))
+	if flat.size() >= 2:
+		var shortest := float(mini(size.x, size.y))
+		var radius := maxf(float(params.get("width", 0.06)) * shortest * 0.5, 0.5)
+		var soft := clampf(float(params.get("soft", 0.0)) * shortest, 0.0, radius)
+		var scale := Vector2(size)
+		for index in range(flat.size() - 1):
+			var from_point: Vector2 = flat[index] * scale
+			var to_point: Vector2 = flat[index + 1] * scale
+			var span := maxi(int(ceil(from_point.distance_to(to_point) * 2.0)), 1)
+			for step in span + 1:
+				_stamp_disc(image, from_point.lerp(to_point, float(step) / span), radius, soft)
+	_path_cache[key] = image
+	return image
+
+
+static func _stamp_disc(image: Image, center: Vector2, radius: float, soft: float) -> void:
+	var extent := int(ceil(radius))
+	var middle := Vector2i(roundi(center.x), roundi(center.y))
+	for offset_y in range(-extent, extent + 1):
+		for offset_x in range(-extent, extent + 1):
+			var x := middle.x + offset_x
+			var y := middle.y + offset_y
+			if x < 0 or y < 0 or x >= image.get_width() or y >= image.get_height():
+				continue
+			var distance := Vector2(offset_x, offset_y).length()
+			if distance > radius:
+				continue
+			var value := 1.0
+			if soft > 0.0 and distance > radius - soft:
+				value = clampf((radius - distance) / soft, 0.0, 1.0)
+			if value > image.get_pixel(x, y).r:
+				image.set_pixel(x, y, Color(value, value, value, 1.0))
+
+
+## The project layer picked by a pixel_art node, cached for this generation.
+func _source_image(node: Dictionary) -> Image:
+	var key := str(node["id"])
+	if _source_cache.has(key):
+		return _source_cache[key]
+	var project = Global.current_project
+	if project == null or project.frames.is_empty() or project.layers.is_empty():
+		_source_cache[key] = null
+		return null
+	var params: Dictionary = node["params"]
+	var frame_index := clampi(project.current_frame, 0, project.frames.size() - 1)
+	match int(params.get("frame_mode", 0)):
+		1:
+			frame_index = clampi(int(params.get("frame", 0)), 0, project.frames.size() - 1)
+		2:
+			var frame_count: int = project.frames.size()
+			frame_index = clampi(int(floorf(time * float(frame_count))), 0, frame_count - 1)
+	var layer_index := clampi(int(params.get("layer", 0)), 0, project.layers.size() - 1)
+	var cel = project.frames[frame_index].cels[layer_index]
+	var image: Image = null
+	if cel is BaseCel:
+		image = (cel as BaseCel).get_image()
+	_source_cache[key] = image
+	return image
+
+
+## Value of a pixel_art node at [param uv]. The source image is stretched over the
+## generated image, so the preview at a lower resolution still lines up.
+func _source_value(node: Dictionary, uv: Vector2, size: Vector2i) -> float:
+	var params: Dictionary = node["params"]
+	return sample_source(
+		_source_image(node), int(params.get("channel", 0)), bool(params.get("invert", false)), uv, size
+	)
+
+
+## Reads one pixel of [param image] as a value. Split out from the node so it can
+## be tested without a project behind it.
+static func sample_source(
+	image: Image, channel: int, invert: bool, uv: Vector2, size: Vector2i
+) -> float:
+	if image == null or image.is_empty():
+		return 0.0
+	var width := float(image.get_width())
+	var height := float(image.get_height())
+	if width <= 0.0 or height <= 0.0:
+		return 0.0
+	var source_x := int(clampf(uv.x / float(size.x), 0.0, 0.999999) * width)
+	var source_y := int(clampf(uv.y / float(size.y), 0.0, 0.999999) * height)
+	var color := image.get_pixel(source_x, source_y)
+	var value := 0.0
+	match channel:
+		1:
+			value = color.a
+		2:
+			value = 1.0 - color.a
+		_:
+			value = (color.r + color.g + color.b) / 3.0 * color.a
+	if invert:
+		value = 1.0 - value
+	return clampf(value, 0.0, 1.0)
+
+
+## True when the graph reads the project, so the preview has to be refreshed when
+## the artwork changes underneath it.
+func uses_source() -> bool:
+	for node: Dictionary in nodes:
+		if node["type"] == "pixel_art":
+			return true
+	return false
+
+
 func _math_value(op: int, source: float, params: Dictionary) -> float:
 	var amount := float(params["amount"])
 	match MATH_OPS[op]:
@@ -1337,6 +1544,16 @@ static func describe(node: Dictionary) -> String:
 			return "cell %d px" % int(params["cell"])
 		"constant":
 			return "%.2f" % float(params.get("value", 0.5))
+		"path":
+			return "%d 点 · 宽 %.2f" % [
+				(params.get("points", []) as Array).size(), float(params["width"])
+			]
+		"pixel_art":
+			var channels := ["亮度", "透明度", "反向透明度"]
+			return "%s · 图层 %d" % [
+				channels[clampi(int(params.get("channel", 0)), 0, 2)],
+				int(params.get("layer", 0)) + 1
+			]
 		"time":
 			return "速度 %.1f" % float(params.get("speed", 1.0))
 		"wave":
@@ -1423,6 +1640,8 @@ func uses_time() -> bool:
 		if node["type"] == "time":
 			return true
 		if node["type"] == "echo" and bool(node["params"].get("animated", false)):
+			return true
+		if node["type"] == "pixel_art" and int(node["params"].get("frame_mode", 0)) == 2:
 			return true
 	return false
 
