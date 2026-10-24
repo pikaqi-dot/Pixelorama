@@ -56,7 +56,11 @@ func _ready() -> void:
 	_board.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	_board.custom_minimum_size = Vector2(120, 120)
 	_board.stroke_started.connect(_remember)
-	_board.stroke_finished.connect(func() -> void: _dirty = true)
+	_board.stroke_finished.connect(
+		func() -> void:
+			_dirty = true
+			_update_status()
+	)
 	column.add_child(_board)
 	# Brush size row: the arrows step by exactly one pixel, the slider covers
 	# everything in between.
@@ -104,6 +108,7 @@ func setup(image: Image) -> void:
 	_undo.clear()
 	_dirty = false
 	_board.set_image(image)
+	_update_status()
 
 
 func image_size() -> Vector2i:
@@ -161,12 +166,17 @@ func _on_brush_size_changed(value: float) -> void:
 	_update_status()
 
 
-## Shows the active tool and brush, so it is obvious which one is drawing.
+## Shows the active tool, the brush and how many pixels are already painted, so
+## what is on screen can be compared with what is in the image.
 func _update_status() -> void:
 	if not is_instance_valid(_status) or not is_instance_valid(_board):
 		return
-	_status.text = "工具：%s · 笔刷 %d px" % [
-		TOOLS[clampi(_board.tool, 0, TOOLS.size() - 1)], _board.brush_size
+	_status.text = "工具：%s · 笔刷 %d px · 画布 %d×%d · 已画 %d px" % [
+		TOOLS[clampi(_board.tool, 0, TOOLS.size() - 1)],
+		_board.brush_size,
+		_board.image_size().x,
+		_board.image_size().y,
+		_board.painted_count(),
 	]
 
 
@@ -372,6 +382,24 @@ class Board extends Control:
 		):
 			return Vector2i(-1, -1)
 		return pixel
+
+
+	func image_size() -> Vector2i:
+		if image == null:
+			return Vector2i.ZERO
+		return Vector2i(image.get_width(), image.get_height())
+
+
+	## Number of pixels that already carry a value, used by the status line.
+	func painted_count() -> int:
+		if image == null:
+			return 0
+		var total := 0
+		for y in image.get_height():
+			for x in image.get_width():
+				if image.get_pixel(x, y).a > 0.0:
+					total += 1
+		return total
 
 
 	func _refresh() -> void:
