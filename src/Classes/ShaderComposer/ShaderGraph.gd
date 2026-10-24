@@ -31,7 +31,13 @@ const NODE_TYPES := {
 	"area_warp": {"label": "Area Warp", "inputs": 2},
 	"nine_slice": {"label": "Nine Slice", "inputs": 1},
 	"crop_content": {"label": "Crop Content", "inputs": 1},
+	"kaleidoscope": {"label": "Kaleidoscope", "inputs": 1},
 	"warp": {"label": "Warp", "inputs": 2},
+	# Filters read neighbouring pixels, they do not move the mapping.
+	"blur": {"label": "Blur", "inputs": 1},
+	"edge": {"label": "Edge", "inputs": 1},
+	"dither": {"label": "Dither", "inputs": 1},
+	"pixelate": {"label": "Pixelate", "inputs": 1},
 	"math": {"label": "Math", "inputs": 1},
 	"blend": {"label": "Blend", "inputs": 2},
 	"output": {"label": "Output", "inputs": 1},
@@ -52,6 +58,41 @@ const BLEND_OPS := ["Mix", "Add", "Multiply", "Screen", "Difference"]
 const POLAR_MODES := ["矩形 → 极坐标", "极坐标 → 矩形"]
 const ECHO_MODES := ["最大值（拖影）", "平均值（残影）"]
 const PATH_SHAPES := ["圆形", "水平", "垂直", "正弦", "方形", "8 字"]
+const DITHER_SIZES_TEXT := ["2×2", "4×4", "8×8"]
+## Bits of the Bayer matrix behind each entry of [constant DITHER_SIZES_TEXT].
+const DITHER_BITS := [1, 2, 3]
+
+## Node types grouped for the add menu. Every type in [constant NODE_TYPES] has
+## to appear exactly once, which the tests check.
+const NODE_GROUPS := [
+	{
+		"label": "生成",
+		"types": ["noise", "gradient", "radial", "checker", "constant"],
+	},
+	{"label": "动态", "types": ["time", "wave"]},
+	{
+		"label": "变换",
+		"types":
+		[
+			"transform",
+			"scale",
+			"flip",
+			"skew",
+			"tile",
+			"polar",
+			"crop",
+			"padding",
+			"nine_slice",
+			"crop_content",
+		],
+	},
+	{
+		"label": "变形",
+		"types": ["warp", "area_warp", "mesh_warp", "kaleidoscope", "echo", "follow_path"],
+	},
+	{"label": "滤镜", "types": ["blur", "edge", "dither", "pixelate"]},
+	{"label": "合成", "types": ["math", "blend", "output"]},
+]
 ## Coordinates closer than this to a pixel are treated as that pixel. Only used to
 ## cancel the floating point noise of rotations by right angles.
 const SNAP_STEP := 0.000001
@@ -65,6 +106,7 @@ var _noise_cache := {}
 var _noise_signature := {}
 ## Bounds of the non empty part of a branch, rebuilt for every generated image.
 var _bounds_cache := {}
+var _bayer_cache := {}
 
 
 func _init() -> void:
@@ -283,6 +325,16 @@ static func default_params(type: String) -> Dictionary:
 			return {"border": 0.2, "scale": 1.5}
 		"crop_content":
 			return {"threshold": 0.02, "margin": 0.0}
+		"kaleidoscope":
+			return {"segments": 6.0, "angle": 0.0, "mirror": true}
+		"blur":
+			return {"radius": 1.5}
+		"edge":
+			return {"radius": 1.0, "gain": 3.0, "invert": false}
+		"dither":
+			return {"matrix": 1, "strength": 0.5}
+		"pixelate":
+			return {"size": 4.0}
 		"warp":
 			return {"amount": 0.15}
 		"math":
@@ -556,6 +608,80 @@ func _eval(node_id: String, uv: Vector2, size: Vector2i, depth: int) -> float:
 				content_bounds.position + (uv / size_vec) * content_bounds.size
 			) * size_vec
 			return _sample(node, 0, content_uv, size, depth)
+		"kaleidoscope":
+			# Folds the canvas into wedges around the centre.
+			var kaleido_center := size_vec * 0.5
+			var kaleido_delta := uv - kaleido_center
+			var kaleido_slice := TAU / float(clampi(int(params["segments"]), 2, 16))
+			var kaleido_angle := (
+				atan2(kaleido_delta.y, kaleido_delta.x) - deg_to_rad(float(params["angle"]))
+			)
+			kaleido_angle = fposmod(kaleido_angle, kaleido_slice)
+			if bool(params.get("mirror", true)) and kaleido_angle > kaleido_slice * 0.5:
+				kaleido_angle = kaleido_slice - kaleido_angle
+			var kaleido_radius := kaleido_delta.length()
+			var kaleido_mapped := (
+				kaleido_center
+				+ Vector2(cos(kaleido_angle), sin(kaleido_angle)) * kaleido_radius
+			)
+			return clampf(
+				_eval(_input_id(node, 0), kaleido_mapped, size, depth + 1), 0.0, 1.0
+			)
+		"blur":
+			# A 3×3 kernel spread over the radius, which is cheap and smooth enough
+			# for pixel work once the result is posterized.
+			var blur_radius := maxf(float(params["radius"]), 0.0)
+			if blur_radius < 0.01:
+				return clampf(_eval(_input_id(node, 0), uv, size, depth + 1), 0.0, 1.0)
+			var blur_total := 0.0
+			for row in 3:
+				for column in 3:
+					var blur_offset := Vector2(
+						float(column - 1) * blur_radius, float(row - 1) * blur_radius
+					)
+					blur_total += clampf(
+						_eval(_input_id(node, 0), uv + blur_offset, size, depth + 1), 0.0, 1.0
+					)
+			return clampf(blur_total / 9.0, 0.0, 1.0)
+		"edge":
+			# Difference between opposite neighbours, which outlines the branch.
+			var edge_step := maxf(float(params["radius"]), 0.5)
+			var edge_left := _eval(_input_id(node, 0), uv - Vector2(edge_step, 0.0), size, depth + 1)
+			var edge_right := _eval(_input_id(node, 0), uv + Vector2(edge_step, 0.0), size, depth + 1)
+			var edge_top := _eval(_input_id(node, 0), uv - Vector2(0.0, edge_step), size, depth + 1)
+			var edge_bottom := _eval(_input_id(node, 0), uv + Vector2(0.0, edge_step), size, depth + 1)
+			var edge_value := clampf(
+				Vector2(edge_right - edge_left, edge_bottom - edge_top).length()
+				* maxf(float(params["gain"]), 0.0),
+				0.0,
+				1.0
+			)
+			return 1.0 - edge_value if bool(params["invert"]) else edge_value
+		"dither":
+			# Ordered dithering, so the posterized output gains texture instead of
+			# flat bands. The threshold is per pixel, so it stays put while playing.
+			var dither_matrix := _bayer_matrix(DITHER_BITS[clampi(int(params["matrix"]), 0, 2)])
+			var dither_span := dither_matrix.size()
+			var dither_x := int(floorf(uv.x)) % dither_span
+			var dither_y := int(floorf(uv.y)) % dither_span
+			var dither_threshold := (
+				(float(dither_matrix[dither_y][dither_x]) + 0.5) / float(dither_span * dither_span)
+			)
+			var dither_source := clampf(
+				_eval(_input_id(node, 0), uv, size, depth + 1), 0.0, 1.0
+			)
+			return clampf(
+				dither_source + (dither_threshold - 0.5) * float(params["strength"]), 0.0, 1.0
+			)
+		"pixelate":
+			var block := maxf(float(params["size"]), 1.0)
+			var pixel_mapped := Vector2(
+				clampf(floorf(uv.x / block) * block + block * 0.5, 0.0, size_vec.x - 1.0),
+				clampf(floorf(uv.y / block) * block + block * 0.5, 0.0, size_vec.y - 1.0)
+			)
+			return clampf(
+				_eval(_input_id(node, 0), pixel_mapped, size, depth + 1), 0.0, 1.0
+			)
 		"warp":
 			# The first input is the field, the second one the image being distorted.
 			var amount := float(params.get("amount", 0.15)) * size_vec.y
@@ -713,6 +839,30 @@ func _content_bounds(node: Dictionary) -> Rect2:
 	return rect
 
 
+## Bayer threshold matrix of 2^[param bits] per side, built once and cached.
+func _bayer_matrix(bits: int) -> Array:
+	if _bayer_cache.has(bits):
+		return _bayer_cache[bits]
+	var matrix := [[0]]
+	for _step in bits:
+		var span := matrix.size()
+		var grown := []
+		for _row in span * 2:
+			var row: Array = []
+			row.resize(span * 2)
+			grown.append(row)
+		for y in span:
+			for x in span:
+				var base: int = int(matrix[y][x]) * 4
+				grown[y][x] = base
+				grown[y][x + span] = base + 2
+				grown[y + span][x] = base + 3
+				grown[y + span][x + span] = base + 1
+		matrix = grown
+	_bayer_cache[bits] = matrix
+	return matrix
+
+
 func _math_value(op: int, source: float, params: Dictionary) -> float:
 	var amount := float(params["amount"])
 	match MATH_OPS[op]:
@@ -822,6 +972,16 @@ static func describe(node: Dictionary) -> String:
 			return "边框 %.2f · ×%.2f" % [float(params["border"]), float(params["scale"])]
 		"crop_content":
 			return "阈值 %.2f" % float(params["threshold"])
+		"kaleidoscope":
+			return "%d 段" % int(params["segments"])
+		"blur":
+			return "r %.1f" % float(params["radius"])
+		"edge":
+			return "%.1f · ×%.1f" % [float(params["radius"]), float(params["gain"])]
+		"dither":
+			return DITHER_SIZES_TEXT[clampi(int(params["matrix"]), 0, 2)]
+		"pixelate":
+			return "%d px" % int(params["size"])
 		"warp":
 			return "%.2f" % float(params.get("amount", 0.15))
 		"math":

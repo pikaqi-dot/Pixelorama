@@ -24,6 +24,8 @@ var _params_hint: Label
 var _preview: TextureRect
 var _status: Label
 var _add_type: OptionButton
+## Type behind every item of the add menu, "" for the group separators.
+var _add_types: Array[String] = []
 var _preview_timer: Timer
 var _selected_id := ""
 var _can_draw_before := true
@@ -144,9 +146,7 @@ func _build_ui() -> void:
 	var toolbar := HFlowContainer.new()
 	root.add_child(toolbar)
 	_add_type = OptionButton.new()
-	for type: String in ShaderGraphScript.NODE_TYPES.keys():
-		_add_type.add_item(ShaderGraphScript.NODE_TYPES[type]["label"])
-	_add_type.select(0)
+	_fill_add_menu()
 	_add_type.custom_minimum_size = Vector2(0, TOUCH_SIZE)
 	_add_type.add_theme_font_size_override("font_size", TOUCH_FONT_SIZE)
 	toolbar.add_child(_add_type)
@@ -324,8 +324,26 @@ func _on_delete_nodes_request(nodes: Array[StringName]) -> void:
 	_schedule_preview()
 
 
+## Builds the add menu from the groups, so 30 types stay readable on a phone.
+func _fill_add_menu() -> void:
+	_add_type.clear()
+	_add_types.clear()
+	for group: Dictionary in ShaderGraphScript.NODE_GROUPS:
+		_add_type.add_separator(str(group["label"]))
+		_add_types.append("")
+		for type: String in group["types"]:
+			_add_type.add_item(ShaderGraphScript.NODE_TYPES[type]["label"])
+			_add_types.append(type)
+	if _add_types.size() > 1:
+		_add_type.select(1)
+
+
 func _on_add_pressed() -> void:
-	var type: String = ShaderGraphScript.NODE_TYPES.keys()[_add_type.selected]
+	if _add_type.selected < 0 or _add_type.selected >= _add_types.size():
+		return
+	var type: String = _add_types[_add_type.selected]
+	if type.is_empty():
+		return
 	# New nodes land next to the visible area instead of on top of each other.
 	var offset := Vector2(60 + graph.nodes.size() * 24, 40 + graph.nodes.size() * 18)
 	var id: String = graph.add_node(type, offset)
@@ -527,6 +545,42 @@ func _show_params(id: String) -> void:
 			_params_box.add_child(content_hint)
 			_add_slider("阈值", 0.0, 1.0, 0.01, float(params["threshold"]), params, "threshold")
 			_add_slider("边距", 0.0, 0.4, 0.01, float(params["margin"]), params, "margin")
+		"kaleidoscope":
+			_add_slider("分段", 2.0, 16.0, 1.0, float(params["segments"]), params, "segments")
+			_add_slider("旋转", 0.0, 360.0, 1.0, float(params["angle"]), params, "angle")
+			_add_check("镜像", bool(params.get("mirror", true)), params, "mirror")
+		"blur":
+			var blur_hint := Label.new()
+			blur_hint.text = "3×3 模糊，半径越大越糊。配合 Output 的色阶可以做出柔边。"
+			blur_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+			blur_hint.add_theme_font_size_override("font_size", 13)
+			_params_box.add_child(blur_hint)
+			_add_slider("半径", 0.5, 8.0, 0.5, float(params["radius"]), params, "radius")
+		"edge":
+			var edge_hint := Label.new()
+			edge_hint.text = "比较上下左右邻居，得到描边。反向可得到内部填充。"
+			edge_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+			edge_hint.add_theme_font_size_override("font_size", 13)
+			_params_box.add_child(edge_hint)
+			_add_slider("采样距离", 0.5, 8.0, 0.5, float(params["radius"]), params, "radius")
+			_add_slider("强度", 0.5, 8.0, 0.1, float(params["gain"]), params, "gain")
+			_add_check("反向", bool(params["invert"]), params, "invert")
+		"dither":
+			var dither_hint := Label.new()
+			dither_hint.text = "有序抖动，让 Output 的色阶产生网点而不是平涂。"
+			dither_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+			dither_hint.add_theme_font_size_override("font_size", 13)
+			_params_box.add_child(dither_hint)
+			_add_option(
+				"矩阵",
+				ShaderGraphScript.DITHER_SIZES_TEXT,
+				int(params["matrix"]),
+				params,
+				"matrix"
+			)
+			_add_slider("强度", 0.0, 1.0, 0.01, float(params["strength"]), params, "strength")
+		"pixelate":
+			_add_slider("块大小", 1.0, 32.0, 1.0, float(params["size"]), params, "size")
 		"warp":
 			var warp_hint := Label.new()
 			warp_hint.text = "输入 1 是扰动场，输入 2 是被扭曲的图案。"
