@@ -681,7 +681,19 @@ static func default_params(type: String) -> Dictionary:
 				"reveal_reverse": false,
 			}
 		"pixel_art":
-			return {"layer": 0, "frame_mode": 0, "frame": 0, "channel": 0, "invert": false}
+			return {
+				"layer": 0,
+				"frame_mode": 0,
+				"frame": 0,
+				"channel": 0,
+				"invert": false,
+				# Cropped rectangle in layer pixels. A width or height of 0 means
+				# "up to the edge", so an untouched node reads the whole layer.
+				"crop_x": 0,
+				"crop_y": 0,
+				"crop_w": 0,
+				"crop_h": 0,
+			}
 		"time":
 			return {"speed": 1.0, "offset": 0.0}
 		"wave":
@@ -2261,9 +2273,15 @@ func _scatter_image(
 	var footprint := Vector2(shortest * stamp, shortest * stamp)
 	var source_node := get_node_by_id(source_id)
 	if not source_node.is_empty() and str(source_node["type"]) == "pixel_art":
-		var brush := _source_image(source_node, params_for(source_node))
+		var brush_params := params_for(source_node)
+		var brush := _source_image(source_node, brush_params)
 		if brush != null and not brush.is_empty():
-			var aspect := float(brush.get_width()) / float(maxi(brush.get_height(), 1))
+			# The aspect of the cropped brush, not of the whole layer, so a
+			# cropped leaf keeps its own shape.
+			var region := source_crop(
+				brush_params, Vector2i(brush.get_width(), brush.get_height())
+			)
+			var aspect := float(region.size.x) / float(maxi(region.size.y, 1))
 			if aspect >= 1.0:
 				footprint.y = footprint.x / aspect
 			else:
@@ -2515,22 +2533,70 @@ func _source_image(node: Dictionary, params: Dictionary) -> Image:
 	return image
 
 
-## Value of a pixel_art node at [param uv]. The source image is stretched over the
-## generated image, so the preview at a lower resolution still lines up.
+## The layer behind a pixel_art node, for the editor preview.
+func source_image(node: Dictionary) -> Image:
+	return _source_image(node, params_for(node))
+
+
+## Size of the layer behind a pixel_art node, or a zero vector when the layer
+## cannot be read. Node labels show it as the canvas size.
+func source_image_size(node: Dictionary) -> Vector2i:
+	var image := source_image(node)
+	if image == null or image.is_empty():
+		return Vector2i.ZERO
+	return Vector2i(image.get_width(), image.get_height())
+
+
+## Cropped rectangle of the layer behind a pixel_art node, clamped to the image.
+func source_region(node: Dictionary) -> Rect2i:
+	var image_size := source_image_size(node)
+	if image_size.x <= 0 or image_size.y <= 0:
+		return Rect2i()
+	return source_crop(params_for(node), image_size)
+
+
+## Value of a pixel_art node at [param uv]. The cropped part of the source image
+## is stretched over the generated image, so the preview at a lower resolution
+## still lines up.
 func _source_value(node: Dictionary, params: Dictionary, uv: Vector2, size: Vector2i) -> float:
+	var image := _source_image(node, params)
+	if image == null or image.is_empty():
+		return 0.0
 	return sample_source(
-		_source_image(node, params),
+		image,
 		int(params.get("channel", 0)),
 		bool(params.get("invert", false)),
 		uv,
-		size
+		size,
+		source_crop(params, Vector2i(image.get_width(), image.get_height()))
 	)
 
 
+## Crop rectangle of a pixel_art node in image pixels. A width or height of 0
+## means the rest of the image, and the result is always inside the image, so a
+## layer that shrank underneath a node never reads out of bounds.
+static func source_crop(params: Dictionary, image_size: Vector2i) -> Rect2i:
+	var width := maxi(image_size.x, 1)
+	var height := maxi(image_size.y, 1)
+	var x := clampi(int(params.get("crop_x", 0)), 0, width - 1)
+	var y := clampi(int(params.get("crop_y", 0)), 0, height - 1)
+	var crop_width := int(params.get("crop_w", 0))
+	var crop_height := int(params.get("crop_h", 0))
+	var right := width if crop_width <= 0 else mini(x + crop_width, width)
+	var bottom := height if crop_height <= 0 else mini(y + crop_height, height)
+	return Rect2i(x, y, maxi(right - x, 1), maxi(bottom - y, 1))
+
+
 ## Reads one pixel of [param image] as a value. Split out from the node so it can
-## be tested without a project behind it.
+## be tested without a project behind it. [param crop] limits the sampled area,
+## which is how a pixel_art node reads only part of its layer.
 static func sample_source(
-	image: Image, channel: int, invert: bool, uv: Vector2, size: Vector2i
+	image: Image,
+	channel: int,
+	invert: bool,
+	uv: Vector2,
+	size: Vector2i,
+	crop := Rect2i()
 ) -> float:
 	if image == null or image.is_empty():
 		return 0.0
@@ -2538,8 +2604,22 @@ static func sample_source(
 	var height := float(image.get_height())
 	if width <= 0.0 or height <= 0.0:
 		return 0.0
-	var source_x := int(clampf(uv.x / float(size.x), 0.0, 0.999999) * width)
-	var source_y := int(clampf(uv.y / float(size.y), 0.0, 0.999999) * height)
+	var region := crop
+	if region.size.x <= 0 or region.size.y <= 0:
+		region = Rect2i(0, 0, int(width), int(height))
+	else:
+		region = region.intersection(Rect2i(0, 0, int(width), int(height)))
+		if region.size.x <= 0 or region.size.y <= 0:
+			region = Rect2i(0, 0, int(width), int(height))
+	var span := Vector2(maxf(float(size.x), 1.0), maxf(float(size.y), 1.0))
+	var source_x := (
+		int(clampf(uv.x / span.x, 0.0, 0.999999) * float(region.size.x)) + region.position.x
+	)
+	var source_y := (
+		int(clampf(uv.y / span.y, 0.0, 0.999999) * float(region.size.y)) + region.position.y
+	)
+	source_x = clampi(source_x, 0, int(width) - 1)
+	source_y = clampi(source_y, 0, int(height) - 1)
 	var color := image.get_pixel(source_x, source_y)
 	var value := 0.0
 	match channel:
@@ -2655,10 +2735,18 @@ static func describe(node: Dictionary) -> String:
 			]
 		"pixel_art":
 			var channels := ["亮度", "透明度", "反向透明度"]
-			return "%s · 图层 %d" % [
+			var source_text := "%s · 图层 %d" % [
 				channels[clampi(int(params.get("channel", 0)), 0, 2)],
 				int(params.get("layer", 0)) + 1
 			]
+			var crop_w := int(params.get("crop_w", 0))
+			var crop_h := int(params.get("crop_h", 0))
+			if crop_w > 0 or crop_h > 0:
+				source_text += " · 裁切 %s×%s" % [
+					str(crop_w) if crop_w > 0 else "全宽",
+					str(crop_h) if crop_h > 0 else "全高"
+				]
+			return source_text
 		"time":
 			return "速度 %.1f" % float(params.get("speed", 1.0))
 		"wave":

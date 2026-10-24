@@ -55,6 +55,8 @@ const PATH_POPUP_RATIO := 0.9
 const PATH_EDITOR_MIN_HEIGHT := 110
 ## Side of the preview drawn in the frame under every node, in pixels.
 const NODE_PREVIEW_SIZE := 56
+## Height of the cropped source preview in the pixel_art panel, in pixels.
+const SOURCE_PREVIEW_HEIGHT := 120
 
 var graph: RefCounted
 var _graph_edit: GraphEdit
@@ -581,7 +583,13 @@ func _make_graph_node(node: Dictionary) -> GraphNode:
 	graph_node.set_slot(0, input_count >= 1, 0, PORT_COLOR, true, 0, PORT_COLOR)
 	var description := Label.new()
 	description.text = ShaderGraphScript.describe(node)
+	# Every node names the canvas it generates at, so the graph reads without
+	# opening the preview.
+	var canvas_text := _canvas_size_text()
+	if not canvas_text.is_empty():
+		description.text += " · " + canvas_text
 	description.add_theme_font_size_override("font_size", 12)
+	description.tooltip_text = "生成尺寸：%s" % canvas_text
 	graph_node.add_child(description)
 	if bool(node.get("bypass", false)):
 		# A bypassed node is still visible, so it can be switched back on, but the
@@ -603,6 +611,15 @@ func _make_graph_node(node: Dictionary) -> GraphNode:
 	# Every node shows what it produces, in a frame that can be folded away.
 	graph_node.add_child(_make_node_preview(node))
 	return graph_node
+
+
+## Canvas size the graph generates at, taken from the project. It is written on
+## every node label.
+func _canvas_size_text() -> String:
+	var project := Global.current_project
+	if project == null:
+		return ""
+	return "%d×%d" % [project.size.x, project.size.y]
 
 
 ## Preview frame of every node, under its ports. It shows the value that node
@@ -1634,6 +1651,7 @@ func _show_params(id: String) -> void:
 				"channel"
 			)
 			_add_check("反相", bool(params.get("invert", false)), params, "invert")
+			_build_source_crop_section(id, params)
 		"constant":
 			_add_slider("数值", 0.0, 1.0, 0.01, float(params.get("value", 0.5)), params, "value")
 		"time":
@@ -2314,6 +2332,99 @@ func _add_option(
 	_params_target.add_child(row)
 
 
+## Crop rectangle of the imported art, with a preview of what the node really
+## reads. Cropping a leaf out of a sheet is how a scatter brush is made, so the
+## numbers and the result belong in the same place.
+func _build_source_crop_section(node_id: String, params: Dictionary) -> void:
+	var node: Dictionary = graph.get_node_by_id(node_id)
+	var image_size := Vector2i.ZERO
+	if not node.is_empty():
+		image_size = graph.source_image_size(node)
+	_begin_section("裁切", true)
+	if image_size.x <= 0 or image_size.y <= 0:
+		var empty_hint := Label.new()
+		empty_hint.text = "当前图层读不到内容，先画出材质再来裁切。"
+		empty_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+		empty_hint.add_theme_font_size_override("font_size", 13)
+		_params_target.add_child(empty_hint)
+		_end_section()
+		return
+	var hint := Label.new()
+	hint.text = "按图层像素裁切一块当材质，宽或高填 0 表示一直到边缘；下面是裁切后的实际取样。"
+	hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	hint.add_theme_font_size_override("font_size", 13)
+	_params_target.add_child(hint)
+	_add_number(
+		"X",
+		0,
+		maxi(image_size.x - 1, 0),
+		1,
+		int(params.get("crop_x", 0)),
+		params,
+		"crop_x",
+		false,
+		true
+	)
+	_add_number(
+		"Y",
+		0,
+		maxi(image_size.y - 1, 0),
+		1,
+		int(params.get("crop_y", 0)),
+		params,
+		"crop_y",
+		false,
+		true
+	)
+	_add_number(
+		"宽", 0, image_size.x, 1, int(params.get("crop_w", 0)), params, "crop_w", false, true
+	)
+	_add_number(
+		"高", 0, image_size.y, 1, int(params.get("crop_h", 0)), params, "crop_h", false, true
+	)
+	var region: Rect2i = ShaderGraphScript.source_crop(params, image_size)
+	var info := Label.new()
+	info.text = "取样 %d×%d / 图层 %d×%d" % [
+		region.size.x, region.size.y, image_size.x, image_size.y
+	]
+	info.add_theme_font_size_override("font_size", 12)
+	_params_target.add_child(info)
+	_add_source_preview(node, region)
+	_params_target.add_child(
+		_make_button("重置裁切", func() -> void: _reset_source_crop(node_id, params))
+	)
+	_end_section()
+
+
+## Draws the cropped part of the layer, so the material can be checked while the
+## numbers change. Nearest filtering keeps the pixels readable.
+func _add_source_preview(node: Dictionary, region: Rect2i) -> void:
+	var image: Image = graph.source_image(node)
+	if image == null or image.is_empty() or region.size.x <= 0 or region.size.y <= 0:
+		return
+	var cropped := image.get_region(region)
+	var preview := TextureRect.new()
+	preview.texture = ImageTexture.create_from_image(cropped)
+	preview.texture_filter = CanvasItem.TEXTURE_FILTER_NEAREST
+	preview.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+	preview.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
+	preview.custom_minimum_size = Vector2(0, SOURCE_PREVIEW_HEIGHT)
+	preview.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_params_target.add_child(preview)
+
+
+## Puts the crop back to the whole layer, which is the default of a new node.
+func _reset_source_crop(node_id: String, params: Dictionary) -> void:
+	_push_undo("%s:crop" % node_id)
+	params["crop_x"] = 0
+	params["crop_y"] = 0
+	params["crop_w"] = 0
+	params["crop_h"] = 0
+	_mark_preview_dirty(node_id)
+	_schedule_preview()
+	call_deferred("_show_params", node_id)
+
+
 ## Opens the path window from the side panel. The control points live in a large
 ## separate window, so the panel stays short and the node only shows a thumbnail.
 func _add_path_button(id: String) -> void:
@@ -2560,7 +2671,8 @@ func _add_number(
 	value: int,
 	params: Dictionary,
 	key: String,
-	animatable := true
+	animatable := true,
+	rebuild := false
 ) -> void:
 	_register_animatable(label_text, key, min_value, max_value, step, true, animatable)
 	var row := HBoxContainer.new()
@@ -2583,6 +2695,9 @@ func _add_number(
 			_mark_preview_dirty(_selected_id)
 			params[key] = int(new_value)
 			_schedule_preview()
+			# The crop numbers change the source preview drawn under them.
+			if rebuild and not _selected_id.is_empty():
+				call_deferred("_show_params", _selected_id)
 	)
 	row.add_child(spin)
 	_params_target.add_child(row)
