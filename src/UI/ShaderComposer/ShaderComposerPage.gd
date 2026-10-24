@@ -394,8 +394,10 @@ func _build_ui() -> void:
 	output_label.add_theme_font_size_override("font_size", 13)
 	_output_column.add_child(output_label)
 	_preview = TextureRect.new()
-	_preview.custom_minimum_size = Vector2(120, 140)
-	_preview.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	# A square is enough to judge the result, and it leaves the graph area the
+	# rest of the height instead of taking the whole column.
+	_preview.custom_minimum_size = Vector2(150, 150)
+	_preview.size_flags_vertical = Control.SIZE_SHRINK_BEGIN
 	_preview.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
 	_preview.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
 	_preview.texture_filter = CanvasItem.TEXTURE_FILTER_NEAREST
@@ -3539,7 +3541,10 @@ func _apply_layout() -> void:
 	_body.vertical = narrow
 	if is_instance_valid(_output_column):
 		# A portrait phone keeps enough width for the nodes to stay usable.
-		_output_column.custom_minimum_size = Vector2(96 if narrow else 150, 0)
+		var preview_side := 96 if narrow else 150
+		_output_column.custom_minimum_size = Vector2(preview_side, 0)
+		if is_instance_valid(_preview):
+			_preview.custom_minimum_size = Vector2(preview_side, preview_side)
 	if _zen_mode:
 		# The graph is hidden, so the parameters can use the whole height.
 		_graph_edit.custom_minimum_size = Vector2.ZERO
