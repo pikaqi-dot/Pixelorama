@@ -32,6 +32,9 @@ const NODE_TYPES := {
 	"nine_slice": {"label": "Nine Slice", "inputs": 1},
 	"crop_content": {"label": "Crop Content", "inputs": 1},
 	"kaleidoscope": {"label": "Kaleidoscope", "inputs": 1},
+	"bend": {"label": "Bend", "inputs": 1},
+	"stretch": {"label": "Stretch", "inputs": 1},
+	"mirror": {"label": "Mirror", "inputs": 1},
 	"warp": {"label": "Warp", "inputs": 2},
 	# Filters read neighbouring pixels, they do not move the mapping.
 	"blur": {"label": "Blur", "inputs": 1},
@@ -63,6 +66,11 @@ const PATH_CUSTOM := 6
 ## Prefix of the ids of groups, so a group node can be told from a real node.
 const GROUP_PREFIX := "group_"
 const DITHER_SIZES_TEXT := ["2×2", "4×4", "8×8"]
+const FLIP_AXIS := ["水平", "垂直", "两者"]
+const SCALE_MODES := ["按比例", "缩放到尺寸"]
+const SCALE_FITS := ["拉伸铺满", "保持比例放入", "保持比例填满"]
+const BEND_TYPES := ["弧线", "波浪"]
+const BEND_AXIS := ["沿 X（按 Y 弯曲）", "沿 Y（按 X 弯曲）"]
 ## Bits of the Bayer matrix behind each entry of [constant DITHER_SIZES_TEXT].
 const DITHER_BITS := [1, 2, 3]
 
@@ -92,7 +100,18 @@ const NODE_GROUPS := [
 	},
 	{
 		"label": "变形",
-		"types": ["warp", "area_warp", "mesh_warp", "kaleidoscope", "echo", "follow_path"],
+		"types":
+		[
+			"warp",
+			"area_warp",
+			"mesh_warp",
+			"bend",
+			"stretch",
+			"mirror",
+			"kaleidoscope",
+			"echo",
+			"follow_path",
+		],
 	},
 	{"label": "滤镜", "types": ["blur", "edge", "dither", "pixelate"]},
 	{"label": "合成", "types": ["math", "blend", "output"]},
@@ -218,6 +237,16 @@ func from_dict(data: Dictionary) -> void:
 		var suffix := str(node["id"]).get_slice("_", -1)
 		if suffix.is_valid_int():
 			_next_id = maxi(_next_id, int(suffix) + 1)
+	# Flip used to have two checkboxes, move old graphs to the single axis.
+	for node: Dictionary in nodes:
+		if str(node["type"]) != "flip":
+			continue
+		var flip_params: Dictionary = node["params"]
+		if flip_params.has("axis"):
+			continue
+		var horizontal := bool(flip_params.get("horizontal", false))
+		var vertical := bool(flip_params.get("vertical", false))
+		flip_params["axis"] = 2 if (horizontal and vertical) else (1 if vertical else 0)
 	groups.clear()
 	for entry in data.get("groups", []):
 		if entry is not Dictionary or not entry.has("id"):
@@ -433,11 +462,23 @@ static func default_params(type: String) -> Dictionary:
 				"offset_x": 0.0,
 				"offset_y": 0.0,
 				"tile": false,
+				"position_x": 0.0,
+				"position_y": 0.0,
+				"round": false,
+				"alpha": 1.0,
 			}
 		"scale":
-			return {"scale_x": 1.0, "scale_y": 1.0, "tile": false}
+			return {
+				"scale_x": 1.0,
+				"scale_y": 1.0,
+				"tile": false,
+				"mode": 0,
+				"target_x": 32.0,
+				"target_y": 32.0,
+				"fit": 0,
+			}
 		"flip":
-			return {"horizontal": false, "vertical": false}
+			return {"axis": 0}
 		"skew":
 			return {"angle_x": 0.0, "angle_y": 0.0}
 		"tile":
@@ -445,9 +486,9 @@ static func default_params(type: String) -> Dictionary:
 		"polar":
 			return {"mode": 0, "repeat": 2.0, "twist": 0.0}
 		"crop":
-			return {"left": 0.0, "top": 0.0, "right": 1.0, "bottom": 1.0}
+			return {"left": 0.0, "top": 0.0, "right": 1.0, "bottom": 1.0, "aspect": 0.0}
 		"padding":
-			return {"amount": 0.15}
+			return {"amount": 0.15, "align_x": 0.5, "align_y": 0.5}
 		"echo":
 			return {"count": 4, "angle": 90.0, "distance": 0.2, "mode": 0}
 		"follow_path":
@@ -474,7 +515,22 @@ static func default_params(type: String) -> Dictionary:
 				"bl_y": 0.0,
 				"br_x": 0.0,
 				"br_y": 0.0,
+				"randomness": 0.0,
 			}
+		"bend":
+			return {
+				"type": 1,
+				"axis": 0,
+				"amount": 0.1,
+				"scale": 1.0,
+				"shift": 0.0,
+				"uv_scale": 1.0,
+				"uv_shift": 0.0,
+			}
+		"stretch":
+			return {"angle": 0.0, "amount": 0.3, "inverse": true}
+		"mirror":
+			return {"angle": 0.0, "position": 0.5, "flip_side": false}
 		"area_warp":
 			return {"center_x": 0.5, "center_y": 0.5, "radius": 0.35, "amount": 0.2}
 		"nine_slice":
@@ -599,26 +655,63 @@ func _eval(node_id: String, uv: Vector2, size: Vector2i, depth: int) -> float:
 			mapped += (
 				Vector2(float(params["offset_x"]), float(params["offset_y"])) * size_vec
 			)
+			# Position moves the content, so the sampling point moves the other way.
+			mapped -= (
+				Vector2(
+					float(params.get("position_x", 0.0)),
+					float(params.get("position_y", 0.0))
+				)
+				* size_vec
+			)
 			# cos(90°) is not exactly zero, so a quarter turn leaves a ~1e-16 wobble
 			# that flips pixels sitting on a color step. Snapping far below a pixel
 			# removes the wobble without touching the visible result.
 			mapped = mapped.snapped(Vector2(SNAP_STEP, SNAP_STEP))
+			if bool(params.get("round", false)):
+				mapped = mapped.round()
 			if bool(params.get("tile", false)):
 				mapped = Vector2(fposmod(mapped.x, size_vec.x), fposmod(mapped.y, size_vec.y))
-			return clampf(_eval(_input_id(node, 0), mapped, size, depth + 1), 0.0, 1.0)
+			var transformed := clampf(
+				_eval(_input_id(node, 0), mapped, size, depth + 1), 0.0, 1.0
+			)
+			# There is no alpha channel in a value graph, so this fades towards the
+			# darkest colour of the ramp instead.
+			return transformed * clampf(float(params.get("alpha", 1.0)), 0.0, 1.0)
 		"scale":
 			# Separate axes, and a negative factor mirrors that axis.
+			var scale_x := float(params["scale_x"])
+			var scale_y := float(params["scale_y"])
+			if int(params.get("mode", 0)) == 1:
+				# Scale to size: a target sized image is fitted into the canvas.
+				var target := Vector2(
+					maxf(float(params.get("target_x", 32.0)), 1.0),
+					maxf(float(params.get("target_y", 32.0)), 1.0)
+				)
+				var fitted := size_vec / target
+				match int(params.get("fit", 0)):
+					1:
+						fitted = Vector2.ONE * minf(fitted.x, fitted.y)
+					2:
+						fitted = Vector2.ONE * maxf(fitted.x, fitted.y)
+				scale_x = fitted.x
+				scale_y = fitted.y
 			var scale_mapped := Vector2(
-				_scale_axis(uv.x, size_vec.x, float(params["scale_x"])),
-				_scale_axis(uv.y, size_vec.y, float(params["scale_y"]))
+				_scale_axis(uv.x, size_vec.x, scale_x),
+				_scale_axis(uv.y, size_vec.y, scale_y)
 			)
 			var scale_wrap := bool(params.get("tile", false))
 			return _sample(node, 0, scale_mapped, size, depth, scale_wrap, scale_wrap)
 		"flip":
+			var flip_axis := int(params.get("axis", -1))
+			var flip_horizontal := bool(params.get("horizontal", false))
+			var flip_vertical := bool(params.get("vertical", false))
+			if flip_axis >= 0:
+				flip_horizontal = flip_axis == 0 or flip_axis == 2
+				flip_vertical = flip_axis == 1 or flip_axis == 2
 			var flip_mapped := uv
-			if bool(params["horizontal"]):
+			if flip_horizontal:
 				flip_mapped.x = size_vec.x - 1.0 - flip_mapped.x
-			if bool(params["vertical"]):
+			if flip_vertical:
 				flip_mapped.y = size_vec.y - 1.0 - flip_mapped.y
 			return clampf(_eval(_input_id(node, 0), flip_mapped, size, depth + 1), 0.0, 1.0)
 		"skew":
@@ -670,6 +763,22 @@ func _eval(node_id: String, uv: Vector2, size: Vector2i, depth: int) -> float:
 			var crop_top := float(params["top"]) * size_vec.y
 			var crop_right := float(params["right"]) * size_vec.x
 			var crop_bottom := float(params["bottom"]) * size_vec.y
+			var crop_aspect := float(params.get("aspect", 0.0))
+			if crop_aspect > 0.001 and crop_right > crop_left and crop_bottom > crop_top:
+				# Locking the aspect ratio adjusts the shorter side around the centre.
+				var crop_center := Vector2(
+					(crop_left + crop_right) * 0.5, (crop_top + crop_bottom) * 0.5
+				)
+				var crop_width := crop_right - crop_left
+				var crop_height := crop_bottom - crop_top
+				if crop_width / crop_height > crop_aspect:
+					crop_width = crop_height * crop_aspect
+				else:
+					crop_height = crop_width / crop_aspect
+				crop_left = crop_center.x - crop_width * 0.5
+				crop_right = crop_center.x + crop_width * 0.5
+				crop_top = crop_center.y - crop_height * 0.5
+				crop_bottom = crop_center.y + crop_height * 0.5
 			if (
 				uv.x < crop_left
 				or uv.x >= crop_right
@@ -679,10 +788,16 @@ func _eval(node_id: String, uv: Vector2, size: Vector2i, depth: int) -> float:
 				return 0.0
 			return clampf(_eval(_input_id(node, 0), uv, size, depth + 1), 0.0, 1.0)
 		"padding":
-			# Squeezes the branch inwards, leaving an empty margin around it.
+			# Squeezes the branch inwards, leaving an empty margin around it. The
+			# alignment decides where the shrunk content sits.
 			var pad_amount := clampf(float(params["amount"]), 0.0, 0.49)
 			var pad_scale := maxf(1.0 - pad_amount * 2.0, 0.02)
-			var pad_mapped := (uv - size_vec * 0.5) / pad_scale + size_vec * 0.5
+			var pad_align := Vector2(
+				clampf(float(params.get("align_x", 0.5)), 0.0, 1.0),
+				clampf(float(params.get("align_y", 0.5)), 0.0, 1.0)
+			)
+			var pad_origin := pad_align * (1.0 - pad_scale)
+			var pad_mapped := ((normalized - pad_origin) / pad_scale) * size_vec
 			return _sample(node, 0, pad_mapped, size, depth)
 		"echo":
 			# Samples the branch several times along a direction, which smears a
@@ -726,6 +841,14 @@ func _eval(node_id: String, uv: Vector2, size: Vector2i, depth: int) -> float:
 				lerpf(mesh_top.x, mesh_bottom.x, mesh_t) * size_vec.x,
 				lerpf(mesh_top.y, mesh_bottom.y, mesh_t) * size_vec.y
 			)
+			var mesh_random := clampf(float(params.get("randomness", 0.0)), 0.0, 0.4)
+			if mesh_random > 0.0:
+				# A smooth wobble, so the mesh looks hand jittered instead of noisy.
+				var mesh_jitter := Vector2(
+					sin(mesh_mapped.y * 0.19 + mesh_mapped.x * 0.11),
+					cos(mesh_mapped.x * 0.17 - mesh_mapped.y * 0.23)
+				)
+				mesh_mapped += mesh_jitter * mesh_random * size_vec * 0.5
 			return _sample(node, 0, mesh_mapped, size, depth)
 		"area_warp":
 			# Warp, but the displacement fades out towards the edge of a circle.
@@ -783,6 +906,64 @@ func _eval(node_id: String, uv: Vector2, size: Vector2i, depth: int) -> float:
 			return clampf(
 				_eval(_input_id(node, 0), kaleido_mapped, size, depth + 1), 0.0, 1.0
 			)
+		"bend":
+			# Shifts one axis by a curve of the other, which arcs or ripples the
+			# whole branch. UV Scale and UV Shift move the pattern beforehand.
+			var bend_uv := normalized * maxf(float(params.get("uv_scale", 1.0)), 0.01)
+			bend_uv += Vector2.ONE * float(params.get("uv_shift", 0.0))
+			bend_uv = Vector2(fposmod(bend_uv.x, 1.0), fposmod(bend_uv.y, 1.0))
+			var bend_amount := float(params["amount"]) * size_vec.y
+			var bend_along := bend_uv.x
+			if int(params["axis"]) == 0:
+				bend_along = bend_uv.y
+			var bend_delta := 0.0
+			match int(params["type"]):
+				0:
+					# Arc: a parabola, so the middle bulges and the ends stay put.
+					var bend_centered := (bend_along - 0.5) * 2.0
+					bend_delta = (bend_centered * bend_centered - 0.5) * bend_amount
+				_:
+					var bend_frequency := maxf(float(params["scale"]), 0.05)
+					bend_delta = (
+						sin((bend_along * bend_frequency + float(params["shift"])) * TAU)
+						* bend_amount
+					)
+			var bend_offset := (
+				Vector2(bend_delta, 0.0) if int(params["axis"]) == 0 else Vector2(0.0, bend_delta)
+			)
+			return _sample(node, 0, bend_uv * size_vec + bend_offset, size, depth)
+		"stretch":
+			# Scales along one direction only, the classic speed smear. Inverse also
+			# squeezes across, so the area roughly stays the same.
+			var stretch_angle := deg_to_rad(float(params["angle"]))
+			var stretch_amount := clampf(float(params["amount"]), 0.0, 0.95)
+			var stretch_direction := Vector2.from_angle(stretch_angle)
+			var stretch_normal := Vector2.from_angle(stretch_angle + PI * 0.5)
+			var stretch_delta := uv - size_vec * 0.5
+			var stretch_along := stretch_delta.dot(stretch_direction) / (1.0 + stretch_amount)
+			var stretch_across := stretch_delta.dot(stretch_normal)
+			if bool(params.get("inverse", false)):
+				stretch_across /= maxf(1.0 - stretch_amount * 0.5, 0.05)
+			var stretch_mapped := (
+				size_vec * 0.5
+				+ stretch_direction * stretch_along
+				+ stretch_normal * stretch_across
+			)
+			return _sample(node, 0, stretch_mapped, size, depth)
+		"mirror":
+			# Folds one half of the canvas onto the other across a line. The centre
+			# is the middle of the pixel grid, so mirrored pixels line up exactly and
+			# no seam appears on an even sized canvas.
+			var mirror_center := (size_vec - Vector2.ONE) * 0.5
+			var mirror_normal := Vector2.from_angle(deg_to_rad(float(params["angle"])) + PI * 0.5)
+			if bool(params.get("flip_side", false)):
+				mirror_normal = -mirror_normal
+			var mirror_delta := uv - mirror_center
+			mirror_delta -= mirror_normal * float(params["position"]) * size_vec.y
+			var mirror_distance := mirror_delta.dot(mirror_normal)
+			if mirror_distance > 0.0:
+				mirror_delta -= mirror_normal * mirror_distance * 2.0
+			return _sample(node, 0, mirror_center + mirror_delta, size, depth)
 		"blur":
 			# A 3×3 kernel spread over the radius, which is cheap and smooth enough
 			# for pixel work once the result is posterized.
@@ -1130,14 +1311,11 @@ static func describe(node: Dictionary) -> String:
 		"transform":
 			return "×%.2f · %d°" % [float(params["scale"]), int(params["angle"])]
 		"scale":
+			if int(params.get("mode", 0)) == 1:
+				return "%d×%d" % [int(params["target_x"]), int(params["target_y"])]
 			return "×%.2f · %.2f" % [float(params["scale_x"]), float(params["scale_y"])]
 		"flip":
-			var flips: Array[String] = []
-			if bool(params["horizontal"]):
-				flips.append("H")
-			if bool(params["vertical"]):
-				flips.append("V")
-			return "-".join(flips) if not flips.is_empty() else "—"
+			return FLIP_AXIS[clampi(int(params.get("axis", 0)), 0, 2)]
 		"skew":
 			return "%d° / %d°" % [int(params["angle_x"]), int(params["angle_y"])]
 		"tile":
@@ -1170,6 +1348,12 @@ static func describe(node: Dictionary) -> String:
 			return "阈值 %.2f" % float(params["threshold"])
 		"kaleidoscope":
 			return "%d 段" % int(params["segments"])
+		"bend":
+			return "%s · %.2f" % [BEND_TYPES[clampi(int(params["type"]), 0, 1)], float(params["amount"])]
+		"stretch":
+			return "%d° · %.2f" % [int(params["angle"]), float(params["amount"])]
+		"mirror":
+			return "%d° · %.2f" % [int(params["angle"]), float(params["position"])]
 		"blur":
 			return "r %.1f" % float(params["radius"])
 		"edge":

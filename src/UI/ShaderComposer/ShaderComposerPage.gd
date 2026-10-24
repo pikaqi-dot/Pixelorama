@@ -601,18 +601,56 @@ func _show_params(id: String) -> void:
 			_add_slider("角度", 0.0, 360.0, 1.0, float(params["angle"]), params, "angle")
 			_add_slider("振幅", 0.0, 1.0, 0.01, float(params["amplitude"]), params, "amplitude")
 		"transform":
+			var transform_hint := Label.new()
+			transform_hint.text = "位置移动内容；位置取整可减少像素画的糊边；不透明度在数值图里表现为向最暗色淡出。"
+			transform_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+			transform_hint.add_theme_font_size_override("font_size", 13)
+			_params_box.add_child(transform_hint)
+			_add_slider(
+				"位置 X", -1.0, 1.0, 0.01, float(params.get("position_x", 0.0)), params, "position_x"
+			)
+			_add_slider(
+				"位置 Y", -1.0, 1.0, 0.01, float(params.get("position_y", 0.0)), params, "position_y"
+			)
 			_add_slider("旋转", 0.0, 360.0, 1.0, float(params["angle"]), params, "angle")
 			_add_slider("缩放", 0.1, 4.0, 0.05, float(params["scale"]), params, "scale")
 			_add_slider("偏移 X", -1.0, 1.0, 0.01, float(params["offset_x"]), params, "offset_x")
 			_add_slider("偏移 Y", -1.0, 1.0, 0.01, float(params["offset_y"]), params, "offset_y")
+			_add_check("位置取整", bool(params.get("round", false)), params, "round")
 			_add_check("平铺", bool(params.get("tile", false)), params, "tile")
+			_add_slider(
+				"不透明度", 0.0, 1.0, 0.01, float(params.get("alpha", 1.0)), params, "alpha"
+			)
 		"scale":
-			_add_slider("X 缩放", -4.0, 4.0, 0.05, float(params["scale_x"]), params, "scale_x")
-			_add_slider("Y 缩放", -4.0, 4.0, 0.05, float(params["scale_y"]), params, "scale_y")
+			_add_option(
+				"模式", ShaderGraphScript.SCALE_MODES, int(params.get("mode", 0)), params, "mode", true
+			)
+			if int(params.get("mode", 0)) == 1:
+				_add_slider(
+					"目标宽",
+					1.0,
+					256.0,
+					1.0,
+					float(params.get("target_x", 32.0)),
+					params,
+					"target_x"
+				)
+				_add_slider(
+					"目标高",
+					1.0,
+					256.0,
+					1.0,
+					float(params.get("target_y", 32.0)),
+					params,
+					"target_y"
+				)
+				_add_option("适配", ShaderGraphScript.SCALE_FITS, int(params.get("fit", 0)), params, "fit")
+			else:
+				_add_slider("X 缩放", -4.0, 4.0, 0.05, float(params["scale_x"]), params, "scale_x")
+				_add_slider("Y 缩放", -4.0, 4.0, 0.05, float(params["scale_y"]), params, "scale_y")
 			_add_check("平铺", bool(params.get("tile", false)), params, "tile")
 		"flip":
-			_add_check("水平翻转", bool(params["horizontal"]), params, "horizontal")
-			_add_check("垂直翻转", bool(params["vertical"]), params, "vertical")
+			_add_option("翻转轴", ShaderGraphScript.FLIP_AXIS, int(params.get("axis", 0)), params, "axis")
 		"skew":
 			_add_slider("X 倾斜", -80.0, 80.0, 1.0, float(params["angle_x"]), params, "angle_x")
 			_add_slider("Y 倾斜", -80.0, 80.0, 1.0, float(params["angle_y"]), params, "angle_y")
@@ -635,8 +673,15 @@ func _show_params(id: String) -> void:
 			_add_slider("上", 0.0, 1.0, 0.01, float(params["top"]), params, "top")
 			_add_slider("右", 0.0, 1.0, 0.01, float(params["right"]), params, "right")
 			_add_slider("下", 0.0, 1.0, 0.01, float(params["bottom"]), params, "bottom")
+			_add_slider("宽高比", 0.0, 4.0, 0.05, float(params.get("aspect", 0.0)), params, "aspect")
 		"padding":
 			_add_slider("边距", 0.0, 0.49, 0.01, float(params["amount"]), params, "amount")
+			_add_slider(
+				"对齐 X", 0.0, 1.0, 0.01, float(params.get("align_x", 0.5)), params, "align_x"
+			)
+			_add_slider(
+				"对齐 Y", 0.0, 1.0, 0.01, float(params.get("align_y", 0.5)), params, "align_y"
+			)
 		"echo":
 			var echo_hint := Label.new()
 			echo_hint.text = "沿一个方向重复采样。最大值留下拖影，平均值得到残影。"
@@ -686,6 +731,9 @@ func _show_params(id: String) -> void:
 			_add_slider("左下 Y", -0.5, 0.5, 0.01, float(params["bl_y"]), params, "bl_y")
 			_add_slider("右下 X", -0.5, 0.5, 0.01, float(params["br_x"]), params, "br_x")
 			_add_slider("右下 Y", -0.5, 0.5, 0.01, float(params["br_y"]), params, "br_y")
+			_add_slider(
+				"随机抖动", 0.0, 0.4, 0.01, float(params.get("randomness", 0.0)), params, "randomness"
+			)
 		"area_warp":
 			var area_hint := Label.new()
 			area_hint.text = "输入 1 是扰动场，输入 2 是被扭曲的图案。只在圆圈范围内生效。"
@@ -718,6 +766,37 @@ func _show_params(id: String) -> void:
 			_add_slider("分段", 2.0, 16.0, 1.0, float(params["segments"]), params, "segments")
 			_add_slider("旋转", 0.0, 360.0, 1.0, float(params["angle"]), params, "angle")
 			_add_check("镜像", bool(params.get("mirror", true)), params, "mirror")
+		"bend":
+			var bend_hint := Label.new()
+			bend_hint.text = "把整条分支按曲线推开：弧线做弯曲，波浪做热浪抖动。"
+			bend_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+			bend_hint.add_theme_font_size_override("font_size", 13)
+			_params_box.add_child(bend_hint)
+			_add_option("类型", ShaderGraphScript.BEND_TYPES, int(params["type"]), params, "type")
+			_add_option("作用轴", ShaderGraphScript.BEND_AXIS, int(params["axis"]), params, "axis")
+			_add_slider("幅度", -0.5, 0.5, 0.01, float(params["amount"]), params, "amount")
+			_add_slider("频率", 0.1, 6.0, 0.1, float(params["scale"]), params, "scale")
+			_add_slider("相位", 0.0, 1.0, 0.01, float(params["shift"]), params, "shift")
+			_add_slider("UV 缩放", 0.25, 4.0, 0.05, float(params.get("uv_scale", 1.0)), params, "uv_scale")
+			_add_slider("UV 偏移", -1.0, 1.0, 0.01, float(params.get("uv_shift", 0.0)), params, "uv_shift")
+		"stretch":
+			var stretch_hint := Label.new()
+			stretch_hint.text = "沿一个方向拉长，做冲刺、子弹、魔法弹的速度感。反向会同时压扁垂直方向。"
+			stretch_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+			stretch_hint.add_theme_font_size_override("font_size", 13)
+			_params_box.add_child(stretch_hint)
+			_add_slider("角度", 0.0, 360.0, 1.0, float(params["angle"]), params, "angle")
+			_add_slider("强度", 0.0, 0.95, 0.01, float(params["amount"]), params, "amount")
+			_add_check("反向压缩", bool(params.get("inverse", true)), params, "inverse")
+		"mirror":
+			var mirror_hint := Label.new()
+			mirror_hint.text = "沿一条线把半边折到另一边，做左右对称或上下对称的图案。"
+			mirror_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+			mirror_hint.add_theme_font_size_override("font_size", 13)
+			_params_box.add_child(mirror_hint)
+			_add_slider("角度", 0.0, 360.0, 1.0, float(params["angle"]), params, "angle")
+			_add_slider("位置", -1.0, 1.0, 0.01, float(params["position"]), params, "position")
+			_add_check("反向半边", bool(params.get("flip_side", false)), params, "flip_side")
 		"blur":
 			var blur_hint := Label.new()
 			blur_hint.text = "3×3 模糊，半径越大越糊。配合 Output 的色阶可以做出柔边。"
