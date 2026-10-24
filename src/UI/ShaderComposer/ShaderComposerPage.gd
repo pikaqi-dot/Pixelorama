@@ -980,6 +980,7 @@ func _build_preset_menu() -> void:
 	root.add_item("遮罩生长", 5)
 	root.add_item("灌木丛", 6)
 	root.add_item("灌木丛（程序化）", 7)
+	root.add_item("藤蔓叶片（沿路径）", 8)
 	root.add_separator()
 	root.add_item("保存当前图…", 2)
 	var saved := _list_presets()
@@ -1031,6 +1032,9 @@ func _on_preset_pressed(id: int) -> void:
 		return
 	if id == 7:
 		_on_scatter_preset_pressed(false)
+		return
+	if id == 8:
+		_on_vine_preset_pressed()
 		return
 	if id == 2:
 		_show_preset_dialog()
@@ -1487,17 +1491,44 @@ func _show_params(id: String) -> void:
 		"scatter":
 			var scatter_hint := Label.new()
 			scatter_hint.text = (
-				"把输入 1 当作笔刷，在范围内按随机角度和大小盖章，"
+				"把输入 1 当作笔刷，按随机角度和大小盖章，"
 				+ "适合把像素画图层里的叶片、石头、碎石铺成灌木和苔藓。"
-				+ "输入 2 可选，当作密度遮罩：越亮的位置越容易放下笔刷。"
+				+ "输入 2 在「区域密度」时是遮罩（越亮越密）；"
+				+ "切到「沿路径」并把路径接到输入 2，笔刷会顺着曲线排布，"
+				+ "动画那个路径的「显示比例」就是边生长边撒。"
 			)
 			scatter_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 			scatter_hint.add_theme_font_size_override("font_size", 13)
 			_params_box.add_child(scatter_hint)
 			_add_number("数量", 1, 256, 1, int(params.get("amount", 24)), params, "amount")
-			_add_slider(
-				"范围", 0.0, 1.5, 0.01, float(params.get("spread", 0.6)), params, "spread"
+			_add_option(
+				"分布",
+				["区域密度", "沿路径"],
+				int(params.get("mode", 0)),
+				params,
+				"mode",
+				true
 			)
+			if int(params.get("mode", 0)) == 1:
+				_add_slider(
+					"路径宽度",
+					0.0,
+					0.5,
+					0.01,
+					float(params.get("path_width", 0.08)),
+					params,
+					"path_width"
+				)
+				_add_check(
+					"沿切线朝向",
+					bool(params.get("follow_tangent", false)),
+					params,
+					"follow_tangent"
+				)
+			else:
+				_add_slider(
+					"范围", 0.0, 1.5, 0.01, float(params.get("spread", 0.6)), params, "spread"
+				)
 			_add_slider(
 				"笔刷大小", 0.02, 0.6, 0.01, float(params.get("stamp", 0.3)), params, "stamp"
 			)
@@ -2806,6 +2837,19 @@ func _on_path_growth_preset_pressed() -> void:
 func _on_mask_growth_preset_pressed() -> void:
 	_push_undo()
 	graph.build_mask_growth_preset()
+	if is_instance_valid(_phase):
+		_phase.set_value_no_signal(1.0)
+	_selected_id = ""
+	_show_params("")
+	_refresh_graph()
+	_refresh_preview()
+
+
+## Builds leaves along a vine: the path is the stem and the placement, and its
+## animated reveal grows the whole plant.
+func _on_vine_preset_pressed() -> void:
+	_push_undo()
+	graph.build_vine_preset()
 	if is_instance_valid(_phase):
 		_phase.set_value_no_signal(1.0)
 	_selected_id = ""

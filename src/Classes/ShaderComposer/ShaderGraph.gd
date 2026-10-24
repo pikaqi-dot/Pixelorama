@@ -619,7 +619,12 @@ static func default_params(type: String) -> Dictionary:
 		"scatter":
 			return {
 				"amount": 24,
+				# 0 scatters inside a radius, 1 places the brush along a path node
+				# connected to the second input, which makes growth animation easy.
+				"mode": 0,
 				"spread": 0.6,
+				"path_width": 0.08,
+				"follow_tangent": true,
 				"stamp": 0.3,
 				"angle": 0.0,
 				"angle_random": 180.0,
@@ -1908,6 +1913,32 @@ static func trim_polyline(flat: PackedVector2Array, amount: float) -> PackedVect
 	return result
 
 
+## Point and direction at [param t] (0..1) along a polyline, measured by length.
+## Used to lay a scatter brush out along a path.
+static func _path_point_at(flat: PackedVector2Array, t: float) -> Dictionary:
+	if flat.is_empty():
+		return {"point": Vector2(0.5, 0.5), "direction": Vector2.RIGHT}
+	if flat.size() < 2:
+		return {"point": flat[0], "direction": Vector2.RIGHT}
+	var total := 0.0
+	for index in range(flat.size() - 1):
+		total += flat[index].distance_to(flat[index + 1])
+	if total <= 0.0:
+		return {"point": flat[0], "direction": Vector2.RIGHT}
+	var wanted := clampf(t, 0.0, 1.0) * total
+	var walked := 0.0
+	for index in range(flat.size() - 1):
+		var segment := flat[index].distance_to(flat[index + 1])
+		if walked + segment >= wanted:
+			var local := 0.0 if segment <= 0.0 else (wanted - walked) / segment
+			return {
+				"point": flat[index].lerp(flat[index + 1], local),
+				"direction": (flat[index + 1] - flat[index]).normalized(),
+			}
+		walked += segment
+	return {"point": flat[flat.size() - 1], "direction": Vector2.RIGHT}
+
+
 ## Grayscale preview of what one node outputs, used by the frame under the nodes
 ## in the graph editor. It evaluates the node the same way the generator does, so
 ## the picture always matches that branch of the graph.
@@ -2216,6 +2247,8 @@ func _scatter_image(
 	var amount := clampi(int(params.get("amount", 24)), 1, 256)
 	var shortest := float(mini(size.x, size.y))
 	var spread := clampf(float(params.get("spread", 0.6)), 0.0, 1.5)
+	var path_width := clampf(float(params.get("path_width", 0.08)), 0.0, 0.5)
+	var follow_tangent := bool(params.get("follow_tangent", true))
 	var stamp := maxf(float(params.get("stamp", 0.3)), 0.01)
 	var angle := deg_to_rad(float(params.get("angle", 0.0)))
 	var angle_random := deg_to_rad(clampf(float(params.get("angle_random", 180.0)), 0.0, 180.0))
@@ -2237,7 +2270,27 @@ func _scatter_image(
 				footprint.x = footprint.y * aspect
 	var center := Vector2(size) * 0.5
 	var reach := Vector2(shortest * spread * 0.5, shortest * spread * 0.5)
-	for _index in amount:
+	# Along a path the brush follows the curve, and the path's own reveal limits
+	# how far it may go, so animating that reveal grows the scatter.
+	var along_path := false
+	var path_points := PackedVector2Array()
+	if int(params.get("mode", 0)) == 1 and not density_id.is_empty():
+		var path_node := get_node_by_id(density_id)
+		if not path_node.is_empty() and str(path_node["type"]) == "path":
+			var path_params: Dictionary = params_for(path_node)
+			var flat := flatten_path(
+				path_params.get("points", []), bool(path_params.get("closed", false))
+			)
+			var reveal := clampf(float(path_params.get("reveal", 1.0)), 0.0, 1.0)
+			if bool(path_params.get("reveal_reverse", false)):
+				flat.reverse()
+			if reveal < 0.9999:
+				flat = trim_polyline(flat, reveal)
+			if flat.size() >= 2:
+				path_points = flat
+				along_path = true
+	var size_vec := Vector2(size)
+	for index in amount:
 		# Every random value is taken before the density test, so hiding one
 		# stamp does not reshuffle the rest of the field.
 		var across := rng.randf_range(-1.0, 1.0)
@@ -2245,11 +2298,23 @@ func _scatter_image(
 		var rotation := angle + deg_to_rad(rng.randf_range(-angle_random, angle_random))
 		var scale := rng.randf_range(scale_min, scale_max)
 		var chance := rng.randf()
-		var position := center + Vector2(across * reach.x, down * reach.y)
+		var position: Vector2
+		if along_path:
+			# Stratified slots keep the stamps spread evenly instead of clumping.
+			var slot := (float(index) + rng.randf_range(0.0, 1.0)) / float(amount)
+			var sample: Dictionary = _path_point_at(path_points, slot)
+			var direction: Vector2 = sample["direction"]
+			if follow_tangent and direction.length_squared() > 0.0:
+				rotation += direction.angle()
+			position = (sample["point"] as Vector2) * size_vec
+			position += Vector2(-direction.y, direction.x) * across * shortest * path_width * 0.5
+		else:
+			position = center + Vector2(across * reach.x, down * reach.y)
 		if align:
 			position = position.round()
-		if not density_id.is_empty() and _eval(density_id, position, size, depth + 1) < chance:
-			continue
+		if not along_path and not density_id.is_empty():
+			if _eval(density_id, position, size, depth + 1) < chance:
+				continue
 		_stamp_source(image, source_id, position, rotation, scale, footprint, size, depth)
 	_path_cache[key] = image
 	return image
@@ -3027,6 +3092,130 @@ func build_scatter_preset(layer_material := true) -> void:
 			"color_a": Color(0.09, 0.18, 0.11, 1.0),
 			"color_mid": Color(0.22, 0.45, 0.27, 1.0),
 			"color_b": Color(0.46, 0.75, 0.4, 1.0),
+			"mid_position": 0.55,
+			"transparent": true,
+		},
+		true
+	)
+
+
+## Leaves growing along a vine: the path is both the stem and the placement for
+## the scatter, and animating its reveal grows the whole thing.
+func build_vine_preset() -> void:
+	nodes.clear()
+	groups.clear()
+	_noise_cache.clear()
+	_noise_signature.clear()
+	var stem := add_node("path", Vector2(20, 40))
+	var brush := add_node("path", Vector2(20, 300))
+	var scatter := add_node("scatter", Vector2(260, 60))
+	var blend := add_node("blend", Vector2(520, 60))
+	var out := add_node("output", Vector2(760, 60))
+	connect_nodes(scatter, blend, 1)
+	connect_nodes(stem, blend, 0)
+	connect_nodes(brush, scatter, 0)
+	connect_nodes(stem, scatter, 1)
+	connect_nodes(blend, out, 0)
+	get_node_by_id(stem)["params"].merge(
+		{
+			"points":
+			[
+				{"point": Vector2(0.12, 0.95), "in": Vector2.ZERO, "out": Vector2(0.05, -0.08)},
+				{
+					"point": Vector2(0.28, 0.76),
+					"in": Vector2(-0.05, 0.06),
+					"out": Vector2(0.06, -0.05),
+				},
+				{
+					"point": Vector2(0.45, 0.82),
+					"in": Vector2(-0.06, -0.02),
+					"out": Vector2(0.06, -0.01),
+				},
+				{
+					"point": Vector2(0.62, 0.56),
+					"in": Vector2(-0.06, 0.05),
+					"out": Vector2(0.06, -0.04),
+				},
+				{
+					"point": Vector2(0.78, 0.62),
+					"in": Vector2(-0.06, -0.03),
+					"out": Vector2(0.05, -0.05),
+				},
+				{"point": Vector2(0.9, 0.26), "in": Vector2(-0.04, 0.06), "out": Vector2.ZERO},
+			],
+			"closed": false,
+			"fill": false,
+			"width": 0.035,
+			"soft": 0.01,
+			"reveal": 1.0,
+			"reveal_reverse": false,
+			"anim":
+			{
+				"param": "reveal",
+				"from": 0.0,
+				"to": 1.0,
+				"start": 0.0,
+				"end": 1.0,
+				"ease": 0.35,
+				"mode": 0,
+			},
+		},
+		true
+	)
+	get_node_by_id(brush)["params"].merge(
+		{
+			"points":
+			[
+				{"point": Vector2(0.5, 0.06), "in": Vector2(0.2, 0.1), "out": Vector2(-0.2, 0.1)},
+				{
+					"point": Vector2(0.94, 0.5),
+					"in": Vector2(-0.16, -0.22),
+					"out": Vector2(-0.16, 0.22),
+				},
+				{
+					"point": Vector2(0.5, 0.94),
+					"in": Vector2(-0.2, -0.1),
+					"out": Vector2(0.2, -0.1),
+				},
+				{
+					"point": Vector2(0.06, 0.5),
+					"in": Vector2(0.16, 0.22),
+					"out": Vector2(0.16, -0.22),
+				},
+			],
+			"closed": true,
+			"fill": true,
+			"width": 0.02,
+			"soft": 0.01,
+			"reveal": 1.0,
+			"reveal_reverse": false,
+		},
+		true
+	)
+	get_node_by_id(scatter)["params"].merge(
+		{
+			"amount": 30,
+			"mode": 1,
+			"spread": 1.0,
+			"path_width": 0.08,
+			"follow_tangent": false,
+			"stamp": 0.13,
+			"angle": 0.0,
+			"angle_random": 40.0,
+			"scale_min": 0.7,
+			"scale_max": 1.2,
+			"seed": 3,
+			"align": true,
+		},
+		true
+	)
+	get_node_by_id(blend)["params"].merge({"op": 1, "factor": 1.0}, true)
+	get_node_by_id(out)["params"].merge(
+		{
+			"steps": 4,
+			"color_a": Color(0.1, 0.24, 0.12, 1.0),
+			"color_mid": Color(0.26, 0.55, 0.24, 1.0),
+			"color_b": Color(0.62, 0.88, 0.42, 1.0),
 			"mid_position": 0.55,
 			"transparent": true,
 		},
