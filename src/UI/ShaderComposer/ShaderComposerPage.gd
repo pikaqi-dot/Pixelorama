@@ -1511,6 +1511,8 @@ func _show_params(id: String) -> void:
 				+ "输入 2 在「区域密度」时是遮罩（越亮越密）；"
 				+ "切到「沿路径」并把路径接到输入 2，笔刷会顺着曲线排布，"
 				+ "动画那个路径的「显示比例」就是边生长边撒。"
+				+ "笔刷只取不透明的形状，像素画本身的颜色不参与，"
+				+ "盖章的颜色由输出节点的渐变和下面的「亮度」决定。"
 			)
 			scatter_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 			scatter_hint.add_theme_font_size_override("font_size", 13)
@@ -1546,6 +1548,9 @@ func _show_params(id: String) -> void:
 				)
 			_add_slider(
 				"笔刷大小", 0.02, 0.6, 0.01, float(params.get("stamp", 0.3)), params, "stamp"
+			)
+			_add_slider(
+				"亮度", 0.0, 1.0, 0.01, float(params.get("level", 1.0)), params, "level"
 			)
 			_begin_section("随机", true)
 			_add_slider(

@@ -22,7 +22,8 @@ const NODE_TYPES := {
 	# instead of being simulated, so any frame can be rendered on its own.
 	"particles": {"label": "像素粒子", "inputs": 0},
 	# Stamps the first input over the canvas at random angles and sizes. The
-	# brush is usually a pixel_art layer, so a leaf turns into a bush.
+	# brush is usually a pixel_art layer, so a leaf turns into a bush. Only the
+	# opacity of the brush is used, so the artwork recolours the stamps.
 	"scatter": {"label": "散布", "inputs": 2},
 	# Input nodes: one draws a vector path, the other reads the project's layers.
 	"path": {"label": "路径", "inputs": 0},
@@ -626,6 +627,10 @@ static func default_params(type: String) -> Dictionary:
 				"path_width": 0.08,
 				"follow_tangent": true,
 				"stamp": 0.3,
+				# Value the opaque part of the brush is stamped with. The brush
+				# only supplies its shape, so this is where the stamps get their
+				# step on the output ramp.
+				"level": 1.0,
 				"angle": 0.0,
 				"angle_random": 180.0,
 				"scale_min": 0.7,
@@ -2267,6 +2272,7 @@ func _scatter_image(
 	var scale_min := maxf(float(params.get("scale_min", 0.7)), 0.05)
 	var scale_max := maxf(float(params.get("scale_max", 1.3)), scale_min)
 	var align := bool(params.get("align", true))
+	var level := clampf(float(params.get("level", 1.0)), 0.0, 1.0)
 	var rng := RandomNumberGenerator.new()
 	rng.seed = int(params.get("seed", 1))
 	# Keep the aspect of a layer brush, so a wide leaf stays wide.
@@ -2333,7 +2339,7 @@ func _scatter_image(
 		if not along_path and not density_id.is_empty():
 			if _eval(density_id, position, size, depth + 1) < chance:
 				continue
-		_stamp_source(image, source_id, position, rotation, scale, footprint, size, depth)
+		_stamp_source(image, source_id, position, rotation, scale, footprint, size, depth, level)
 	_path_cache[key] = image
 	return image
 
@@ -2348,12 +2354,27 @@ func _stamp_source(
 	scale: float,
 	footprint: Vector2,
 	size: Vector2i,
-	depth: int
+	depth: int,
+	level := 1.0
 ) -> void:
 	var scaled := footprint * maxf(scale, 0.01)
 	var reach := int(ceil(scaled.length() * 0.5)) + 1
 	var center := Vector2i(roundi(position.x), roundi(position.y))
 	var size_vec := Vector2(size)
+	# The brush shape is resolved once per stamp. A pixel_art layer supplies its
+	# opacity only, so the colours of the artwork never leak into the pattern and
+	# the output ramp stays in charge of the colour.
+	var mask_image: Image = null
+	var mask_crop := Rect2i()
+	var source_node := get_node_by_id(source_id)
+	if not source_node.is_empty() and str(source_node["type"]) == "pixel_art":
+		var source_params := params_for(source_node)
+		mask_image = _source_image(source_node, source_params)
+		if mask_image == null or mask_image.is_empty():
+			return
+		mask_crop = source_crop(
+			source_params, Vector2i(mask_image.get_width(), mask_image.get_height())
+		)
 	for offset_y in range(-reach, reach + 1):
 		var y := center.y + offset_y
 		if y < 0 or y >= size.y:
@@ -2368,7 +2389,12 @@ func _stamp_source(
 			if absf(brush_local.x) > 0.5 or absf(brush_local.y) > 0.5:
 				continue
 			var uv := (brush_local + Vector2(0.5, 0.5)) * size_vec
-			var value := clampf(_eval(source_id, uv, size, depth + 1), 0.0, 1.0)
+			var mask := (
+				sample_source(mask_image, 1, false, uv, size, mask_crop)
+				if mask_image != null
+				else _eval(source_id, uv, size, depth + 1)
+			)
+			var value := clampf(mask * level, 0.0, 1.0)
 			if value <= 0.0:
 				continue
 			if value > image.get_pixel(x, y).r:
@@ -2720,9 +2746,13 @@ static func describe(node: Dictionary) -> String:
 				int(params.get("depth", 5)), int(params.get("branches", 2))
 			]
 		"scatter":
-			return "%d 枚 · %.0f%%" % [
+			var scatter_text := "%d 枚 · %.0f%%" % [
 				int(params.get("amount", 24)), float(params.get("stamp", 0.3)) * 100.0
 			]
+			var level := float(params.get("level", 1.0))
+			if not is_equal_approx(level, 1.0):
+				scatter_text += " · 亮度 %.2f" % level
+			return scatter_text
 		"particles":
 			return "%d 颗 · %.1fpx" % [
 				int(params.get("count", 48)), float(params.get("size", 1.5))
