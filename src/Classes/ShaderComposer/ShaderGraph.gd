@@ -2950,18 +2950,53 @@ func build_mask_growth_preset() -> void:
 ## A pixel bush built from the current layer: the layer is the brush, and a soft
 ## shape decides where the leaves may land, so they clump instead of carpeting
 ## the whole canvas.
-func build_scatter_preset() -> void:
+func build_scatter_preset(layer_material := true) -> void:
 	nodes.clear()
 	groups.clear()
 	_noise_cache.clear()
 	_noise_signature.clear()
-	var brush := add_node("pixel_art", Vector2(20, 40))
-	var area := add_node("shape", Vector2(20, 260))
+	var brush := add_node("path", Vector2(20, 40)) if not layer_material else add_node("pixel_art", Vector2(20, 40))
+	var area := add_node("shape", Vector2(20, 300))
 	var scatter := add_node("scatter", Vector2(240, 60))
 	var out := add_node("output", Vector2(560, 60))
 	connect_nodes(brush, scatter, 0)
 	connect_nodes(area, scatter, 1)
 	connect_nodes(scatter, out, 0)
+	if not layer_material:
+		# A leaf outline that fills the brush square, so the preset shows a bush
+		# even before anything is drawn on a layer.
+		get_node_by_id(brush)["params"].merge(
+			{
+				"points":
+				[
+					{
+						"point": Vector2(0.5, 0.04),
+						"in": Vector2(0.22, 0.10),
+						"out": Vector2(-0.22, 0.10),
+					},
+					{
+						"point": Vector2(0.94, 0.5),
+						"in": Vector2(-0.16, -0.22),
+						"out": Vector2(-0.16, 0.22),
+					},
+					{
+						"point": Vector2(0.5, 0.96),
+						"in": Vector2(-0.22, -0.10),
+						"out": Vector2(0.22, -0.10),
+					},
+					{
+						"point": Vector2(0.06, 0.5),
+						"in": Vector2(0.16, 0.22),
+						"out": Vector2(0.16, -0.22),
+					},
+				],
+				"closed": true,
+				"fill": true,
+				"width": 0.02,
+				"soft": 0.01,
+			},
+			true
+		)
 	get_node_by_id(area)["params"].merge(
 		{
 			"kind": 0,

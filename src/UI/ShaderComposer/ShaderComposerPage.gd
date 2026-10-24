@@ -978,7 +978,8 @@ func _build_preset_menu() -> void:
 	root.add_item("生长树", 3)
 	root.add_item("路径生长", 4)
 	root.add_item("遮罩生长", 5)
-	root.add_item("散布灌木", 6)
+	root.add_item("灌木丛", 6)
+	root.add_item("灌木丛（程序化）", 7)
 	root.add_separator()
 	root.add_item("保存当前图…", 2)
 	var saved := _list_presets()
@@ -1026,7 +1027,10 @@ func _on_preset_pressed(id: int) -> void:
 		_on_mask_growth_preset_pressed()
 		return
 	if id == 6:
-		_on_scatter_preset_pressed()
+		_on_scatter_preset_pressed(true)
+		return
+	if id == 7:
+		_on_scatter_preset_pressed(false)
 		return
 	if id == 2:
 		_show_preset_dialog()
@@ -2810,11 +2814,12 @@ func _on_mask_growth_preset_pressed() -> void:
 	_refresh_preview()
 
 
-## Builds a pixel bush: the current layer is the brush, scattered inside a soft
-## shape so the leaves clump instead of covering the whole canvas.
-func _on_scatter_preset_pressed() -> void:
+## Builds a pixel bush. With [param layer_material] the current layer is the
+## brush; otherwise a leaf path is drawn for it, so the preset also works on an
+## empty canvas.
+func _on_scatter_preset_pressed(layer_material := true) -> void:
 	_push_undo()
-	graph.build_scatter_preset()
+	graph.build_scatter_preset(layer_material)
 	if is_instance_valid(_phase):
 		_phase.set_value_no_signal(0.0)
 	_selected_id = ""
