@@ -93,8 +93,11 @@ var _node_previews: Dictionary = {}
 ## Nodes whose preview frame the user folded away. Open is the default.
 var _preview_collapsed: Dictionary = {}
 var _preview: TextureRect
-## Picture of the node selected in the side panel.
+## Picture of the node selected in the side panel, and the area that holds it
+## with its backdrop.
 var _node_preview: TextureRect
+var _node_preview_frame: Control
+var _node_preview_back: TextureRect
 ## Holds the graph view and the floating output window, so the window can sit on
 ## top of the graph without being a child of GraphEdit.
 var _graph_host: Control
@@ -225,6 +228,9 @@ func _ready() -> void:
 	mouse_filter = Control.MOUSE_FILTER_STOP
 	graph = ShaderGraphScript.new()
 	_build_ui()
+	# The node preview is built after the output window, so its backdrop gets its
+	# first texture only once the whole interface exists.
+	_apply_preview_backdrop()
 	_apply_layout()
 	resized.connect(_apply_layout)
 	_refresh_graph()
@@ -554,13 +560,24 @@ func _build_ui() -> void:
 	node_preview_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	node_preview_label.add_theme_font_size_override("font_size", TOUCH_FONT_SIZE)
 	_side.add_child(node_preview_label)
+	_node_preview_frame = Control.new()
+	_node_preview_frame.custom_minimum_size = Vector2(200, 120)
+	_side.add_child(_node_preview_frame)
+	# Same backdrop as the output window, so both pictures read the same way.
+	_node_preview_back = TextureRect.new()
+	_node_preview_back.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	_node_preview_back.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+	_node_preview_back.stretch_mode = TextureRect.STRETCH_TILE
+	_node_preview_back.texture_filter = CanvasItem.TEXTURE_FILTER_NEAREST
+	_node_preview_back.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_node_preview_frame.add_child(_node_preview_back)
 	_node_preview = TextureRect.new()
-	_node_preview.custom_minimum_size = Vector2(200, 120)
+	_node_preview.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
 	_node_preview.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
 	_node_preview.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
 	_node_preview.texture_filter = CanvasItem.TEXTURE_FILTER_NEAREST
 	_node_preview.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	_side.add_child(_node_preview)
+	_node_preview_frame.add_child(_node_preview)
 
 	_preview_timer = Timer.new()
 	_preview_timer.one_shot = true
@@ -3672,11 +3689,13 @@ func _apply_preview_backdrop() -> void:
 			texture = _preview_checker
 		_:
 			texture = _preview_backdrop_texture(Color(0.05, 0.05, 0.06))
-	# Both the floating window and the enlarged one use the same colour.
+	# The floating window, the enlarged one and the selected node all share it.
 	if is_instance_valid(_preview_back):
 		_preview_back.texture = texture
 	if is_instance_valid(_preview_big_back):
 		_preview_big_back.texture = texture
+	if is_instance_valid(_node_preview_back):
+		_node_preview_back.texture = texture
 
 
 func _on_preview_backdrop_selected(index: int) -> void:
@@ -3769,8 +3788,10 @@ func _apply_layout() -> void:
 	if is_instance_valid(_preview_panel):
 		_preview_panel.visible = not _zen_mode
 	_fit_preview_panel()
-	if is_instance_valid(_node_preview):
-		_node_preview.custom_minimum_size = _preview_box(150.0, maxf(size.y * 0.3, 90.0))
+	if is_instance_valid(_node_preview_frame):
+		_node_preview_frame.custom_minimum_size = _preview_box(
+			150.0, maxf(size.y * 0.3, 90.0)
+		)
 	if _zen_mode:
 		# The graph is hidden, so the parameters can use the whole height.
 		_graph_host.custom_minimum_size = Vector2.ZERO
