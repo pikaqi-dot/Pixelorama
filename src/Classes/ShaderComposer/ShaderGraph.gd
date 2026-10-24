@@ -25,9 +25,11 @@ const NODE_TYPES := {
 	# brush is usually a pixel_art layer, so a leaf turns into a bush. Only the
 	# opacity of the brush is used, so the artwork recolours the stamps.
 	"scatter": {"label": "散布", "inputs": 2},
-	# Input nodes: one draws a vector path, the other reads the project's layers.
+	# Input nodes: one holds a vector path, the other turns a path or a layer
+	# into pixels. The path carries no stroke of its own, so the canvas decides
+	# how wide the line is and how it tapers.
 	"path": {"label": "路径", "inputs": 0},
-	"pixel_art": {"label": "像素画", "inputs": 0},
+	"pixel_art": {"label": "画布", "inputs": 1},
 	"time": {"label": "时间", "inputs": 0},
 	"wave": {"label": "波纹", "inputs": 1},
 	# Transform group. They all move the sampling position, so they can be
@@ -676,9 +678,6 @@ static func default_params(type: String) -> Dictionary:
 					},
 				],
 				"closed": false,
-				"fill": false,
-				"width": 0.06,
-				"soft": 0.0,
 				# How much of the path is drawn. Animating this grows the stroke
 				# along the curve, which is what a vine or a lightning needs.
 				"reveal": 1.0,
@@ -687,11 +686,19 @@ static func default_params(type: String) -> Dictionary:
 			}
 		"pixel_art":
 			return {
+				# 0 reads the drawing area, 1 draws the path connected to input 1.
+				"source": 0,
 				"layer": 0,
 				"frame_mode": 0,
 				"frame": 0,
 				"channel": 0,
 				"invert": false,
+				# Stroke used in path mode. The profile holds the line width along
+				# the curve, from its start to its end, so a tip can taper out.
+				"width": 0.06,
+				"soft": 0.0,
+				"fill": false,
+				"profile": [1.0, 1.0, 1.0, 1.0, 1.0],
 				# Cropped rectangle in layer pixels. A width or height of 0 means
 				# "up to the edge", so an untouched node reads the whole layer.
 				"crop_x": 0,
@@ -1165,6 +1172,9 @@ func _eval(node_id: String, uv: Vector2, size: Vector2i, depth: int) -> float:
 		# darkest colour of the ramp instead.
 		return transformed * clampf(float(params.get("alpha", 1.0)), 0.0, 1.0)
 	elif node_type == "pixel_art":
+		# The canvas node either reads the drawing area or draws its path input.
+		if int(params.get("source", 0)) == 1:
+			return _canvas_path_value(node, params, uv, size, depth)
 		return _source_value(node, params, uv, size)
 	elif node_type == "time":
 		# Loops of the animation and a per node offset, so several time driven
@@ -1980,36 +1990,127 @@ func _path_image(node: Dictionary, params: Dictionary, size: Vector2i) -> Image:
 	return image
 
 
-## Draws a path node without touching the cache, so the thumbnail on the node can
-## be refreshed as soon as the control points change in the path window.
+## Draws a bare vector path without touching the cache, so the thumbnail on the
+## node can be refreshed as soon as the control points change. A path carries no
+## stroke of its own, so this is a one pixel line; a canvas node draws it with
+## the width and the profile it was given.
 func rasterise_path(params: Dictionary, size: Vector2i) -> Image:
 	var image := Image.create_empty(size.x, size.y, false, Image.FORMAT_RGBA8)
 	image.fill(Color(0.0, 0.0, 0.0, 0.0))
-	var closed := bool(params.get("closed", false))
-	var flat := flatten_path(params.get("points", []), closed)
-	var reveal := clampf(float(params.get("reveal", 1.0)), 0.0, 1.0)
-	if bool(params.get("reveal_reverse", false)):
-		flat.reverse()
-	# A partial stroke is cut by length, so the tip stays on the curve instead
-	# of jumping to the next control point.
-	if reveal < 0.9999:
-		flat = trim_polyline(flat, reveal)
-	# Filling a half drawn outline would close the loop early, so the fill only
-	# appears once the whole path is there.
-	if closed and reveal >= 0.9999 and bool(params.get("fill", false)) and flat.size() >= 3:
-		_fill_polygon(image, flat)
+	var flat := flatten_path(params.get("points", []), bool(params.get("closed", false)))
+	flat = revealed_points(flat, params)
 	if flat.size() >= 2:
-		var shortest := float(mini(size.x, size.y))
-		var radius := maxf(float(params.get("width", 0.06)) * shortest * 0.5, 0.5)
-		var soft := clampf(float(params.get("soft", 0.0)) * shortest, 0.0, radius)
 		var scale := Vector2(size)
 		for index in range(flat.size() - 1):
 			var from_point: Vector2 = flat[index] * scale
 			var to_point: Vector2 = flat[index + 1] * scale
 			var span := maxi(int(ceil(from_point.distance_to(to_point) * 2.0)), 1)
 			for step in span + 1:
-				_stamp_disc(image, from_point.lerp(to_point, float(step) / span), radius, soft)
+				_stamp_disc(image, from_point.lerp(to_point, float(step) / span), 0.5, 0.0)
 	return image
+
+
+## Cuts a flattened path down to the part that is drawn. A partial stroke is cut
+## by length, so the tip stays on the curve instead of jumping to the next
+## control point.
+static func revealed_points(flat: PackedVector2Array, params: Dictionary) -> PackedVector2Array:
+	var points := flat
+	if bool(params.get("reveal_reverse", false)):
+		points = points.duplicate()
+		points.reverse()
+	var reveal := clampf(float(params.get("reveal", 1.0)), 0.0, 1.0)
+	if reveal < 0.9999:
+		points = trim_polyline(points, reveal)
+	return points
+
+
+## Value of a canvas node that draws its path input at [param uv].
+func _canvas_path_value(
+	node: Dictionary, params: Dictionary, uv: Vector2, size: Vector2i, depth: int
+) -> float:
+	if uv.x < 0.0 or uv.y < 0.0 or uv.x >= float(size.x) or uv.y >= float(size.y):
+		return 0.0
+	var image := _canvas_path_image(node, params, size, depth)
+	return image.get_pixel(int(uv.x), int(uv.y)).r
+
+
+## Rasterises the path connected to a canvas node as pixel lines. The path node
+## only supplies the curve, so the width, the softening, the fill and the width
+## profile along the stroke all come from the canvas node.
+func _canvas_path_image(
+	node: Dictionary, params: Dictionary, size: Vector2i, depth: int
+) -> Image:
+	var key := str(node["id"])
+	if _path_cache.has(key):
+		return _path_cache[key]
+	var image := Image.create_empty(size.x, size.y, false, Image.FORMAT_RGBA8)
+	image.fill(Color(0.0, 0.0, 0.0, 0.0))
+	_path_cache[key] = image
+	var path_id := _input_id(node, 0)
+	if path_id.is_empty():
+		return image
+	var path_node := get_node_by_id(path_id)
+	if path_node.is_empty() or str(path_node["type"]) != "path":
+		return image
+	var path_params: Dictionary = params_for(path_node)
+	var closed := bool(path_params.get("closed", false))
+	var flat := flatten_path(path_params.get("points", []), closed)
+	flat = revealed_points(flat, path_params)
+	if flat.size() < 2:
+		return image
+	var shortest := float(mini(size.x, size.y))
+	var base := maxf(float(params.get("width", 0.06)) * shortest * 0.5, 0.5)
+	var soft := clampf(float(params.get("soft", 0.0)) * shortest, 0.0, base)
+	# Filling a half drawn outline would close the loop early, so the fill only
+	# appears once the whole path is there.
+	if closed and bool(params.get("fill", false)) and flat.size() >= 3:
+		var reveal := clampf(float(path_params.get("reveal", 1.0)), 0.0, 1.0)
+		if reveal >= 0.9999:
+			_fill_polygon(image, flat)
+	var profile: Array = params.get("profile", [])
+	var scale := Vector2(size)
+	# The width follows the position along the stroke, which is what makes a
+	# tapered tip or a bulge in the middle possible.
+	var total := 0.0
+	for index in range(flat.size() - 1):
+		total += flat[index].distance_to(flat[index + 1])
+	if total <= 0.0001:
+		return image
+	var walked := 0.0
+	for index in range(flat.size() - 1):
+		var from_point: Vector2 = flat[index] * scale
+		var to_point: Vector2 = flat[index + 1] * scale
+		var segment := flat[index].distance_to(flat[index + 1])
+		var t_from := walked / total
+		walked += segment
+		var t_to := walked / total
+		var radius_from := base * profile_at(profile, t_from)
+		var radius_to := base * profile_at(profile, t_to)
+		var span := maxi(int(ceil(from_point.distance_to(to_point) * 2.0)), 1)
+		for step in span + 1:
+			var ratio := float(step) / float(span)
+			_stamp_disc(
+				image, from_point.lerp(to_point, ratio), lerpf(radius_from, radius_to, ratio), soft
+			)
+	return image
+
+
+## Samples the width profile of a stroke. The array holds evenly spaced values
+## from the start of the curve to its end, so five numbers give four straight
+## ramps.
+static func profile_at(profile: Array, t: float) -> float:
+	if profile.is_empty():
+		return 1.0
+	if profile.size() == 1:
+		return clampf(float(profile[0]), 0.0, 1.0)
+	var position := clampf(t, 0.0, 1.0) * float(profile.size() - 1)
+	var index := mini(int(floorf(position)), profile.size() - 2)
+	var ratio := position - float(index)
+	return lerpf(
+		clampf(float(profile[index]), 0.0, 1.0),
+		clampf(float(profile[index + 1]), 0.0, 1.0),
+		ratio
+	)
 
 
 ## Rasterises the recursive tree at [param size] and caches it per generated
@@ -2280,7 +2381,13 @@ func _scatter_image(
 	var source_node := get_node_by_id(source_id)
 	if not source_node.is_empty() and str(source_node["type"]) == "pixel_art":
 		var brush_params := params_for(source_node)
-		var brush := _source_image(source_node, brush_params)
+		# Only the layer mode of a canvas node has an image with an aspect; a
+		# path brush is square and keeps the square footprint.
+		var brush := (
+			_source_image(source_node, brush_params)
+			if int(brush_params.get("source", 0)) == 0
+			else null
+		)
 		if brush != null and not brush.is_empty():
 			# The aspect of the cropped brush, not of the whole layer, so a
 			# cropped leaf keeps its own shape.
@@ -2369,12 +2476,15 @@ func _stamp_source(
 	var source_node := get_node_by_id(source_id)
 	if not source_node.is_empty() and str(source_node["type"]) == "pixel_art":
 		var source_params := params_for(source_node)
-		mask_image = _source_image(source_node, source_params)
-		if mask_image == null or mask_image.is_empty():
-			return
-		mask_crop = source_crop(
-			source_params, Vector2i(mask_image.get_width(), mask_image.get_height())
-		)
+		# A canvas node in layer mode stamps the opacity of the artwork. In path
+		# mode it already is a mask, so the node value is used as it is.
+		if int(source_params.get("source", 0)) == 0:
+			mask_image = _source_image(source_node, source_params)
+			if mask_image == null or mask_image.is_empty():
+				return
+			mask_crop = source_crop(
+				source_params, Vector2i(mask_image.get_width(), mask_image.get_height())
+			)
 	for offset_y in range(-reach, reach + 1):
 		var y := center.y + offset_y
 		if y < 0 or y >= size.y:
@@ -2664,7 +2774,7 @@ static func sample_source(
 ## the artwork changes underneath it.
 func uses_source() -> bool:
 	for node: Dictionary in nodes:
-		if node["type"] == "pixel_art":
+		if node["type"] == "pixel_art" and int(node["params"].get("source", 0)) == 0:
 			return true
 	return false
 
@@ -2760,10 +2870,16 @@ static func describe(node: Dictionary) -> String:
 		"constant":
 			return "%.2f" % float(params.get("value", 0.5))
 		"path":
-			return "%d 点 · 宽 %.2f" % [
-				(params.get("points", []) as Array).size(), float(params["width"])
-			]
+			var path_text := "%d 点" % (params.get("points", []) as Array).size()
+			if bool(params.get("closed", false)):
+				path_text += " · 闭合"
+			return path_text
 		"pixel_art":
+			if int(params.get("source", 0)) == 1:
+				var line_text := "路径线条 · 宽 %.3f" % float(params.get("width", 0.06))
+				if bool(params.get("fill", false)):
+					line_text += " · 填充"
+				return line_text
 			var channels := ["亮度", "透明度", "反向透明度"]
 			var source_text := "%s · 图层 %d" % [
 				channels[clampi(int(params.get("channel", 0)), 0, 2)],
@@ -3019,8 +3135,10 @@ func build_path_growth_preset() -> void:
 	_noise_cache.clear()
 	_noise_signature.clear()
 	var path := add_node("path", Vector2(120, 80))
-	var out := add_node("output", Vector2(560, 80))
-	connect_nodes(path, out, 0)
+	var canvas := add_node("pixel_art", Vector2(360, 80))
+	var out := add_node("output", Vector2(600, 80))
+	connect_nodes(path, canvas, 0)
+	connect_nodes(canvas, out, 0)
 	get_node_by_id(path)["params"].merge(
 		{
 			"points":
@@ -3044,9 +3162,6 @@ func build_path_growth_preset() -> void:
 				{"point": Vector2(0.86, 0.2), "in": Vector2(-0.05, 0.04), "out": Vector2.ZERO},
 			],
 			"closed": false,
-			"fill": false,
-			"width": 0.05,
-			"soft": 0.02,
 			"reveal": 1.0,
 			"reveal_reverse": false,
 			"anim":
@@ -3059,6 +3174,16 @@ func build_path_growth_preset() -> void:
 				"ease": 0.35,
 				"mode": 0,
 			},
+		},
+		true
+	)
+	# The canvas draws the curve with a taper at both ends.
+	get_node_by_id(canvas)["params"].merge(
+		{
+			"source": 1,
+			"width": 0.05,
+			"soft": 0.02,
+			"profile": [0.35, 1.0, 0.9, 1.0, 0.25],
 		},
 		true
 	)
@@ -3138,7 +3263,7 @@ func build_scatter_preset(layer_material := true) -> void:
 	groups.clear()
 	_noise_cache.clear()
 	_noise_signature.clear()
-	var brush := add_node("path", Vector2(20, 40)) if not layer_material else add_node("pixel_art", Vector2(20, 40))
+	var brush := add_node("pixel_art", Vector2(20, 40))
 	var area := add_node("shape", Vector2(20, 300))
 	var scatter := add_node("scatter", Vector2(240, 60))
 	var out := add_node("output", Vector2(560, 60))
@@ -3146,9 +3271,11 @@ func build_scatter_preset(layer_material := true) -> void:
 	connect_nodes(area, scatter, 1)
 	connect_nodes(scatter, out, 0)
 	if not layer_material:
-		# A leaf outline that fills the brush square, so the preset shows a bush
-		# even before anything is drawn on a layer.
-		get_node_by_id(brush)["params"].merge(
+		# A vector leaf drawn by the canvas, so the preset shows a bush even
+		# before anything is drawn on a layer.
+		var leaf := add_node("path", Vector2(-240, 40))
+		connect_nodes(leaf, brush, 0)
+		get_node_by_id(leaf)["params"].merge(
 			{
 				"points":
 				[
@@ -3174,9 +3301,15 @@ func build_scatter_preset(layer_material := true) -> void:
 					},
 				],
 				"closed": true,
-				"fill": true,
+			},
+			true
+		)
+		get_node_by_id(brush)["params"].merge(
+			{
+				"source": 1,
 				"width": 0.02,
 				"soft": 0.01,
+				"fill": true,
 			},
 			true
 		)
@@ -3225,15 +3358,29 @@ func build_vine_preset() -> void:
 	_noise_cache.clear()
 	_noise_signature.clear()
 	var stem := add_node("path", Vector2(20, 40))
-	var brush := add_node("path", Vector2(20, 300))
-	var scatter := add_node("scatter", Vector2(260, 60))
-	var blend := add_node("blend", Vector2(520, 60))
-	var out := add_node("output", Vector2(760, 60))
-	connect_nodes(scatter, blend, 1)
-	connect_nodes(stem, blend, 0)
+	var stem_draw := add_node("pixel_art", Vector2(300, 40))
+	var brush_path := add_node("path", Vector2(20, 320))
+	var brush := add_node("pixel_art", Vector2(300, 320))
+	var scatter := add_node("scatter", Vector2(560, 60))
+	var blend := add_node("blend", Vector2(820, 60))
+	var out := add_node("output", Vector2(1060, 60))
+	connect_nodes(stem, stem_draw, 0)
+	connect_nodes(stem_draw, blend, 0)
+	connect_nodes(brush_path, brush, 0)
 	connect_nodes(brush, scatter, 0)
 	connect_nodes(stem, scatter, 1)
+	connect_nodes(scatter, blend, 1)
 	connect_nodes(blend, out, 0)
+	# The stem gets thinner towards its tip, so the vine reads as a growing line.
+	get_node_by_id(stem_draw)["params"].merge(
+		{
+			"source": 1,
+			"width": 0.035,
+			"soft": 0.01,
+			"profile": [0.5, 1.0, 1.0, 0.75, 0.35],
+		},
+		true
+	)
 	get_node_by_id(stem)["params"].merge(
 		{
 			"points":
@@ -3262,9 +3409,6 @@ func build_vine_preset() -> void:
 				{"point": Vector2(0.9, 0.26), "in": Vector2(-0.04, 0.06), "out": Vector2.ZERO},
 			],
 			"closed": false,
-			"fill": false,
-			"width": 0.035,
-			"soft": 0.01,
 			"reveal": 1.0,
 			"reveal_reverse": false,
 			"anim":
@@ -3280,7 +3424,7 @@ func build_vine_preset() -> void:
 		},
 		true
 	)
-	get_node_by_id(brush)["params"].merge(
+	get_node_by_id(brush_path)["params"].merge(
 		{
 			"points":
 			[
@@ -3302,11 +3446,17 @@ func build_vine_preset() -> void:
 				},
 			],
 			"closed": true,
-			"fill": true,
-			"width": 0.02,
-			"soft": 0.01,
 			"reveal": 1.0,
 			"reveal_reverse": false,
+		},
+		true
+	)
+	get_node_by_id(brush)["params"].merge(
+		{
+			"source": 1,
+			"width": 0.02,
+			"soft": 0.01,
+			"fill": true,
 		},
 		true
 	)

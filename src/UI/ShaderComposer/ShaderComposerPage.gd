@@ -5,9 +5,14 @@ extends Panel
 ## The page is embedded in the interface instead of being a separate window, and
 ## it blocks drawing while it is open.
 
+## Emitted when the close button hides the page, so the host can switch back to
+## the drawing tab.
+signal page_closed
+
 const ShaderGraphScript := preload("res://src/Classes/ShaderComposer/ShaderGraph.gd")
 const ShaderPathEditorScript := preload("res://src/UI/ShaderComposer/ShaderPathEditor.gd")
 const ShaderValueChangerScript := preload("res://src/UI/ShaderComposer/ShaderValueChanger.gd")
+const ShaderWidthCurveScript := preload("res://src/UI/ShaderComposer/ShaderWidthCurve.gd")
 
 const PORT_COLOR := Color(0.55, 0.8, 1.0)
 const PREVIEW_LIMIT := 256
@@ -186,7 +191,10 @@ func _ready() -> void:
 ## Opens the page. When [param layer] is a layer made by this editor, its graph is
 ## loaded back so the nodes can be adjusted again.
 func open_page(layer: BaseLayer = null) -> void:
-	_can_draw_before = Global.can_draw
+	# Only remember the state before the page took over, so reopening it from a
+	# layer button cannot turn drawing off for good.
+	if not visible:
+		_can_draw_before = Global.can_draw
 	Global.can_draw = false
 	_editing_layer = layer
 	if layer != null and layer.has_meta("shader_graph"):
@@ -217,10 +225,35 @@ func close_page() -> void:
 	_graph_fingers.clear()
 	_graph_gesture = false
 	hide()
+	page_closed.emit()
 
 
 func is_open() -> bool:
 	return visible
+
+
+## Hides the page while another view tab is shown. The graph, the selected node
+## and the layer being edited all stay, so switching back is instant.
+func pause_page() -> void:
+	if not visible:
+		return
+	_preview_timer.stop()
+	if is_instance_valid(_source_timer):
+		_source_timer.stop()
+	if is_instance_valid(_play_timer):
+		_play_timer.stop()
+	if is_instance_valid(_play_button):
+		_play_button.text = "▶"
+	hide()
+	Global.can_draw = _can_draw_before
+
+
+## Shows the page again after [method pause_page], without reloading anything.
+func resume_page() -> void:
+	Global.can_draw = false
+	show()
+	_apply_layout()
+	_refresh_preview()
 
 
 func _build_ui() -> void:
@@ -1589,7 +1622,8 @@ func _show_params(id: String) -> void:
 		"path":
 			var path_hint := Label.new()
 			path_hint.text = (
-				"矢量描边：路径用三次贝塞尔曲线连接，线宽按画布短边比例。"
+				"纯矢量：这里只保存控制点和开合状态，没有线宽。"
+				+ "接到「画布」节点的输入，线宽和粗细曲线都由画布决定。"
 				+ "「显示比例」控制画到哪一段，在下方「动画」里驱动它就是沿路径生长。"
 			)
 			path_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
@@ -1597,11 +1631,6 @@ func _show_params(id: String) -> void:
 			_params_box.add_child(path_hint)
 			_add_path_button(id)
 			_add_check("闭合", bool(params.get("closed", false)), params, "closed", true)
-			_add_check("填充（需闭合）", bool(params.get("fill", false)), params, "fill")
-			_add_slider("线宽", 0.01, 0.3, 0.005, float(params["width"]), params, "width")
-			_add_slider(
-				"羽化", 0.0, 0.2, 0.005, float(params.get("soft", 0.0)), params, "soft"
-			)
 			_add_slider(
 				"显示比例",
 				0.0,
@@ -1618,43 +1647,20 @@ func _show_params(id: String) -> void:
 				"reveal_reverse"
 			)
 		"pixel_art":
-			var source_hint := Label.new()
-			source_hint.text = (
-				"读取主窗口的图层内容，预览会跟着画布自动刷新。"
-				+ "亮度通道会乘上透明度，透明处视为 0。帧号从 0 开始。"
-			)
-			source_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-			source_hint.add_theme_font_size_override("font_size", 13)
-			_params_box.add_child(source_hint)
-			var project := Global.current_project
-			var layer_names: Array = []
-			var layer_index := 0
-			if project != null:
-				for i in project.layers.size():
-					layer_names.append("%d %s" % [i + 1, project.layers[i].name])
-				layer_index = clampi(int(params.get("layer", 0)), 0, layer_names.size() - 1)
-			if layer_names.is_empty():
-				layer_names.append("无图层")
-			_add_option("图层", layer_names, layer_index, params, "layer")
+			# The canvas node either reads the drawing area or draws a path as
+			# pixel lines, so the panel switches with the source.
 			_add_option(
-				"帧",
-				["当前帧", "指定帧", "跟随动画"],
-				int(params.get("frame_mode", 0)),
+				"来源",
+				["画布图像", "路径线条"],
+				int(params.get("source", 0)),
 				params,
-				"frame_mode",
+				"source",
 				true
 			)
-			if int(params.get("frame_mode", 0)) == 1:
-				_add_number("帧号", 0, 999, 1, int(params.get("frame", 0)), params, "frame")
-			_add_option(
-				"通道",
-				["亮度×透明度", "透明度", "反向透明度"],
-				int(params.get("channel", 0)),
-				params,
-				"channel"
-			)
-			_add_check("反相", bool(params.get("invert", false)), params, "invert")
-			_build_source_crop_section(id, params)
+			if int(params.get("source", 0)) == 1:
+				_build_canvas_line_section(id, params)
+			else:
+				_build_canvas_image_section(id, params)
 		"constant":
 			_add_slider("数值", 0.0, 1.0, 0.01, float(params.get("value", 0.5)), params, "value")
 		"time":
@@ -2333,6 +2339,84 @@ func _add_option(
 	)
 	row.add_child(option)
 	_params_target.add_child(row)
+
+
+## Layer reading controls of a canvas node.
+func _build_canvas_image_section(id: String, params: Dictionary) -> void:
+	var source_hint := Label.new()
+	source_hint.text = (
+		"读取主窗口的图层内容，预览会跟着画布自动刷新。"
+		+ "亮度通道会乘上透明度，透明处视为 0。帧号从 0 开始。"
+	)
+	source_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	source_hint.add_theme_font_size_override("font_size", 13)
+	_params_target.add_child(source_hint)
+	var project := Global.current_project
+	var layer_names: Array = []
+	var layer_index := 0
+	if project != null:
+		for i in project.layers.size():
+			layer_names.append("%d %s" % [i + 1, project.layers[i].name])
+		layer_index = clampi(int(params.get("layer", 0)), 0, layer_names.size() - 1)
+	if layer_names.is_empty():
+		layer_names.append("无图层")
+	_add_option("图层", layer_names, layer_index, params, "layer")
+	_add_option(
+		"帧",
+		["当前帧", "指定帧", "跟随动画"],
+		int(params.get("frame_mode", 0)),
+		params,
+		"frame_mode",
+		true
+	)
+	if int(params.get("frame_mode", 0)) == 1:
+		_add_number("帧号", 0, 999, 1, int(params.get("frame", 0)), params, "frame")
+	_add_option(
+		"通道",
+		["亮度×透明度", "透明度", "反向透明度"],
+		int(params.get("channel", 0)),
+		params,
+		"channel"
+	)
+	_add_check("反相", bool(params.get("invert", false)), params, "invert")
+	_build_source_crop_section(id, params)
+
+
+## Stroke controls of a canvas node in path mode.
+func _build_canvas_line_section(id: String, params: Dictionary) -> void:
+	var line_hint := Label.new()
+	line_hint.text = (
+		"把「路径」节点接到输入 1，这里把曲线画成像素线条。"
+		+ "线宽按画布短边比例；下面的曲线是线宽沿路径的变化。"
+	)
+	line_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	line_hint.add_theme_font_size_override("font_size", 13)
+	_params_target.add_child(line_hint)
+	_add_slider("线宽", 0.005, 0.3, 0.005, float(params.get("width", 0.06)), params, "width")
+	_add_slider("羽化", 0.0, 0.2, 0.005, float(params.get("soft", 0.0)), params, "soft")
+	_add_check("闭合填充（路径需闭合）", bool(params.get("fill", false)), params, "fill")
+	var curve_hint := Label.new()
+	curve_hint.text = "线宽曲线：横轴是从起点到终点的位置，纵轴是线宽倍率，拖动圆点调整。"
+	curve_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	curve_hint.add_theme_font_size_override("font_size", 13)
+	_params_target.add_child(curve_hint)
+	_add_width_profile(id, params)
+
+
+## Curve strip for the width along the stroke. The values live in the node
+## parameters, so the graph stays a plain dictionary.
+func _add_width_profile(id: String, params: Dictionary) -> void:
+	var curve := ShaderWidthCurveScript.new()
+	curve.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	curve.set_profile(params.get("profile", []))
+	curve.changed.connect(
+		func(values: Array) -> void:
+			_push_undo("%s:profile" % id)
+			_mark_preview_dirty(id)
+			params["profile"] = values
+			_schedule_preview()
+	)
+	_params_target.add_child(curve)
 
 
 ## Crop rectangle of the imported art, with a preview of what the node really
