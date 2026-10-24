@@ -108,7 +108,9 @@ var _preview_frame: Control
 ## Backdrop of the picture: solid black, solid white or a checker for transparency.
 var _preview_back: TextureRect
 var _preview_back_choice: OptionButton
-var _preview_backdrop := 0
+## Transparent first: a preview of a mask is mostly empty, and the checker is the
+## only backdrop that shows where nothing was drawn.
+var _preview_backdrop := 2
 var _preview_solid_black: ImageTexture
 var _preview_solid_white: ImageTexture
 var _preview_checker: ImageTexture
@@ -819,19 +821,38 @@ func _make_node_preview(node: Dictionary) -> Control:
 	for side in ["left", "right", "top", "bottom"]:
 		body.add_theme_constant_override("margin_" + side, 3)
 	frame.add_child(body)
+	# The picture is transparent wherever the node outputs nothing, so it needs
+	# the same backdrop as the other previews instead of the node's own colour.
+	# A square box, kept centred even when the node is wider than the picture.
+	var board := CenterContainer.new()
+	board.custom_minimum_size = Vector2(NODE_PREVIEW_SIZE, NODE_PREVIEW_SIZE)
+	body.add_child(board)
+	var picture := Control.new()
+	picture.custom_minimum_size = Vector2(NODE_PREVIEW_SIZE, NODE_PREVIEW_SIZE)
+	board.add_child(picture)
+	var back := TextureRect.new()
+	back.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	back.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+	back.stretch_mode = TextureRect.STRETCH_TILE
+	back.texture_filter = CanvasItem.TEXTURE_FILTER_NEAREST
+	back.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	back.texture = _backdrop_texture()
+	picture.add_child(back)
 	var thumb := TextureRect.new()
-	thumb.custom_minimum_size = Vector2(NODE_PREVIEW_SIZE, NODE_PREVIEW_SIZE)
+	thumb.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
 	thumb.texture_filter = CanvasItem.TEXTURE_FILTER_NEAREST
 	thumb.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
 	thumb.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
 	thumb.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	body.add_child(thumb)
+	picture.add_child(thumb)
 	column.add_child(frame)
 
 	var collapsed := bool(_preview_collapsed.get(node_id, false))
 	frame.visible = not collapsed
 	toggle.text = "▸ 预览" if collapsed else "▾ 预览"
-	_node_previews[node_id] = {"frame": frame, "thumb": thumb, "toggle": toggle}
+	_node_previews[node_id] = {
+		"frame": frame, "thumb": thumb, "toggle": toggle, "back": back
+	}
 	if not collapsed:
 		thumb.texture = ImageTexture.create_from_image(
 			graph.preview_node(node_id, Vector2i(NODE_PREVIEW_SIZE, NODE_PREVIEW_SIZE))
@@ -3694,26 +3715,35 @@ func _preview_box(width: float, max_height: float) -> Vector2:
 	return Vector2(roundf(width), roundf(height))
 
 
-## Backdrop of the floating picture: solid black, solid white, or a checker that
-## shows where the output is transparent.
-func _apply_preview_backdrop() -> void:
-	var texture: Texture2D = null
+## Backdrop of the pictures: solid black, solid white, or a checker that shows
+## where the output is transparent.
+func _backdrop_texture() -> Texture2D:
 	match _preview_backdrop:
 		1:
-			texture = _preview_backdrop_texture(Color(0.93, 0.93, 0.95))
+			return _preview_backdrop_texture(Color(0.93, 0.93, 0.95))
 		2:
 			if _preview_checker == null:
 				_preview_checker = _make_checker_texture()
-			texture = _preview_checker
+			return _preview_checker
 		_:
-			texture = _preview_backdrop_texture(Color(0.05, 0.05, 0.06))
-	# The floating window, the enlarged one and the selected node all share it.
+			return _preview_backdrop_texture(Color(0.05, 0.05, 0.06))
+
+
+func _apply_preview_backdrop() -> void:
+	var texture := _backdrop_texture()
+	# The floating window, the enlarged one, the selected node and the thumbnail
+	# under every node all share it, so the same picture reads the same way.
 	if is_instance_valid(_preview_back):
 		_preview_back.texture = texture
 	if is_instance_valid(_preview_big_back):
 		_preview_big_back.texture = texture
 	if is_instance_valid(_node_preview_back):
 		_node_preview_back.texture = texture
+	for node_id: String in _node_previews.keys():
+		var entry: Dictionary = _node_previews[node_id]
+		var back: TextureRect = entry.get("back", null)
+		if is_instance_valid(back):
+			back.texture = texture
 
 
 func _on_preview_backdrop_selected(index: int) -> void:

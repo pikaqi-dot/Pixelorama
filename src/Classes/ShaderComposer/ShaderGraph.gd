@@ -195,6 +195,10 @@ const NODE_GROUP_COLORS := {
 ## Coordinates closer than this to a pixel are treated as that pixel. Only used to
 ## cancel the floating point noise of rotations by right angles.
 const SNAP_STEP := 0.000001
+## Value below which a node counts as producing nothing. The previews leave those
+## pixels transparent, so the backdrop of the frame shows through instead of a
+## black block that hides what the node actually covers.
+const PREVIEW_EMPTY := 0.004
 
 ## Nodes of the graph, as dictionaries: id, type, position, params, inputs.
 var nodes: Array[Dictionary] = []
@@ -2017,7 +2021,8 @@ func preview_node(node_id: String, size: Vector2i) -> Image:
 	for y in size.y:
 		for x in size.x:
 			var value := clampf(_eval(node_id, Vector2(x, y), size, 0), 0.0, 1.0)
-			image.set_pixel(x, y, Color(value, value, value, 1.0))
+			var alpha := 1.0 if value > PREVIEW_EMPTY else 0.0
+			image.set_pixel(x, y, Color(value, value, value, alpha))
 	return image
 
 
