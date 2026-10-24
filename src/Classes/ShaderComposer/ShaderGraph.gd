@@ -16,6 +16,9 @@ const NODE_TYPES := {
 	# A recursive tree, rasterised once per frame. Growth reveals it level by
 	# level, which is what makes the growing animation possible.
 	"tree": {"label": "树木", "inputs": 0},
+	# A seeded pixel particle system. Positions are worked out from the phase
+	# instead of being simulated, so any frame can be rendered on its own.
+	"particles": {"label": "像素粒子", "inputs": 0},
 	# Input nodes: one draws a vector path, the other reads the project's layers.
 	"path": {"label": "路径", "inputs": 0},
 	"pixel_art": {"label": "像素画", "inputs": 0},
@@ -82,6 +85,9 @@ const BLEND_OPS := ["Mix", "Add", "Multiply", "Screen", "Difference"]
 const POLAR_MODES := ["矩形 → 极坐标", "极坐标 → 矩形"]
 const ECHO_MODES := ["最大值（拖影）", "平均值（残影）"]
 const PATH_SHAPES := ["圆形", "水平", "垂直", "正弦", "方形", "8 字", "自定义"]
+## Where the pixel particles are born.
+const PARTICLE_SPAWN := ["底部升起", "顶部下落", "中心爆发", "全画布"]
+const PARTICLE_SHAPES := ["方形", "圆形"]
 ## Shape index that uses the control points edited in the path editor.
 const PATH_CUSTOM := 6
 ## Prefix of the ids of groups, so a group node can be told from a real node.
@@ -100,7 +106,8 @@ const DITHER_BITS := [1, 2, 3]
 const NODE_GROUPS := [
 	{
 		"label": "生成",
-		"types": ["noise", "gradient", "radial", "checker", "constant", "tree"],
+		"types":
+		["noise", "gradient", "radial", "checker", "constant", "tree", "particles"],
 	},
 	{"label": "输入", "types": ["path", "pixel_art"]},
 	{"label": "动态", "types": ["time", "wave"]},
@@ -521,6 +528,23 @@ static func default_params(type: String) -> Dictionary:
 				"leaf_size": 1.0,
 				"soft": 0.0,
 			}
+		"particles":
+			return {
+				"seed": 1,
+				"count": 48,
+				"size": 1.5,
+				"spawn": 0,
+				"angle": -90.0,
+				"spread": 30.0,
+				"speed": 0.5,
+				"gravity": 0.0,
+				"turbulence": 0.0,
+				"lifetime": 0.8,
+				"fade": true,
+				"twinkle": 0.0,
+				"shape": 0,
+				"soft": 0.0,
+			}
 		"path":
 			return {
 				"points":
@@ -774,6 +798,10 @@ func _eval(node_id: String, uv: Vector2, size: Vector2i, depth: int) -> float:
 			if uv.x < 0.0 or uv.y < 0.0 or uv.x >= float(size.x) or uv.y >= float(size.y):
 				return 0.0
 			return _tree_image(node, size).get_pixel(int(uv.x), int(uv.y)).r
+		"particles":
+			if uv.x < 0.0 or uv.y < 0.0 or uv.x >= float(size.x) or uv.y >= float(size.y):
+				return 0.0
+			return _particles_image(node, size).get_pixel(int(uv.x), int(uv.y)).r
 		"path":
 			# The stroke is rasterised once per generated image, so this is a lookup.
 			if uv.x < 0.0 or uv.y < 0.0 or uv.x >= float(size.x) or uv.y >= float(size.y):
@@ -1714,6 +1742,113 @@ func _grow_branch(
 		)
 
 
+## True when the particle field depends on the phase. Shared by the renderer and
+## [method uses_time], so the preview and the generated layer always agree.
+static func particles_animate(params: Dictionary) -> bool:
+	if absf(float(params.get("speed", 0.0))) > 0.0:
+		return true
+	if absf(float(params.get("gravity", 0.0))) > 0.0:
+		return true
+	if float(params.get("turbulence", 0.0)) > 0.0:
+		return true
+	return float(params.get("twinkle", 0.0)) > 0.0
+
+
+## Rasterises the pixel particles at [param size] and caches the result per
+## generated image. A particle is placed from its own phase offset instead of
+## being simulated frame by frame, so any frame can be rendered on its own and
+## the sequence loops exactly.
+func _particles_image(node: Dictionary, size: Vector2i) -> Image:
+	var params: Dictionary = node["params"]
+	var phase := clampf(time, 0.0, 1.0)
+	var key := "particles:%s:%d:%.3f:%dx%d" % [
+		node["id"], var_to_str(params).hash(), phase, size.x, size.y
+	]
+	if _path_cache.has(key):
+		return _path_cache[key]
+	var image := Image.create_empty(size.x, size.y, false, Image.FORMAT_RGBA8)
+	image.fill(Color(0.0, 0.0, 0.0, 0.0))
+	var count := clampi(int(params.get("count", 48)), 1, 256)
+	var shortest := float(mini(size.x, size.y))
+	var size_vec := Vector2(size)
+	var rng := RandomNumberGenerator.new()
+	rng.seed = int(params.get("seed", 1))
+	var angle := deg_to_rad(float(params.get("angle", -90.0)))
+	var spread := deg_to_rad(clampf(float(params.get("spread", 30.0)), 0.0, 180.0))
+	var speed := float(params.get("speed", 0.5))
+	var gravity := float(params.get("gravity", 0.0))
+	var turbulence := clampf(float(params.get("turbulence", 0.0)), 0.0, 1.0)
+	var lifetime := clampf(float(params.get("lifetime", 0.8)), 0.1, 1.0)
+	var fade := bool(params.get("fade", true))
+	var twinkle := clampf(float(params.get("twinkle", 0.0)), 0.0, 1.0)
+	var shape := int(params.get("shape", 0))
+	var radius := maxf(float(params.get("size", 1.5)), 0.5)
+	var soft := clampf(float(params.get("soft", 0.0)) * shortest, 0.0, 2.0)
+	var spawn_mode := int(params.get("spawn", 0))
+	# A field that never moves is a plain scattered pattern: every particle shows
+	# up for good instead of blinking in and out of the lifetime window.
+	var animated := particles_animate(params)
+	for index in count:
+		# Every random value is taken before the visibility test, so a hidden
+		# particle never shifts the randomness of the ones after it.
+		var particle_angle := angle + rng.randf_range(-1.0, 1.0) * spread
+		var particle_speed := speed * rng.randf_range(0.65, 1.35)
+		var offset := rng.randf()
+		var spawn := _particle_spawn(spawn_mode, rng.randf(), rng.randf(), size_vec)
+		var age_phase := fposmod(phase + offset, 1.0) if animated else 0.0
+		if animated and age_phase > lifetime:
+			continue
+		var age := age_phase / lifetime if animated else 0.0
+		var position := (
+			spawn
+			+ Vector2.from_angle(particle_angle) * particle_speed * shortest * age_phase
+			+ Vector2(0.0, 0.5 * gravity * shortest * age_phase * age_phase)
+		)
+		if turbulence > 0.0:
+			position += (
+				Vector2(
+					sin(age_phase * TAU * 2.0 + offset * 31.0),
+					cos(age_phase * TAU * 3.0 + offset * 17.0)
+				)
+				* turbulence
+				* shortest
+				* 0.08
+			)
+		var brightness := 1.0
+		if fade and animated:
+			# Fade in at birth and out towards the end, so a recycled particle
+			# never pops into view.
+			brightness = clampf(age / 0.12, 0.0, 1.0) * (1.0 - age)
+		if twinkle > 0.0:
+			brightness *= (
+				1.0 - twinkle * 0.5 * (1.0 - sin(phase * TAU * 4.0 + offset * 40.0))
+			)
+		if brightness <= 0.004:
+			continue
+		if shape == 1:
+			_stamp_disc(image, position, radius, soft, brightness)
+		else:
+			_stamp_square(image, position, radius, brightness)
+	_path_cache[key] = image
+	return image
+
+
+## Birth point of a particle, in pixels. The two random values are shared by all
+## the modes, so switching the mode does not reshuffle the whole field.
+static func _particle_spawn(
+	mode: int, across: float, down: float, size_vec: Vector2
+) -> Vector2:
+	match mode:
+		1:  # 顶部下落
+			return Vector2(across * size_vec.x, -1.0)
+		2:  # 中心爆发
+			return size_vec * 0.5 + (Vector2(across, down) - Vector2(0.5, 0.5)) * size_vec * 0.06
+		3:  # 全画布
+			return Vector2(across * size_vec.x, down * size_vec.y)
+	# 底部升起
+	return Vector2(across * size_vec.x, size_vec.y + 1.0)
+
+
 ## Even odd scanline fill of a closed path, in 0..1 canvas units.
 static func _fill_polygon(image: Image, flat: PackedVector2Array) -> void:
 	var scale := Vector2(image.get_width(), image.get_height())
@@ -1793,6 +1928,22 @@ static func _stamp_disc(
 				value = brightness * clampf((radius - distance) / soft, 0.0, 1.0)
 			if value > image.get_pixel(x, y).r:
 				image.set_pixel(x, y, Color(value, value, value, 1.0))
+
+
+## Stamps a square of pixels, which is what a pixel particle is made of.
+static func _stamp_square(
+	image: Image, center: Vector2, radius: float, brightness: float
+) -> void:
+	var span := maxi(int(round(radius * 2.0)), 1)
+	var start := Vector2i(roundi(center.x), roundi(center.y)) - Vector2i(span / 2, span / 2)
+	for offset_y in span:
+		for offset_x in span:
+			var x := start.x + offset_x
+			var y := start.y + offset_y
+			if x < 0 or y < 0 or x >= image.get_width() or y >= image.get_height():
+				continue
+			if brightness > image.get_pixel(x, y).r:
+				image.set_pixel(x, y, Color(brightness, brightness, brightness, 1.0))
 
 
 ## Stamps a line of discs, the way a branch of the tree is drawn.
@@ -1954,6 +2105,10 @@ static func describe(node: Dictionary) -> String:
 			return "深 %d · %d 叉" % [
 				int(params.get("depth", 5)), int(params.get("branches", 2))
 			]
+		"particles":
+			return "%d 颗 · %.1fpx" % [
+				int(params.get("count", 48)), float(params.get("size", 1.5))
+			]
 		"constant":
 			return "%.2f" % float(params.get("value", 0.5))
 		"path":
@@ -2088,6 +2243,8 @@ func uses_time() -> bool:
 				return true
 			if float(tree_params.get("sway", 0.0)) > 0.0:
 				return true
+		if node["type"] == "particles" and particles_animate(node["params"]):
+			return true
 		if node["type"] == "pixel_art" and int(node["params"].get("frame_mode", 0)) == 2:
 			return true
 	return false

@@ -1149,6 +1149,53 @@ func _show_params(id: String) -> void:
 				"sway_speed"
 			)
 			_end_section()
+		"particles":
+			var particles_hint := Label.new()
+			particles_hint.text = (
+				"像素粒子：位置按相位直接算出，不存状态，所以任意一帧都能单独生成、循环精确。"
+				+ "底部升起做火花/尘埃，顶部下落做雪/雨，全画布做萤火。"
+			)
+			particles_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+			particles_hint.add_theme_font_size_override("font_size", 13)
+			_params_box.add_child(particles_hint)
+			_add_number("种子", 0, 9999, 1, int(params.get("seed", 1)), params, "seed")
+			_add_number("数量", 1, 256, 1, int(params.get("count", 48)), params, "count")
+			_add_slider("大小", 0.5, 6.0, 0.5, float(params.get("size", 1.5)), params, "size")
+			_begin_section("发射", true)
+			_add_option(
+				"起点", ShaderGraphScript.PARTICLE_SPAWN, int(params.get("spawn", 0)), params, "spawn"
+			)
+			_add_slider(
+				"方向", -180.0, 180.0, 1.0, float(params.get("angle", -90.0)), params, "angle"
+			)
+			_add_slider(
+				"扩散", 0.0, 180.0, 1.0, float(params.get("spread", 30.0)), params, "spread"
+			)
+			_add_slider(
+				"速度", -2.0, 2.0, 0.05, float(params.get("speed", 0.5)), params, "speed"
+			)
+			_add_slider(
+				"重力", -2.0, 2.0, 0.05, float(params.get("gravity", 0.0)), params, "gravity"
+			)
+			_end_section()
+			_begin_section("运动", true)
+			_add_slider(
+				"湍流", 0.0, 1.0, 0.01, float(params.get("turbulence", 0.0)), params, "turbulence"
+			)
+			_add_slider(
+				"寿命", 0.1, 1.0, 0.01, float(params.get("lifetime", 0.8)), params, "lifetime"
+			)
+			_add_check("淡入淡出", bool(params.get("fade", true)), params, "fade")
+			_add_slider(
+				"闪烁", 0.0, 1.0, 0.01, float(params.get("twinkle", 0.0)), params, "twinkle"
+			)
+			_end_section()
+			_begin_section("外观", false)
+			_add_option(
+				"形状", ShaderGraphScript.PARTICLE_SHAPES, int(params.get("shape", 0)), params, "shape"
+			)
+			_add_slider("柔边", 0.0, 0.2, 0.005, float(params.get("soft", 0.0)), params, "soft")
+			_end_section()
 		"path":
 			var path_hint := Label.new()
 			path_hint.text = (
