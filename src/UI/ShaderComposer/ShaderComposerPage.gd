@@ -12,6 +12,17 @@ const PORT_COLOR := Color(0.55, 0.8, 1.0)
 const PREVIEW_LIMIT := 256
 ## Preview size for graphs that sample neighbours, which are much slower.
 const PREVIEW_LIMIT_HEAVY := 128
+## Longest edge while the animation plays. A smaller picture is far cheaper per
+## frame, and the preview is on screen at a similar size anyway.
+const PREVIEW_LIMIT_PLAYBACK := 160
+## Time one preview refresh may take. The preview size adapts to the device, so
+## a slow phone draws fewer pixels instead of freezing the interface.
+const PREVIEW_BUDGET_MSEC := 180.0
+## Tighter budget while playing, where a steady frame rate matters more.
+const PLAYBACK_BUDGET_MSEC := 90.0
+## Longest time one slice of the preview may take before the frame is handed
+## back, so input and scrolling stay responsive while a graph is painted.
+const PREVIEW_SLICE_MSEC := 12.0
 ## Minimum height of every interactive row, which keeps it usable with a finger.
 const TOUCH_SIZE := 40
 const TOUCH_FONT_SIZE := 15
@@ -36,6 +47,9 @@ const SOURCE_REFRESH_MSEC := 600
 const HOLD_MENU_MSEC := 500
 ## The path window takes most of the screen, the control points need the room.
 const PATH_POPUP_RATIO := 0.9
+## Smallest height of the control point canvas. When the screen is shorter than
+## the window needs, the canvas stops shrinking here and the window scrolls.
+const PATH_EDITOR_MIN_HEIGHT := 110
 ## Side of the preview drawn in the frame under every node, in pixels.
 const NODE_PREVIEW_SIZE := 56
 
@@ -82,6 +96,10 @@ var _param_filter_edit: LineEdit
 var _params_target: VBoxContainer
 ## Sections of the current node, so the filter can fold them.
 var _param_sections: Array[Dictionary] = []
+## Numeric parameters of the node being shown, by key. The animation section is
+## built from this, so every slider and number can be animated without a hand
+## written list per node type.
+var _animatable: Dictionary = {}
 ## Long press on a node opens a context menu.
 var _node_menu: PopupMenu
 var _hold_id := ""
@@ -109,6 +127,19 @@ var _frame_count: SpinBox
 var _play_timer: Timer
 var _play_button: Button
 var _playhead := 0.0
+## Rotates through the node thumbnails while the animation plays, so only one
+## of them is redrawn per tick.
+var _thumbnail_index := 0
+## Measured size and duration of the last preview, used to keep every refresh
+## inside a time budget on slower devices.
+var _preview_side := 0
+var _preview_msec := 0.0
+## A sliced preview is in flight; new requests are merged into it.
+var _preview_busy := false
+var _preview_pending := false
+## Pauses previews while a one shot generation runs, so its caches are not
+## cleared halfway through.
+var _suspend_preview := false
 var _editing_layer: BaseLayer
 ## Header button, whose label changes when an existing layer is being edited.
 var _add_layer_button: Button
@@ -879,6 +910,8 @@ func _build_preset_menu() -> void:
 	root.add_item("默认图", 0)
 	root.add_item("像素海面", 1)
 	root.add_item("生长树", 3)
+	root.add_item("路径生长", 4)
+	root.add_item("遮罩生长", 5)
 	root.add_separator()
 	root.add_item("保存当前图…", 2)
 	var saved := _list_presets()
@@ -919,6 +952,12 @@ func _on_preset_pressed(id: int) -> void:
 	if id == 3:
 		_on_tree_preset_pressed()
 		return
+	if id == 4:
+		_on_path_growth_preset_pressed()
+		return
+	if id == 5:
+		_on_mask_growth_preset_pressed()
+		return
 	if id == 2:
 		_show_preset_dialog()
 		return
@@ -946,6 +985,15 @@ func _show_export_dialog() -> void:
 ## Writes three files: the scene, the evaluator with the graph baked in, and a
 ## preview PNG. The folder is self contained, so it can be copied into a game.
 func _export_scene() -> void:
+	# A sliced preview may still own the per frame caches, so let it finish
+	# before the one shot generation clears them.
+	_suspend_preview = true
+	await _wait_for_preview()
+	_export_scene_now()
+	_suspend_preview = false
+
+
+func _export_scene_now() -> void:
 	var typed := _export_name.text.strip_edges()
 	if typed.is_empty():
 		Global.notification_label("请先给场景起个名字")
@@ -1186,6 +1234,7 @@ func _on_node_deselected(node: Node) -> void:
 func _show_params(id: String) -> void:
 	_params_target = _params_box
 	_param_sections.clear()
+	_animatable.clear()
 	for child in _params_box.get_children():
 		_params_box.remove_child(child)
 		child.queue_free()
@@ -1259,8 +1308,8 @@ func _show_params(id: String) -> void:
 			var tree_hint := Label.new()
 			tree_hint.text = (
 				"递归生长的树：每个枝头再分叉一次，生长值按层展开。"
-				+ "勾选「随预览时间生长」后，用 ▶ 预览或生成多帧就是生长动画。"
-				+ "树干用较低的值、树叶用 1.0，颜色由输出节点的三段色阶决定。"
+				+ "用下方「动画」驱动「生长」就是生长动画，也可以用「随预览时间生长」跑完整条时间线。"
+				+ "颜色由输出节点的三段色阶决定。"
 			)
 			tree_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 			tree_hint.add_theme_font_size_override("font_size", 13)
@@ -1365,7 +1414,7 @@ func _show_params(id: String) -> void:
 			var path_hint := Label.new()
 			path_hint.text = (
 				"矢量描边：路径用三次贝塞尔曲线连接，线宽按画布短边比例。"
-				+ "输出的是描边蒙版，接到输出节点或混合节点使用。"
+				+ "「显示比例」控制画到哪一段，在下方「动画」里驱动它就是沿路径生长。"
 			)
 			path_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 			path_hint.add_theme_font_size_override("font_size", 13)
@@ -1376,6 +1425,21 @@ func _show_params(id: String) -> void:
 			_add_slider("线宽", 0.01, 0.3, 0.005, float(params["width"]), params, "width")
 			_add_slider(
 				"羽化", 0.0, 0.2, 0.005, float(params.get("soft", 0.0)), params, "soft"
+			)
+			_add_slider(
+				"显示比例",
+				0.0,
+				1.0,
+				0.01,
+				float(params.get("reveal", 1.0)),
+				params,
+				"reveal"
+			)
+			_add_check(
+				"从末端生长",
+				bool(params.get("reveal_reverse", false)),
+				params,
+				"reveal_reverse"
 			)
 		"pixel_art":
 			var source_hint := Label.new()
@@ -1814,6 +1878,7 @@ func _show_params(id: String) -> void:
 				params,
 				"alpha_from_value"
 			)
+	_build_animation_section(params)
 	_apply_param_filter()
 
 
@@ -1841,6 +1906,107 @@ func _begin_section(title: String, expanded := true) -> void:
 
 func _end_section() -> void:
 	_params_target = _params_box
+
+
+## Remembers a numeric parameter of the node being shown, so the animation
+## section can offer it. Slider and spin box rows both end up here, which is why
+## no node needs its own animation list.
+func _register_animatable(
+	label_text: String,
+	key: String,
+	min_value: float,
+	max_value: float,
+	step: float,
+	integer: bool,
+	enabled: bool
+) -> void:
+	if not enabled or _selected_id.is_empty():
+		return
+	if _animatable.has(key):
+		return
+	_animatable[key] = {
+		"label": label_text,
+		"min": min_value,
+		"max": max_value,
+		"step": step,
+		"integer": integer,
+	}
+
+
+## Animation controls for one numeric parameter of the selected node. Any slider
+## of any node can be picked, so growth, masks, warps and colours all animate the
+## same way instead of each node having a fixed, built in animation.
+func _build_animation_section(params: Dictionary) -> void:
+	if _animatable.is_empty():
+		return
+	var anim: Dictionary = {}
+	var stored: Variant = params.get("anim", null)
+	if stored is Dictionary and _animatable.has(str((stored as Dictionary).get("param", ""))):
+		anim = stored
+	_begin_section("动画（随预览时间）", true)
+	var keys: Array = _animatable.keys()
+	var labels: Array = ["（不启用）"]
+	for key in keys:
+		labels.append(str(_animatable[key]["label"]))
+	var row := HBoxContainer.new()
+	var label := Label.new()
+	label.text = "参数"
+	label.custom_minimum_size = Vector2(84, 0)
+	label.add_theme_font_size_override("font_size", 14)
+	row.add_child(label)
+	var option := OptionButton.new()
+	for text in labels:
+		option.add_item(str(text))
+	option.select(0 if anim.is_empty() else keys.find(str(anim["param"])) + 1)
+	option.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	option.custom_minimum_size = Vector2(0, TOUCH_SIZE)
+	option.add_theme_font_size_override("font_size", TOUCH_FONT_SIZE)
+	option.item_selected.connect(
+		func(index: int) -> void:
+			if _selected_id.is_empty():
+				return
+			_push_undo("%s:anim" % _selected_id)
+			if index <= 0 or index > keys.size():
+				params.erase("anim")
+			else:
+				var key := str(keys[index - 1])
+				var start_spec: Dictionary = _animatable[key]
+				params["anim"] = {
+					"param": key,
+					"from": float(start_spec["min"]),
+					"to": float(start_spec["max"]),
+					"start": 0.0,
+					"end": 1.0,
+					"ease": 0.4,
+					"mode": 0,
+				}
+			_schedule_preview()
+			call_deferred("_show_params", _selected_id)
+	)
+	row.add_child(option)
+	_params_target.add_child(row)
+	if anim.is_empty():
+		var hint := Label.new()
+		hint.text = (
+			"选一个数值参数，再用预览滑杆或 ▶ 播放推进时间；"
+			+ "任何滑杆都能动画，生长只是其中一种用法。"
+		)
+		hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+		hint.add_theme_font_size_override("font_size", 13)
+		_params_target.add_child(hint)
+		_end_section()
+		return
+	var spec: Dictionary = _animatable[str(anim["param"])]
+	var step := maxf(float(spec["step"]), 0.001)
+	var low := float(spec["min"])
+	var high := float(spec["max"])
+	_add_slider("起始值", low, high, step, float(anim.get("from", low)), anim, "from", false)
+	_add_slider("结束值", low, high, step, float(anim.get("to", high)), anim, "to", false)
+	_add_slider("开始于", 0.0, 1.0, 0.01, float(anim.get("start", 0.0)), anim, "start", false)
+	_add_slider("结束于", 0.0, 1.0, 0.01, float(anim.get("end", 1.0)), anim, "end", false)
+	_add_slider("缓动", 0.0, 1.0, 0.05, float(anim.get("ease", 0.4)), anim, "ease", false)
+	_add_option("方式", ShaderGraphScript.ANIM_MODES, int(anim.get("mode", 0)), anim, "mode")
+	_end_section()
 
 
 ## Hides the parameter rows whose label does not contain the filter text. A
@@ -2011,7 +2177,7 @@ func _open_path_editor(node_id: String) -> void:
 		return
 	if _path_popup_node == node_id and is_instance_valid(_path_popup):
 		# The same node keeps the window it already has, points and all.
-		_path_popup.popup_centered_ratio(PATH_POPUP_RATIO)
+		_popup_path_editor()
 		return
 	if is_instance_valid(_path_popup):
 		_path_popup.queue_free()
@@ -2034,23 +2200,32 @@ func _open_path_editor(node_id: String) -> void:
 	add_child(_path_popup)
 	var frame := MarginContainer.new()
 	for side in ["left", "right", "top", "bottom"]:
-		frame.add_theme_constant_override("margin_" + side, 14)
+		frame.add_theme_constant_override("margin_" + side, 12)
 	_path_popup.add_child(frame)
+	# The window is kept inside the visible part of the screen, so the content
+	# scrolls instead of pushing the panel past the top and bottom edges of a
+	# phone. The canvas itself still gets all the height that is left over.
+	var scroll := ScrollContainer.new()
+	scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+	scroll.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	scroll.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	frame.add_child(scroll)
 	var column := VBoxContainer.new()
 	column.add_theme_constant_override("separation", 10)
-	frame.add_child(column)
+	column.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	scroll.add_child(column)
 
 	var title := Label.new()
 	title.text = "编辑路径 · %s" % ShaderGraphScript.NODE_TYPES[type_name]["label"]
 	title.add_theme_font_size_override("font_size", 17)
+	title.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	column.add_child(title)
 
 	var hint := Label.new()
 	if bezier:
-		hint.text = (
-			"点空白处新增顶点（自动带切线），点在线条上会插进那一段；"
-			+ "拖动顶点移动，拖小圆点改曲率，长按顶点删除。"
-		)
+		# Short enough to stay on one line in landscape, which is the tightest
+		# case for the window height.
+		hint.text = "点空白处或线条上添加顶点；拖动顶点移动，拖小圆点改曲率，长按删除。"
 	else:
 		hint.text = "点空白处新增控制点，拖动移动，长按删除；曲线由节点统一平滑。"
 	hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
@@ -2068,8 +2243,10 @@ func _open_path_editor(node_id: String) -> void:
 		editor.set_points(stored, float(params.get("phase", 0.0)))
 	editor.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	editor.size_flags_vertical = Control.SIZE_EXPAND_FILL
-	editor.custom_minimum_size = Vector2(340, 300)
 	column.add_child(editor)
+	# The canvas takes whatever height the rest of the window leaves, so the
+	# window can stay inside the screen instead of asking for a fixed 300 px.
+	editor.custom_minimum_size = Vector2(0, PATH_EDITOR_MIN_HEIGHT)
 	_path_editor = editor
 	editor.points_changed.connect(
 		func(new_points: Array) -> void:
@@ -2078,7 +2255,7 @@ func _open_path_editor(node_id: String) -> void:
 			_schedule_preview()
 	)
 
-	var buttons := HBoxContainer.new()
+	var buttons := HFlowContainer.new()
 	# A flow container wraps the buttons instead of squeezing them on a phone.
 	buttons.add_theme_constant_override("h_separation", 8)
 	buttons.add_theme_constant_override("v_separation", 6)
@@ -2093,14 +2270,26 @@ func _open_path_editor(node_id: String) -> void:
 		# A real bezier vertex has collinear handles, so dragging one mirrors the
 		# other unless the user asks for a corner.
 		var mirror := CheckBox.new()
-		mirror.text = "对称手柄（拖一侧镜像另一侧）"
+		# A short label, so the window can be narrow on a phone; the long version
+		# lives in the tooltip.
+		mirror.text = "对称手柄"
+		mirror.tooltip_text = "拖一侧手柄时镜像另一侧"
 		mirror.button_pressed = editor.smooth_handles
 		mirror.custom_minimum_size = Vector2(0, TOUCH_SIZE)
 		mirror.add_theme_font_size_override("font_size", TOUCH_FONT_SIZE)
 		mirror.toggled.connect(func(pressed: bool) -> void: editor.smooth_handles = pressed)
 		column.add_child(mirror)
 
-	_path_popup.popup_centered_ratio(PATH_POPUP_RATIO)
+	# The window keeps the size it is popped up with; the canvas is resized to
+	# the leftover height and everything else scrolls when that is not enough.
+	# The hint only knows how tall it wrapped after it got its width, so it is
+	# fitted again whenever it changes height.
+	scroll.resized.connect(
+		func() -> void: _fit_path_canvas(scroll, column, editor)
+	)
+	hint.resized.connect(func() -> void: _fit_path_canvas(scroll, column, editor))
+	_popup_path_editor()
+	_fit_path_canvas.call_deferred(scroll, column, editor)
 
 
 func _close_path_editor() -> void:
@@ -2110,6 +2299,58 @@ func _close_path_editor() -> void:
 	_path_editor = null
 
 
+## Shows the path window with a size that stays inside the visible part of the
+## screen. The ratio is only a target: a phone in landscape has far less height
+## than the window would like, so the size is clamped and the content scrolls.
+func _popup_path_editor() -> void:
+	if not is_instance_valid(_path_popup):
+		return
+	var visible := _visible_popup_rect()
+	var room := Vector2i(
+		int(minf(float(visible.size.x), size.x)), int(minf(float(visible.size.y), size.y))
+	)
+	# Never ask for more than the room there is, even on a very small screen.
+	var floor_size := Vector2i(mini(200, room.x), mini(200, room.y))
+	var target := Vector2i(
+		maxi(int(room.x * PATH_POPUP_RATIO), floor_size.x),
+		maxi(int(room.y * PATH_POPUP_RATIO), floor_size.y)
+	)
+	_path_popup.popup_centered_clamped(target, PATH_POPUP_RATIO)
+
+
+## The area of the screen a subwindow may cover. Mobile devices draw under the
+## status and navigation bars, so the safe area is respected as well.
+func _visible_popup_rect() -> Rect2i:
+	var host := get_window()
+	if host == null:
+		return Rect2i(Vector2i.ZERO, Vector2i(size))
+	var screen := DisplayServer.window_get_current_screen(host.get_window_id())
+	var visible := DisplayServer.screen_get_usable_rect(screen)
+	if visible.size.x <= 0 or visible.size.y <= 0:
+		visible = Rect2i(host.position, host.size)
+	if OS.has_feature("mobile"):
+		var safe := DisplayServer.get_display_safe_area()
+		if safe.size.x > 0 and safe.size.y > 0:
+			var clipped := visible.intersection(safe)
+			if clipped.size.x > 0 and clipped.size.y > 0:
+				visible = clipped
+	return visible
+
+
+## Gives the control point canvas the height the rest of the window leaves. The
+## window never grows past the screen, so on a short screen the canvas stops at
+## [constant PATH_EDITOR_MIN_HEIGHT] and the rest of the column scrolls.
+func _fit_path_canvas(scroll: ScrollContainer, column: VBoxContainer, editor: Control) -> void:
+	if not is_instance_valid(scroll) or not is_instance_valid(column):
+		return
+	if not is_instance_valid(editor) or scroll.size.y <= 1.0:
+		return
+	var fixed := column.get_combined_minimum_size().y - editor.custom_minimum_size.y
+	var target := maxf(scroll.size.y - fixed - 2.0, PATH_EDITOR_MIN_HEIGHT)
+	if absf(editor.custom_minimum_size.y - target) > 1.0:
+		editor.custom_minimum_size = Vector2(0, target)
+
+
 func _add_slider(
 	label_text: String,
 	min_value: float,
@@ -2117,8 +2358,10 @@ func _add_slider(
 	step: float,
 	value: float,
 	params: Dictionary,
-	key: String
+	key: String,
+	animatable := true
 ) -> void:
+	_register_animatable(label_text, key, min_value, max_value, step, false, animatable)
 	var row := HBoxContainer.new()
 	var label := Label.new()
 	label.text = label_text
@@ -2156,8 +2399,10 @@ func _add_number(
 	step: int,
 	value: int,
 	params: Dictionary,
-	key: String
+	key: String,
+	animatable := true
 ) -> void:
+	_register_animatable(label_text, key, min_value, max_value, step, true, animatable)
 	var row := HBoxContainer.new()
 	var label := Label.new()
 	label.text = label_text
@@ -2260,22 +2505,62 @@ func _schedule_preview() -> void:
 		_preview_timer.start()
 
 
+## Waits for a sliced preview that is still being painted, so a one shot
+## generation cannot clear its caches halfway through.
+func _wait_for_preview() -> void:
+	while _preview_busy and is_inside_tree():
+		await get_tree().process_frame
+
+
 func _refresh_preview() -> void:
 	if not is_instance_valid(_preview):
+		return
+	if _suspend_preview:
+		_preview_pending = false
 		return
 	var project := Global.current_project
 	if project == null:
 		return
-	var limit := PREVIEW_LIMIT_HEAVY if graph.is_expensive() else PREVIEW_LIMIT
-	var preview_size := Vector2i(
-		mini(project.size.x, limit), mini(project.size.y, limit)
-	)
+	if _preview_busy:
+		# The running pass picks up the newest state when it ends, so stacking
+		# another full generation here would only add work.
+		_preview_pending = true
+		return
+	_preview_busy = true
+	var playing := _is_playing()
+	# The size follows the measured cost, so a slow device renders a smaller
+	# preview instead of freezing on a big one. Fast ones keep the full size.
+	var cap := PREVIEW_LIMIT_HEAVY if graph.is_expensive() else PREVIEW_LIMIT
+	if playing:
+		# Playback is judged by how smooth it looks, not by the last pixel.
+		cap = mini(cap, PREVIEW_LIMIT_PLAYBACK)
+	var budget := PLAYBACK_BUDGET_MSEC if playing else PREVIEW_BUDGET_MSEC
+	var side := cap
+	if _preview_side > 0 and _preview_msec > 0.5:
+		side = clampi(int(float(_preview_side) * sqrt(budget / _preview_msec)), 48, cap)
+		# Skip tiny changes, so the picture does not flicker between sizes.
+		if absi(side - _preview_side) < 8:
+			side = _preview_side
+	_preview_side = side
+	var preview_size := Vector2i(mini(project.size.x, side), mini(project.size.y, side))
 	graph.time = _phase.value if is_instance_valid(_phase) else 0.0
 	if is_instance_valid(_path_editor):
 		_path_editor.set_phase(graph.time)
-	var image: Image = graph.generate(preview_size)
+	var started := Time.get_ticks_usec()
+	# Painted in slices, so dragging a node or panning keeps working while the
+	# animation runs instead of freezing for the whole generation.
+	var image: Image = await graph.generate_sliced(preview_size, PREVIEW_SLICE_MSEC)
+	_preview_msec = float(Time.get_ticks_usec() - started) / 1000.0
+	if not is_instance_valid(_preview):
+		_preview_busy = false
+		return
 	_preview.texture = ImageTexture.create_from_image(image)
-	_refresh_node_previews()
+	# There is one thumbnail per node, so they are spread over several frames
+	# while playing instead of competing with the main preview.
+	if playing:
+		_refresh_one_node_preview()
+	else:
+		_refresh_node_previews()
 	if is_instance_valid(_preview_big) and _preview_popup.visible:
 		_preview_big.texture = _preview.texture
 	# A graph that reads the artwork keeps following it while the user draws.
@@ -2292,10 +2577,35 @@ func _refresh_preview() -> void:
 		graph.nodes.size(),
 		"动态" if graph.uses_time() else "静态",
 	]
+	_preview_busy = false
+	if _preview_pending:
+		_preview_pending = false
+		_refresh_preview()
 
 
 ## Launches the echo of earlier frames, which is the quickest way to judge an
 ## animated graph before committing it.
+func _is_playing() -> bool:
+	return is_instance_valid(_play_timer) and not _play_timer.is_stopped()
+
+
+## Redraws a single visible node thumbnail, taking turns. Spreading them out
+## keeps the animation preview responsive on a phone.
+func _refresh_one_node_preview() -> void:
+	if _node_previews.is_empty():
+		return
+	var ids: Array = _node_previews.keys()
+	for _step in ids.size():
+		_thumbnail_index = (_thumbnail_index + 1) % ids.size()
+		var node_id: String = ids[_thumbnail_index]
+		var entry: Dictionary = _node_previews[node_id]
+		var frame: Control = entry["frame"]
+		if not is_instance_valid(frame) or not frame.visible:
+			continue
+		_refresh_node_preview(node_id, entry)
+		return
+
+
 func _on_play_pressed() -> void:
 	if not is_instance_valid(_play_timer):
 		return
@@ -2306,6 +2616,9 @@ func _on_play_pressed() -> void:
 	else:
 		_play_timer.stop()
 		_play_button.text = "▶"
+		# The thumbnails skipped during playback catch up in one go.
+		_refresh_node_previews()
+		_refresh_preview()
 
 
 func _advance_playback() -> void:
@@ -2339,8 +2652,42 @@ func _on_tree_preset_pressed() -> void:
 	_refresh_preview()
 
 
+## Builds a vine that grows along its path, driven by the animated reveal value
+## of the path node.
+func _on_path_growth_preset_pressed() -> void:
+	_push_undo()
+	graph.build_path_growth_preset()
+	if is_instance_valid(_phase):
+		_phase.set_value_no_signal(1.0)
+	_selected_id = ""
+	_show_params("")
+	_refresh_graph()
+	_refresh_preview()
+
+
+## Builds content revealed by an animated mask, the classic bottom up growth.
+func _on_mask_growth_preset_pressed() -> void:
+	_push_undo()
+	graph.build_mask_growth_preset()
+	if is_instance_valid(_phase):
+		_phase.set_value_no_signal(1.0)
+	_selected_id = ""
+	_show_params("")
+	_refresh_graph()
+	_refresh_preview()
+
+
 ## Generates the image(s) at the project size and adds them as a new layer.
 func _on_add_layer_pressed() -> void:
+	# A sliced preview may still own the per frame caches, so let it finish
+	# before the frames are generated.
+	_suspend_preview = true
+	await _wait_for_preview()
+	await _on_add_layer_now()
+	_suspend_preview = false
+
+
+func _on_add_layer_now() -> void:
 	var project := Global.current_project
 	if project == null:
 		return
