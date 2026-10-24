@@ -95,11 +95,12 @@ var _preview_collapsed: Dictionary = {}
 var _preview: TextureRect
 ## Picture of the node selected in the side panel.
 var _node_preview: TextureRect
-## Row that keeps the graph and the output picture next to each other.
-var _stage: HBoxContainer
-## Column of the output picture, narrowed on small screens so the graph keeps
-## most of the width.
-var _output_column: VBoxContainer
+## Floating window with the output of the whole graph, on top of the graph view.
+var _preview_panel: PanelContainer
+## Title bar of that window, which is the handle used to move it.
+var _preview_header: Label
+var _preview_dragging := false
+var _preview_placed := false
 ## Canvas size the preview boxes were last fitted to.
 var _preview_canvas_size := Vector2i.ZERO
 ## Tapping the small preview opens it at a readable size.
@@ -378,35 +379,45 @@ func _build_ui() -> void:
 	_graph_edit.delete_nodes_request.connect(_on_delete_nodes_request)
 	_graph_edit.node_selected.connect(_on_node_selected)
 	_graph_edit.node_deselected.connect(_on_node_deselected)
-	# The output picture sits beside the graph, so it stays visible while the
-	# nodes are edited instead of hiding under the sidebar.
-	_stage = HBoxContainer.new()
-	_stage.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	_stage.add_theme_constant_override("separation", 6)
-	_body.add_child(_stage)
-	_stage.add_child(_graph_edit)
+	_body.add_child(_graph_edit)
 
-	_output_column = VBoxContainer.new()
-	_output_column.custom_minimum_size = Vector2(150, 0)
-	_output_column.add_theme_constant_override("separation", 4)
-	_stage.add_child(_output_column)
-	var output_label := Label.new()
-	output_label.text = "输出预览（点一下放大）"
-	output_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	output_label.add_theme_font_size_override("font_size", 13)
-	_output_column.add_child(output_label)
+	# The output picture floats over the graph instead of taking a column of its
+	# own: it is the shape of the canvas and can be dragged where it is handy.
+	_preview_panel = PanelContainer.new()
+	_preview_panel.name = "OutputPreview"
+	_preview_panel.z_index = 10
+	_preview_panel.mouse_filter = Control.MOUSE_FILTER_STOP
+	var panel_style := StyleBoxFlat.new()
+	panel_style.bg_color = Color(0.13, 0.14, 0.17, 0.94)
+	panel_style.set_corner_radius_all(4)
+	panel_style.set_border_width_all(1)
+	panel_style.border_color = Color(0.36, 0.4, 0.48)
+	panel_style.content_margin_left = 6
+	panel_style.content_margin_right = 6
+	panel_style.content_margin_top = 4
+	panel_style.content_margin_bottom = 6
+	_preview_panel.add_theme_stylebox_override("panel", panel_style)
+	_graph_edit.add_child(_preview_panel)
+	var panel_column := VBoxContainer.new()
+	panel_column.add_theme_constant_override("separation", 4)
+	_preview_panel.add_child(panel_column)
+	_preview_header = Label.new()
+	_preview_header.text = "输出预览 ⠿"
+	_preview_header.tooltip_text = "拖动这里移动预览，点图片放大"
+	_preview_header.mouse_filter = Control.MOUSE_FILTER_STOP
+	_preview_header.mouse_default_cursor_shape = Control.CURSOR_MOVE
+	_preview_header.add_theme_font_size_override("font_size", 12)
+	_preview_header.gui_input.connect(_on_preview_header_input)
+	panel_column.add_child(_preview_header)
 	_preview = TextureRect.new()
-	# A square is enough to judge the result, and it leaves the graph area the
-	# rest of the height instead of taking the whole column.
-	_preview.custom_minimum_size = Vector2(150, 150)
-	_preview.size_flags_vertical = Control.SIZE_SHRINK_BEGIN
 	_preview.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
 	_preview.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
 	_preview.texture_filter = CanvasItem.TEXTURE_FILTER_NEAREST
 	_preview.mouse_filter = Control.MOUSE_FILTER_STOP
 	_preview.tooltip_text = "输出节点的结果，点一下放大"
 	_preview.gui_input.connect(_on_preview_input)
-	_output_column.add_child(_preview)
+	panel_column.add_child(_preview)
+	_graph_edit.resized.connect(_fit_preview_panel)
 
 	_side = VBoxContainer.new()
 	_body.add_child(_side)
@@ -3014,6 +3025,19 @@ func _step_slider(slider: HSlider, direction: float) -> void:
 	slider.value = clampf(next, slider.min_value, slider.max_value)
 
 
+## Same for the drag number field, whose value does not emit a change when it is
+## set from code, so the caller's apply callback is run here.
+func _step_changer(changer: Control, direction: float, apply: Callable) -> void:
+	var step := maxf(float(changer.get("step")), 0.0001)
+	var next := clampf(
+		float(changer.get("value")) + step * direction,
+		float(changer.get("min_value")),
+		float(changer.get("max_value"))
+	)
+	changer.set("value", next)
+	apply.call(float(changer.get("value")))
+
+
 func _add_number(
 	label_text: String,
 	min_value: int,
@@ -3042,12 +3066,28 @@ func _add_number(
 			call_deferred("_show_params", _selected_id)
 	if _drag_numbers:
 		# A drag strip instead of a text field, so the keyboard never covers the
-		# parameter panel on a phone.
+		# parameter panel on a phone. The arrows beside it step by exactly one.
 		var changer := ShaderValueChangerScript.new()
 		changer.set_range(min_value, max_value, step, true, value)
 		changer.custom_minimum_size = Vector2(0, TOUCH_SIZE)
 		changer.value_changed.connect(apply)
+		row.add_child(
+			_make_button(
+				"−",
+				func() -> void: _step_changer(changer, -1.0, apply),
+				"减一档",
+				Vector2(34, TOUCH_SIZE)
+			)
+		)
 		row.add_child(changer)
+		row.add_child(
+			_make_button(
+				"+",
+				func() -> void: _step_changer(changer, 1.0, apply),
+				"加一档",
+				Vector2(34, TOUCH_SIZE)
+			)
+		)
 	else:
 		var spin := SpinBox.new()
 		spin.min_value = min_value
@@ -3555,6 +3595,50 @@ func _preview_box(width: float, max_height: float) -> Vector2:
 	return Vector2(roundf(width), roundf(height))
 
 
+## Sizes the floating output window to the canvas shape and a corner of the graph
+## area. It runs again when the graph area changes size, so the window keeps a
+## sensible size on a phone and on a desktop.
+func _fit_preview_panel() -> void:
+	if not is_instance_valid(_preview_panel) or not is_instance_valid(_graph_edit):
+		return
+	var box_width := clampf(_graph_edit.size.x * 0.34, 96.0, 220.0)
+	var box := _preview_box(box_width, maxf(_graph_edit.size.y * 0.45, 80.0))
+	_preview_panel.custom_minimum_size = box + Vector2(12.0, 32.0)
+	if (
+		not _preview_placed
+		and _graph_edit.size.x >= box.x
+		and _graph_edit.size.y >= box.y
+	):
+		_preview_panel.position = Vector2(12, 12)
+		_preview_placed = true
+	_clamp_preview_panel()
+
+
+## Keeps the floating output window inside the graph area, so it cannot be
+## dragged off screen where it could never be grabbed again.
+func _clamp_preview_panel() -> void:
+	if not is_instance_valid(_preview_panel) or not is_instance_valid(_graph_edit):
+		return
+	var limit := _graph_edit.size - _preview_panel.size
+	_preview_panel.position = _preview_panel.position.clamp(
+		Vector2.ZERO, Vector2(maxf(limit.x, 0.0), maxf(limit.y, 0.0))
+	)
+
+
+## Dragging the small title bar moves the floating output window.
+func _on_preview_header_input(event: InputEvent) -> void:
+	if event is InputEventMouseButton:
+		var button := event as InputEventMouseButton
+		if button.button_index != MOUSE_BUTTON_LEFT:
+			return
+		_preview_dragging = button.pressed
+		return
+	if event is InputEventMouseMotion and _preview_dragging:
+		var motion := event as InputEventMouseMotion
+		_preview_panel.position += motion.relative
+		_clamp_preview_panel()
+
+
 ## Puts the parameters beside the graph when there is room, and below it on a
 ## narrow screen, so the page stays usable on a phone in portrait.
 func _apply_layout() -> void:
@@ -3562,16 +3646,7 @@ func _apply_layout() -> void:
 		return
 	var narrow := size.x < NARROW_WIDTH
 	_body.vertical = narrow
-	if is_instance_valid(_output_column):
-		# A portrait phone keeps enough width for the nodes to stay usable.
-		var preview_side := 96 if narrow else 150
-		_output_column.custom_minimum_size = Vector2(preview_side, 0)
-		if is_instance_valid(_preview):
-			# The box follows the canvas aspect, so a wide or tall project is
-			# shown without letterboxing and without taking a square of space.
-			_preview.custom_minimum_size = _preview_box(
-				preview_side, maxf(size.y * 0.5, 110.0)
-			)
+	_fit_preview_panel()
 	if is_instance_valid(_node_preview):
 		_node_preview.custom_minimum_size = _preview_box(150.0, maxf(size.y * 0.3, 90.0))
 	if _zen_mode:
