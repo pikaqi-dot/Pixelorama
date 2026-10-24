@@ -6,6 +6,7 @@ extends Panel
 ## it blocks drawing while it is open.
 
 const ShaderGraphScript := preload("res://src/Classes/ShaderComposer/ShaderGraph.gd")
+const ShaderPathEditorScript := preload("res://src/UI/ShaderComposer/ShaderPathEditor.gd")
 
 const PORT_COLOR := Color(0.55, 0.8, 1.0)
 const PREVIEW_LIMIT := 256
@@ -21,6 +22,8 @@ var graph: RefCounted
 var _graph_edit: GraphEdit
 var _params_box: VBoxContainer
 var _params_hint: Label
+## Path editor shown in the parameters when Follow Path uses a custom shape.
+var _path_editor
 var _preview: TextureRect
 var _status: Label
 var _add_type: OptionButton
@@ -395,6 +398,7 @@ func _on_node_deselected(_node: Node) -> void:
 
 ## Builds the parameter controls of [param id] in the side panel.
 func _show_params(id: String) -> void:
+	_path_editor = null
 	for child in _params_box.get_children():
 		_params_box.remove_child(child)
 		child.queue_free()
@@ -497,8 +501,18 @@ func _show_params(id: String) -> void:
 			path_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 			path_hint.add_theme_font_size_override("font_size", 13)
 			_params_box.add_child(path_hint)
-			_add_option("路径", ShaderGraphScript.PATH_SHAPES, int(params["shape"]), params, "shape")
-			_add_slider("半径", 0.05, 1.0, 0.01, float(params["radius"]), params, "radius")
+			_add_option(
+				"路径",
+				ShaderGraphScript.PATH_SHAPES,
+				int(params["shape"]),
+				params,
+				"shape",
+				true
+			)
+			if int(params["shape"]) == ShaderGraphScript.PATH_CUSTOM:
+				_add_path_editor(params)
+			else:
+				_add_slider("半径", 0.05, 1.0, 0.01, float(params["radius"]), params, "radius")
 			_add_slider("圈数", 0.25, 4.0, 0.25, float(params["loops"]), params, "loops")
 			_add_slider("相位", 0.0, 1.0, 0.01, float(params["phase"]), params, "phase")
 		"mesh_warp":
@@ -614,7 +628,12 @@ func _show_params(id: String) -> void:
 
 
 func _add_option(
-	label_text: String, items: Array, selected: int, params: Dictionary, key: String
+	label_text: String,
+	items: Array,
+	selected: int,
+	params: Dictionary,
+	key: String,
+	rebuild := false
 ) -> void:
 	var row := HBoxContainer.new()
 	var label := Label.new()
@@ -633,9 +652,45 @@ func _add_option(
 		func(index: int) -> void:
 			params[key] = index
 			_schedule_preview()
+			# Some options change which controls are shown, like the path shape.
+			if rebuild and not _selected_id.is_empty():
+				call_deferred("_show_params", _selected_id)
 	)
 	row.add_child(option)
 	_params_box.add_child(row)
+
+
+## Control point editor for a custom Follow Path.
+func _add_path_editor(params: Dictionary) -> void:
+	var stored: Array = params.get("points", [])
+	if stored.size() < 2:
+		# Graphs saved before the editor existed get the default loop.
+		stored = ShaderPathEditorScript.default_points()
+		params["points"] = stored
+	var editor := ShaderPathEditorScript.new()
+	editor.set_points(stored, float(params.get("phase", 0.0)))
+	editor.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	editor.custom_minimum_size = Vector2(0, 200)
+	editor.points_changed.connect(
+		func(new_points: Array) -> void:
+			params["points"] = new_points
+			_schedule_preview()
+	)
+	_params_box.add_child(editor)
+	_path_editor = editor
+	var remove_point := func() -> void:
+		editor.remove_selected()
+	var reset_path := func() -> void:
+		editor.reset_to_square()
+	var buttons := HBoxContainer.new()
+	buttons.add_child(_make_button("删除选中点", remove_point))
+	buttons.add_child(_make_button("重置路径", reset_path, "回到默认的方形路径"))
+	_params_box.add_child(buttons)
+	var hint := Label.new()
+	hint.text = "点空白处新增控制点，拖动移动，右键或上方按钮删除。红点是当前相位位置。"
+	hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	hint.add_theme_font_size_override("font_size", 13)
+	_params_box.add_child(hint)
 
 
 func _add_slider(
@@ -764,6 +819,8 @@ func _refresh_preview() -> void:
 		mini(project.size.x, PREVIEW_LIMIT), mini(project.size.y, PREVIEW_LIMIT)
 	)
 	graph.time = _phase.value if is_instance_valid(_phase) else 0.0
+	if is_instance_valid(_path_editor):
+		_path_editor.set_phase(graph.time)
 	var image: Image = graph.generate(preview_size)
 	_preview.texture = ImageTexture.create_from_image(image)
 	_status.text = "预览 %d×%d · 输出 %d×%d · 节点 %d · %s" % [

@@ -57,7 +57,9 @@ const MATH_OPS := [
 const BLEND_OPS := ["Mix", "Add", "Multiply", "Screen", "Difference"]
 const POLAR_MODES := ["矩形 → 极坐标", "极坐标 → 矩形"]
 const ECHO_MODES := ["最大值（拖影）", "平均值（残影）"]
-const PATH_SHAPES := ["圆形", "水平", "垂直", "正弦", "方形", "8 字"]
+const PATH_SHAPES := ["圆形", "水平", "垂直", "正弦", "方形", "8 字", "自定义"]
+## Shape index that uses the control points edited in the path editor.
+const PATH_CUSTOM := 6
 const DITHER_SIZES_TEXT := ["2×2", "4×4", "8×8"]
 ## Bits of the Bayer matrix behind each entry of [constant DITHER_SIZES_TEXT].
 const DITHER_BITS := [1, 2, 3]
@@ -307,7 +309,19 @@ static func default_params(type: String) -> Dictionary:
 		"echo":
 			return {"count": 4, "angle": 90.0, "distance": 0.2, "mode": 0}
 		"follow_path":
-			return {"shape": 0, "radius": 0.3, "loops": 1.0, "phase": 0.0}
+			return {
+				"shape": 0,
+				"radius": 0.3,
+				"loops": 1.0,
+				"phase": 0.0,
+				"points":
+				[
+					Vector2(0.3, 0.3),
+					Vector2(0.7, 0.3),
+					Vector2(0.7, 0.7),
+					Vector2(0.3, 0.7),
+				],
+			}
 		"mesh_warp":
 			return {
 				"tl_x": 0.0,
@@ -785,8 +799,46 @@ static func _path_offset(
 			return Vector2(-shortest, lerpf(shortest, -shortest, along))
 		5:  # 8 字
 			return Vector2(sin(angle) * radius * size_vec.x, sin(angle * 2.0) * shortest)
+		PATH_CUSTOM:  # 自定义控制点
+			var custom: Array = params.get("points", [])
+			return (
+				(sample_custom_path(custom, phase * loops) - Vector2(0.5, 0.5)) * size_vec
+			)
 	# 圆形
 	return Vector2(cos(angle), sin(angle)) * shortest
+
+
+## Point at [param t] (0..1) on the closed Catmull-Rom curve through
+## [param points]. Shared with the path editor, so the drawn curve and the
+## generated motion always agree.
+static func sample_custom_path(points: Array, t: float) -> Vector2:
+	var count := points.size()
+	if count < 2:
+		return Vector2(0.5, 0.5)
+	if count == 2:
+		var along := fposmod(t, 1.0)
+		return (points[0] as Vector2).lerp(points[1] as Vector2, along)
+	var scaled := fposmod(t, 1.0) * float(count)
+	var index := int(floorf(scaled))
+	var local := scaled - float(index)
+	var p0: Vector2 = points[(index - 1 + count) % count]
+	var p1: Vector2 = points[index % count]
+	var p2: Vector2 = points[(index + 1) % count]
+	var p3: Vector2 = points[(index + 2) % count]
+	return _catmull_rom(p0, p1, p2, p3, local)
+
+
+static func _catmull_rom(
+	p0: Vector2, p1: Vector2, p2: Vector2, p3: Vector2, t: float
+) -> Vector2:
+	var squared := t * t
+	var cubed := squared * t
+	return 0.5 * (
+		(2.0 * p1)
+		+ (-p0 + p2) * t
+		+ (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * squared
+		+ (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * cubed
+	)
 
 
 ## Maps one axis of a nine slice: the borders stay rigid, the middle is stretched
@@ -961,6 +1013,8 @@ static func describe(node: Dictionary) -> String:
 				int(params["count"]), "Max" if int(params["mode"]) == 0 else "Avg"
 			]
 		"follow_path":
+			if int(params["shape"]) == PATH_CUSTOM:
+				return "自定义 · %d 点" % (params.get("points", []) as Array).size()
 			return "%s · %.2f" % [
 				PATH_SHAPES[int(params["shape"])], float(params["radius"])
 			]
