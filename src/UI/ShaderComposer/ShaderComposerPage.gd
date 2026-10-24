@@ -1836,9 +1836,10 @@ func _show_params(id: String) -> void:
 			scatter_hint.text = (
 				"把输入 1 当作笔刷，按随机角度和大小盖章，"
 				+ "适合把像素画图层里的叶片、石头、碎石铺成灌木和苔藓。"
-				+ "输入 2 在「区域密度」时是遮罩（越亮越密）；"
-				+ "切到「沿路径」并把路径接到输入 2，笔刷会顺着曲线排布，"
-				+ "动画那个路径的「显示比例」就是边生长边撒。"
+				+ "输入 2 的三种用法：「区域密度」是遮罩，越亮越密；"
+				+ "「沿路径」接路径节点，笔刷顺着曲线排布；"
+				+ "「沿画布」接画布（或任何分支），笔刷只落在它的不透明区域上——"
+				+ "画布的线是用路径生长出来的时候，这一撒就跟着动画一起长。"
 				+ "笔刷只取不透明的形状，像素画本身的颜色不参与，"
 				+ "盖章的颜色由输出节点的渐变和下面的「亮度」决定。"
 			)
@@ -1848,13 +1849,17 @@ func _show_params(id: String) -> void:
 			_add_number("数量", 1, 256, 1, int(params.get("amount", 24)), params, "amount")
 			_add_option(
 				"分布",
-				["区域密度", "沿路径"],
+				["区域密度", "沿路径", "沿画布"],
 				int(params.get("mode", 0)),
 				params,
 				"mode",
 				true
 			)
-			if int(params.get("mode", 0)) == 1:
+			if int(params.get("mode", 0)) == 2:
+				_add_slider(
+					"抖动", 0.0, 1.5, 0.01, float(params.get("spread", 0.6)), params, "spread"
+				)
+			elif int(params.get("mode", 0)) == 1:
 				_add_slider(
 					"路径宽度",
 					0.0,

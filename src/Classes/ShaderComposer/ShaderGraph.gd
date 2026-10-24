@@ -680,7 +680,9 @@ static func default_params(type: String) -> Dictionary:
 			return {
 				"amount": 24,
 				# 0 scatters inside a radius, 1 places the brush along a path node
-				# connected to the second input, which makes growth animation easy.
+				# connected to the second input, 2 places it on the drawn part of
+				# whatever the second input is, so a canvas that grows from a path
+				# animates the whole pattern.
 				"mode": 0,
 				"spread": 0.6,
 				"path_width": 0.08,
@@ -2558,11 +2560,18 @@ func _scatter_image(
 				footprint.x = footprint.y * aspect
 	var center := Vector2(size) * 0.5
 	var reach := Vector2(shortest * spread * 0.5, shortest * spread * 0.5)
+	var mode := int(params.get("mode", 0))
+	# Over a drawing: the stamps sit on the opaque part of the second input, so a
+	# canvas that grows from a path animates the scatter by itself — the shape it
+	# shows is exactly what is being scattered over.
+	var mask_points := PackedVector2Array()
+	if mode == 2 and not density_id.is_empty():
+		mask_points = _coverage_points(density_id, size, depth)
 	# Along a path the brush follows the curve, and the path's own reveal limits
 	# how far it may go, so animating that reveal grows the scatter.
 	var along_path := false
 	var path_points := PackedVector2Array()
-	if int(params.get("mode", 0)) == 1 and not density_id.is_empty():
+	if mode == 1 and not density_id.is_empty():
 		var path_node := get_node_by_id(density_id)
 		if not path_node.is_empty() and str(path_node["type"]) == "path":
 			var path_params: Dictionary = params_for(path_node)
@@ -2587,7 +2596,18 @@ func _scatter_image(
 		var scale := rng.randf_range(scale_min, scale_max)
 		var chance := rng.randf()
 		var position: Vector2
-		if along_path:
+		if mode == 2:
+			if mask_points.is_empty():
+				continue
+			# Stratified slots over the scanned points, so the stamps arrive along
+			# the shape the way it was drawn instead of clumping.
+			var slot := (float(index) + rng.randf_range(0.0, 1.0)) / float(amount)
+			var pick := clampi(
+				int(slot * float(mask_points.size())), 0, mask_points.size() - 1
+			)
+			position = mask_points[pick] * size_vec
+			position += Vector2(across, down) * shortest * spread * 0.06
+		elif along_path:
 			# Stratified slots keep the stamps spread evenly instead of clumping.
 			var slot := (float(index) + rng.randf_range(0.0, 1.0)) / float(amount)
 			var sample: Dictionary = _path_point_at(path_points, slot)
@@ -2600,15 +2620,63 @@ func _scatter_image(
 			position = center + Vector2(across * reach.x, down * reach.y)
 		if align:
 			position = position.round()
-		if not along_path and not density_id.is_empty():
+		if not along_path and mode != 2 and not density_id.is_empty():
 			if _eval(density_id, position, size, depth + 1) < chance:
 				continue
 		_stamp_source(image, source_id, position, rotation, scale, footprint, size, depth, level)
 	_path_cache[key] = image
 	return image
-
-
-## Draws one brush stamp. Every destination pixel is mapped back into the brush,
+	
+	
+## Image a branch can hand out directly, or null when it has to be sampled. A
+## canvas node answers with its drawing area or its stroke, a path node with its
+## line, which is what makes "scatter over this drawing" exact and cheap.
+func _branch_image(node_id: String, size: Vector2i, depth: int) -> Image:
+	var owner := get_node_by_id(node_id)
+	if owner.is_empty():
+		return null
+	var params: Dictionary = params_for(owner)
+	match str(owner["type"]):
+		"pixel_art":
+			if int(params.get("source", 0)) == 1:
+				return _canvas_path_image(owner, params, size, depth)
+			return _source_image(owner, params)
+		"path":
+			return _path_image(owner, params, size)
+	return null
+	
+	
+## Points of the drawn part of a branch, in 0..1 canvas coordinates, in the order
+## they are scanned. A canvas or a path node is read from its image; anything else
+## is sampled through the evaluator, so a mask field works as an area too. The
+## scan stops at 128 cells on the long edge, which is plenty for placing stamps.
+func _coverage_points(node_id: String, size: Vector2i, depth: int) -> PackedVector2Array:
+	var points := PackedVector2Array()
+	var image := _branch_image(node_id, size, depth)
+	var grid := size
+	var use_image := image != null and not image.is_empty()
+	if use_image:
+		grid = Vector2i(image.get_width(), image.get_height())
+	if grid.x <= 0 or grid.y <= 0:
+		return points
+	var step := maxi(int(ceil(float(maxi(grid.x, grid.y)) / 128.0)), 1)
+	for y in range(0, grid.y, step):
+		for x in range(0, grid.x, step):
+			var coverage := 0.0
+			if use_image:
+				var color := image.get_pixel(x, y)
+				# A stroke keeps its coverage in the brightness, a drawn area
+				# keeps it in the alpha channel, so the larger of the two counts.
+				coverage = maxf(color.r, color.a)
+			else:
+				coverage = clampf(_eval(node_id, Vector2(x, y), grid, depth + 1), 0.0, 1.0)
+			if coverage <= 0.5:
+				continue
+			points.append(Vector2(float(x) / float(grid.x), float(y) / float(grid.y)))
+	return points
+	
+	
+	## Draws one brush stamp. Every destination pixel is mapped back into the brush,
 ## so rotation and scaling stay pixel exact instead of smearing the brush.
 func _stamp_source(
 	image: Image,
@@ -3056,6 +3124,11 @@ static func describe(node: Dictionary) -> String:
 			var scatter_text := "%d 枚 · %.0f%%" % [
 				int(params.get("amount", 24)), float(params.get("stamp", 0.3)) * 100.0
 			]
+			match clampi(int(params.get("mode", 0)), 0, 2):
+				1:
+					scatter_text += " · 沿路径"
+				2:
+					scatter_text += " · 沿画布"
 			var level := float(params.get("level", 1.0))
 			if not is_equal_approx(level, 1.0):
 				scatter_text += " · 亮度 %.2f" % level
@@ -3570,7 +3643,8 @@ func build_vine_preset() -> void:
 	connect_nodes(stem_draw, blend, 0)
 	connect_nodes(brush_path, brush, 0)
 	connect_nodes(brush, scatter, 0)
-	connect_nodes(stem, scatter, 1)
+	# The leaves sit on the drawn stem, so they follow the stroke as it grows.
+	connect_nodes(stem_draw, scatter, 1)
 	connect_nodes(scatter, blend, 1)
 	connect_nodes(blend, out, 0)
 	# The stem gets thinner towards its tip, so the vine reads as a growing line.
@@ -3667,7 +3741,7 @@ func build_vine_preset() -> void:
 	get_node_by_id(scatter)["params"].merge(
 		{
 			"amount": 30,
-			"mode": 1,
+			"mode": 2,
 			"spread": 1.0,
 			"path_width": 0.08,
 			"follow_tangent": false,
