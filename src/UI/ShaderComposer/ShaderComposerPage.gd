@@ -118,6 +118,8 @@ var _preview_canvas_size := Vector2i.ZERO
 ## Tapping the small preview opens it at a readable size.
 var _preview_popup: PopupPanel
 var _preview_big: TextureRect
+## Backdrop of the enlarged preview, so it shows the same colours as the small one.
+var _preview_big_back: TextureRect
 var _status: Label
 ## Categorised add menu. Picking an item adds that node straight away.
 var _add_menu: MenuButton
@@ -3212,13 +3214,27 @@ func _on_preview_input(event: InputEvent) -> void:
 func _show_big_preview() -> void:
 	if not is_instance_valid(_preview_popup):
 		_preview_popup = PopupPanel.new()
+		var big_frame := Control.new()
+		big_frame.custom_minimum_size = Vector2(280, 280)
+		_preview_popup.add_child(big_frame)
+		# Same backdrop as the floating window, so the enlarged picture reads the
+		# same way instead of showing black behind a white preview.
+		_preview_big_back = TextureRect.new()
+		_preview_big_back.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+		_preview_big_back.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+		_preview_big_back.stretch_mode = TextureRect.STRETCH_TILE
+		_preview_big_back.texture_filter = CanvasItem.TEXTURE_FILTER_NEAREST
+		_preview_big_back.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		big_frame.add_child(_preview_big_back)
 		_preview_big = TextureRect.new()
+		_preview_big.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
 		_preview_big.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
 		_preview_big.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
 		_preview_big.texture_filter = CanvasItem.TEXTURE_FILTER_NEAREST
-		_preview_big.custom_minimum_size = Vector2(280, 280)
-		_preview_popup.add_child(_preview_big)
+		_preview_big.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		big_frame.add_child(_preview_big)
 		add_child(_preview_popup)
+		_apply_preview_backdrop()
 	if is_instance_valid(_preview):
 		_preview_big.texture = _preview.texture
 	var side := int(minf(size.x, size.y) * 0.82)
@@ -3646,17 +3662,21 @@ func _preview_box(width: float, max_height: float) -> Vector2:
 ## Backdrop of the floating picture: solid black, solid white, or a checker that
 ## shows where the output is transparent.
 func _apply_preview_backdrop() -> void:
-	if not is_instance_valid(_preview_back):
-		return
+	var texture: Texture2D = null
 	match _preview_backdrop:
 		1:
-			_preview_back.texture = _preview_backdrop_texture(Color(0.93, 0.93, 0.95))
+			texture = _preview_backdrop_texture(Color(0.93, 0.93, 0.95))
 		2:
 			if _preview_checker == null:
 				_preview_checker = _make_checker_texture()
-			_preview_back.texture = _preview_checker
+			texture = _preview_checker
 		_:
-			_preview_back.texture = _preview_backdrop_texture(Color(0.05, 0.05, 0.06))
+			texture = _preview_backdrop_texture(Color(0.05, 0.05, 0.06))
+	# Both the floating window and the enlarged one use the same colour.
+	if is_instance_valid(_preview_back):
+		_preview_back.texture = texture
+	if is_instance_valid(_preview_big_back):
+		_preview_big_back.texture = texture
 
 
 func _on_preview_backdrop_selected(index: int) -> void:
