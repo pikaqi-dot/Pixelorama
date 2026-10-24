@@ -95,6 +95,9 @@ var _preview_collapsed: Dictionary = {}
 var _preview: TextureRect
 ## Picture of the node selected in the side panel.
 var _node_preview: TextureRect
+## Holds the graph view and the floating output window, so the window can sit on
+## top of the graph without being a child of GraphEdit.
+var _graph_host: Control
 ## Floating window with the output of the whole graph, on top of the graph view.
 var _preview_panel: PanelContainer
 ## Title bar of that window, which is the handle used to move it.
@@ -379,7 +382,13 @@ func _build_ui() -> void:
 	_graph_edit.delete_nodes_request.connect(_on_delete_nodes_request)
 	_graph_edit.node_selected.connect(_on_node_selected)
 	_graph_edit.node_deselected.connect(_on_node_deselected)
-	_body.add_child(_graph_edit)
+	_graph_host = Control.new()
+	_graph_host.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_graph_host.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	_graph_host.clip_contents = true
+	_body.add_child(_graph_host)
+	_graph_host.add_child(_graph_edit)
+	_graph_edit.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
 
 	# The output picture floats over the graph instead of taking a column of its
 	# own: it is the shape of the canvas and can be dragged where it is handy.
@@ -397,16 +406,18 @@ func _build_ui() -> void:
 	panel_style.content_margin_top = 4
 	panel_style.content_margin_bottom = 6
 	_preview_panel.add_theme_stylebox_override("panel", panel_style)
-	_graph_edit.add_child(_preview_panel)
+	_graph_host.add_child(_preview_panel)
 	var panel_column := VBoxContainer.new()
 	panel_column.add_theme_constant_override("separation", 4)
 	_preview_panel.add_child(panel_column)
 	_preview_header = Label.new()
 	_preview_header.text = "输出预览 ⠿"
-	_preview_header.tooltip_text = "拖动这里移动预览，点图片放大"
+	_preview_header.tooltip_text = "按住这一行拖动预览，点图片放大"
 	_preview_header.mouse_filter = Control.MOUSE_FILTER_STOP
 	_preview_header.mouse_default_cursor_shape = Control.CURSOR_MOVE
-	_preview_header.add_theme_font_size_override("font_size", 12)
+	_preview_header.custom_minimum_size = Vector2(0, 28)
+	_preview_header.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	_preview_header.add_theme_font_size_override("font_size", 13)
 	_preview_header.gui_input.connect(_on_preview_header_input)
 	panel_column.add_child(_preview_header)
 	_preview = TextureRect.new()
@@ -417,7 +428,7 @@ func _build_ui() -> void:
 	_preview.tooltip_text = "输出节点的结果，点一下放大"
 	_preview.gui_input.connect(_on_preview_input)
 	panel_column.add_child(_preview)
-	_graph_edit.resized.connect(_fit_preview_panel)
+	_graph_host.resized.connect(_fit_preview_panel)
 
 	_side = VBoxContainer.new()
 	_body.add_child(_side)
@@ -3599,16 +3610,18 @@ func _preview_box(width: float, max_height: float) -> Vector2:
 ## area. It runs again when the graph area changes size, so the window keeps a
 ## sensible size on a phone and on a desktop.
 func _fit_preview_panel() -> void:
-	if not is_instance_valid(_preview_panel) or not is_instance_valid(_graph_edit):
+	if not is_instance_valid(_preview_panel) or not is_instance_valid(_graph_host):
 		return
-	var box_width := clampf(_graph_edit.size.x * 0.34, 96.0, 220.0)
-	var box := _preview_box(box_width, maxf(_graph_edit.size.y * 0.45, 80.0))
-	_preview_panel.custom_minimum_size = box + Vector2(12.0, 32.0)
-	if (
-		not _preview_placed
-		and _graph_edit.size.x >= box.x
-		and _graph_edit.size.y >= box.y
-	):
+	var host := _graph_host.size
+	var box_width := clampf(host.x * 0.34, 96.0, 220.0)
+	var box := _preview_box(box_width, maxf(host.y * 0.45, 80.0))
+	# The image fills the frame, and the frame is the canvas shape plus room for
+	# the title bar, so nothing is squashed and nothing takes room it does not use.
+	if is_instance_valid(_preview):
+		_preview.custom_minimum_size = box
+	_preview_panel.custom_minimum_size = box + Vector2(14.0, 44.0)
+	_preview_panel.size = _preview_panel.custom_minimum_size
+	if not _preview_placed and host.x >= box.x and host.y >= box.y:
 		_preview_panel.position = Vector2(12, 12)
 		_preview_placed = true
 	_clamp_preview_panel()
@@ -3617,9 +3630,9 @@ func _fit_preview_panel() -> void:
 ## Keeps the floating output window inside the graph area, so it cannot be
 ## dragged off screen where it could never be grabbed again.
 func _clamp_preview_panel() -> void:
-	if not is_instance_valid(_preview_panel) or not is_instance_valid(_graph_edit):
+	if not is_instance_valid(_preview_panel) or not is_instance_valid(_graph_host):
 		return
-	var limit := _graph_edit.size - _preview_panel.size
+	var limit := _graph_host.size - _preview_panel.size
 	_preview_panel.position = _preview_panel.position.clamp(
 		Vector2.ZERO, Vector2(maxf(limit.x, 0.0), maxf(limit.y, 0.0))
 	)
@@ -3646,19 +3659,23 @@ func _apply_layout() -> void:
 		return
 	var narrow := size.x < NARROW_WIDTH
 	_body.vertical = narrow
+	# Zen mode hides the graph, so the floating window would only cover the
+	# parameters that the mode is meant to give the whole page.
+	if is_instance_valid(_preview_panel):
+		_preview_panel.visible = not _zen_mode
 	_fit_preview_panel()
 	if is_instance_valid(_node_preview):
 		_node_preview.custom_minimum_size = _preview_box(150.0, maxf(size.y * 0.3, 90.0))
 	if _zen_mode:
 		# The graph is hidden, so the parameters can use the whole height.
-		_graph_edit.custom_minimum_size = Vector2.ZERO
+		_graph_host.custom_minimum_size = Vector2.ZERO
 		_side.custom_minimum_size = Vector2(0, 200)
 		return
 	if narrow:
-		_graph_edit.custom_minimum_size = Vector2(0, 220)
+		_graph_host.custom_minimum_size = Vector2(0, 220)
 		_side.custom_minimum_size = Vector2(0, 260)
 	else:
-		_graph_edit.custom_minimum_size = Vector2(320, 0)
+		_graph_host.custom_minimum_size = Vector2(320, 0)
 		_side.custom_minimum_size = Vector2(300, 0)
 
 
