@@ -78,10 +78,6 @@ const SECOND_INPUT_LABELS := {
 	"bloom": "遮罩",
 	"scatter": "密度",
 }
-## Second inputs that are read as coverage only: a filter mask or a scatter
-## density. They cut or place the artwork instead of painting it, so the previews
-## of those branches stay white.
-const COVERAGE_INPUT_TYPES := ["outline", "glow", "bloom", "scatter"]
 
 const NOISE_TYPES := ["Simplex", "Simplex Smooth", "Perlin", "Cellular", "Value"]
 const NOISE_TYPE_VALUES := [
@@ -2045,17 +2041,16 @@ static func _path_point_at(flat: PackedVector2Array, t: float) -> Dictionary:
 
 ## Preview of what one node outputs, used by the frame under the nodes in the
 ## graph editor and by the picture in the side panel. It evaluates the node the
-## same way the generator does and maps the value through the ramp of the output
-## node, so the picture always matches that branch of the graph.
+## same way the generator does, and maps that value through the ramp of the node
+## itself, wherever the node carries a colour.
 func preview_node(node_id: String, size: Vector2i) -> Image:
 	_resolve_animations()
-	# Colour is not only decided at the output, every node feeds the same ramp, so
-	# a preview is shown in the colour that value ends up with. Branches the colour
-	# never reaches are shown white: a node left out of the output chain, and
-	# everything behind a mask, a density or a canvas read as transparency, paints
-	# nothing, and pretending otherwise made a mask look like artwork.
-	var ramp := _preview_ramp()
-	var grey := ramp.is_empty() or not colors_reach(node_id)
+	# Every node is previewed in its own colour, and only the output node has one.
+	# A node without a ramp is a plain value field, so it is drawn white on a
+	# transparent background rather than borrowing the colour of another node,
+	# which used to paint the whole graph in the palette of the output.
+	var ramp := _node_ramp(node_id)
+	var grey := ramp.is_empty()
 	var steps := maxi(int(ramp.get("steps", 2)), 2)
 	var color_a: Color = ramp.get("color_a", Color.WHITE)
 	var color_mid: Color = ramp.get("color_mid", color_a)
@@ -2093,13 +2088,14 @@ func preview_node(node_id: String, size: Vector2i) -> Image:
 	return Image.create_from_data(size.x, size.y, false, Image.FORMAT_RGBA8, bytes)
 
 
-## Ramp of the output node, read without generating a picture. The previews use it
-## so a branch is judged in the colours it will add to the artwork.
-func _preview_ramp() -> Dictionary:
-	var output_id := output_node_id()
-	if output_id.is_empty():
+## Colour ramp the node itself defines, read without generating a picture. Only
+## the output node has one today, so the rest of the graph is previewed white: a
+## preview never takes the colour of a node the user did not colour.
+func _node_ramp(node_id: String) -> Dictionary:
+	var node := get_node_by_id(node_id)
+	if node.is_empty():
 		return {}
-	var params: Dictionary = params_for(get_node_by_id(output_id))
+	var params: Dictionary = params_for(node)
 	if not params.has("color_a") or not params.has("color_b"):
 		return {}
 	var color_a: Color = params["color_a"]
@@ -2109,64 +2105,12 @@ func _preview_ramp() -> Dictionary:
 		"color_mid": params.get("color_mid", color_a),
 		"color_b": params["color_b"],
 		"mid_position": clampf(float(params.get("mid_position", 0.5)), 0.05, 0.95),
-		# A transparent output is what makes a preview a shape instead of a
+		# A transparent ramp is what makes a preview a shape instead of a
 		# rectangle, so both switches are read here too.
 		"transparent": bool(params.get("transparent", false)),
 		"alpha_cut": clampf(float(params.get("alpha_cut", 0.0)), 0.0, 1.0),
 		"alpha_from_value": bool(params.get("alpha_from_value", false)),
 	}
-
-
-## Whether the colour of the output ramp reaches [param node_id]. Colour walks
-## back from the output node along the wires and stops where a node only reads
-## its input as coverage, so a node that is not part of the artwork, or that sits
-## behind a mask, is known to paint nothing.
-func colors_reach(node_id: String) -> bool:
-	if node_id.is_empty():
-		return false
-	var target := get_node_by_id(node_id)
-	if target.is_empty() or _reads_coverage(target):
-		return false
-	var output_id := output_node_id()
-	if output_id.is_empty():
-		return false
-	if output_id == node_id:
-		return true
-	# Breadth first from the output, because the node being previewed can be
-	# several wires away and the graph is small enough to walk on every refresh.
-	var seen := {output_id: true}
-	var queue: Array = [output_id]
-	while not queue.is_empty():
-		var current: String = queue.pop_back()
-		if current == node_id:
-			return true
-		var current_node := get_node_by_id(current)
-		if current_node.is_empty() or _reads_coverage(current_node):
-			continue
-		var inputs: Dictionary = current_node["inputs"]
-		var slots: Array = inputs.keys()
-		slots.sort()
-		for slot in slots:
-			if int(slot) == 1 and str(current_node["type"]) in COVERAGE_INPUT_TYPES:
-				continue
-			var upstream := str(inputs[slot])
-			if upstream.is_empty() or seen.has(upstream):
-				continue
-			seen[upstream] = true
-			queue.append(upstream)
-	return false
-
-
-## Whether a node turns its input into coverage instead of a picture: a canvas
-## read through its transparency is a mask, so nothing upstream of it is coloured
-## either. The path mode of the same node draws lines, which do carry colour.
-func _reads_coverage(node: Dictionary) -> bool:
-	if str(node["type"]) != "pixel_art":
-		return false
-	var params: Dictionary = params_for(node)
-	if int(params.get("source", 0)) == 1:
-		return false
-	return int(params.get("channel", 0)) != 0
 
 
 ## Cache key of a rasterised node image. The size is part of the key, so the
