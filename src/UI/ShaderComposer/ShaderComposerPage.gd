@@ -181,8 +181,17 @@ var _menu_node_id := ""
 var _hold_timer: Timer
 ## Saved graph presets, and the small dialog used to name them.
 var _preset_menu: MenuButton
-## Secondary actions, so the toolbar stays short on a phone.
-var _more_menu: MenuButton
+## Toggles the full screen parameter mode from the toolbar.
+var _zen_button: Button
+## Group being edited. Inside a group only its members are on screen, and the
+## toolbar shows the way back.
+var _open_group := ""
+var _group_bar: HBoxContainer
+var _group_label: Label
+var _group_dialog: ConfirmationDialog
+var _group_name: LineEdit
+## Nodes waiting for a name before they become a group.
+var _group_members: Array[String] = []
 ## Hides the graph to give the parameters the whole page.
 var _zen_mode := false
 var _preset_paths: Array[String] = []
@@ -282,10 +291,15 @@ func close_page() -> void:
 		if is_instance_valid(_play_button):
 			_play_button.text = "▶ 播放"
 		_editing_layer = null
-	_graph_fingers.clear()
-	_graph_gesture = false
-	hide()
-	page_closed.emit()
+		_graph_fingers.clear()
+		_graph_gesture = false
+		# Closing the page leaves the graph, so the next opening starts at the top
+		# instead of inside whatever group was being edited.
+		if not _open_group.is_empty():
+			_open_group = ""
+			_refresh_graph()
+		hide()
+		page_closed.emit()
 
 
 func is_open() -> bool:
@@ -364,15 +378,30 @@ func _build_ui() -> void:
 	_build_add_menu()
 	toolbar.add_child(_add_menu)
 	toolbar.add_child(_make_button("多选", _on_multi_select_pressed, "打开后连续点节点即可多选"))
-	toolbar.add_child(_make_button("组合", _on_group_pressed, "把选中的节点放进一个可折叠的组"))
+	toolbar.add_child(
+		_make_button("组合", _on_group_pressed, "把选中的节点收成一个组合节点，双击进入编辑")
+	)
+	toolbar.add_child(_make_button("复制", _on_copy_pressed, "复制选中的节点"))
+	toolbar.add_child(_make_button("删除", _on_delete_pressed, "删除选中的节点"))
+	toolbar.add_child(_make_button("断开输入", _disconnect_selected, "断开选中节点的输入连线"))
+	toolbar.add_child(_make_button("刷新", func() -> void: _refresh_preview(), "重新生成预览"))
+	toolbar.add_child(_make_button("导出…", _show_export_dialog, "导出成 Godot 场景"))
+	_zen_button = _make_button("参数全屏", _toggle_zen, "把参数面板铺满整个页面")
+	toolbar.add_child(_zen_button)
 	toolbar.add_child(_make_button("撤销", _undo, "Ctrl+Z"))
 	toolbar.add_child(_make_button("重做", _redo, "Ctrl+Y"))
-	_more_menu = MenuButton.new()
-	_more_menu.text = "更多"
-	_more_menu.custom_minimum_size = Vector2(0, TOUCH_SIZE)
-	_more_menu.add_theme_font_size_override("font_size", TOUCH_FONT_SIZE)
-	_build_more_menu()
-	toolbar.add_child(_more_menu)
+	# Only shown inside a group: where you are, and the two ways back out.
+	_group_bar = HBoxContainer.new()
+	_group_label = Label.new()
+	_group_label.add_theme_font_size_override("font_size", 13)
+	_group_label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	_group_bar.add_child(_group_label)
+	_group_bar.add_child(_make_button("返回", _leave_group, "回到主画布"))
+	_group_bar.add_child(
+		_make_button("取消组合", _dissolve_open_group, "拆掉这个组，里面的节点都保留")
+	)
+	_group_bar.visible = false
+	toolbar.add_child(_group_bar)
 	_preset_menu = MenuButton.new()
 	_preset_menu.text = "预设"
 	_preset_menu.custom_minimum_size = Vector2(0, TOUCH_SIZE)
@@ -614,8 +643,12 @@ func _build_ui() -> void:
 
 
 ## Rebuilds the graph view from the data, keeping where the user put each node.
-## Nodes inside a collapsed group are hidden, and the group stands in for them.
+## Nodes inside a collapsed group are hidden and the group stands in for them;
+## inside an opened group it is the other way round, only its members are shown.
 func _refresh_graph() -> void:
+	# A group can disappear while it is open, through undo or a preset load.
+	if not _open_group.is_empty() and graph.get_group(_open_group).is_empty():
+		_open_group = ""
 	for child in _graph_edit.get_children():
 		if child is GraphNode:
 			var stored: Dictionary = graph.get_node_by_id(str(child.name))
@@ -641,8 +674,10 @@ func _refresh_graph() -> void:
 			continue
 		visible[node["id"]] = true
 		_graph_edit.add_child(_make_graph_node(node))
-	for group: Dictionary in graph.groups:
-		_graph_edit.add_child(_make_group_node(group))
+	# Inside a group the stand-in nodes are not shown, only its members.
+	if _open_group.is_empty():
+		for group: Dictionary in graph.groups:
+			_graph_edit.add_child(_make_group_node(group))
 
 	# Inner connections, only when both ends are on screen.
 	for node: Dictionary in graph.nodes:
@@ -657,7 +692,7 @@ func _refresh_graph() -> void:
 
 	# A collapsed group talks to the outside through its own ports.
 	for group: Dictionary in graph.groups:
-		if not bool(group.get("collapsed", false)):
+		if not _open_group.is_empty() or not bool(group.get("collapsed", false)):
 			continue
 		var edges: Dictionary = graph.group_edges(group)
 		var incoming: Array = edges["incoming"]
@@ -679,9 +714,16 @@ func _refresh_graph() -> void:
 			still_selected.append(node_id)
 	_selected_ids = still_selected
 	_status.text = "节点 %d · 组 %d" % [graph.nodes.size(), graph.groups.size()]
+	_update_group_bar()
 
 
+## True when a node should not be drawn in the current view. Inside an opened
+## group everything that is not a member is hidden; outside it, only the members
+## of a collapsed group are.
 func _is_hidden_by_group(node_id: String) -> bool:
+	if not _open_group.is_empty():
+		var open: Dictionary = graph.get_group(_open_group)
+		return not (open.get("nodes", []) as Array).has(node_id)
 	var group: Dictionary = graph.group_of_node(node_id)
 	return not group.is_empty() and bool(group.get("collapsed", false))
 
@@ -717,17 +759,39 @@ func _make_group_node(group: Dictionary) -> GraphNode:
 			Vector2(0, 32)
 		)
 	)
-	if collapsed:
-		row.add_child(
-			_make_button(
-				"解散",
-				func() -> void: _dissolve_group(str(group["id"])),
-				"拆掉这个组，节点都保留",
-				Vector2(0, 32)
-			)
+	row.add_child(
+		_make_button(
+			"进入",
+			func() -> void: _enter_group(str(group["id"])),
+			"只显示组里的节点，改完可以返回",
+			Vector2(0, 32)
 		)
+	)
+	row.add_child(
+		_make_button(
+			"取消组合",
+			func() -> void: _dissolve_group(str(group["id"])),
+			"拆掉这个组，节点都保留",
+			Vector2(0, 32)
+		)
+	)
 	graph_node.add_child(row)
+	# Double clicking the group node is the shortcut for the 进入 button.
+	graph_node.gui_input.connect(_on_group_node_input.bind(str(group["id"])))
 	return graph_node
+
+
+## Double clicking a group node opens it, the way a nested graph works.
+func _on_group_node_input(event: InputEvent, group_id: String) -> void:
+	if not (event is InputEventMouseButton):
+		return
+	var button := event as InputEventMouseButton
+	if button.button_index != MOUSE_BUTTON_LEFT or not button.pressed:
+		return
+	if not button.double_click:
+		return
+	_enter_group(group_id)
+	_graph_edit.accept_event()
 
 
 func _toggle_group(group_id: String) -> void:
@@ -742,22 +806,113 @@ func _toggle_group(group_id: String) -> void:
 func _dissolve_group(group_id: String) -> void:
 	_push_undo()
 	graph.remove_group(group_id)
+	if _open_group == group_id:
+		_open_group = ""
+	_update_group_bar()
 	_refresh_graph()
 
 
-## Puts the selected nodes into a new group that can then be collapsed.
+## Ids of the nodes the graph view has selected right now. A rubber band selection
+## only reports one node at a time as it grows, so the view is read directly
+## instead of trusting the events.
+func _selected_graph_node_ids() -> Array[String]:
+	var ids: Array[String] = []
+	for child in _graph_edit.get_children():
+		if child is GraphNode and (child as GraphNode).selected:
+			ids.append(str((child as GraphNode).name))
+	if ids.is_empty() and not _selected_id.is_empty():
+		ids.append(_selected_id)
+	return ids
+
+
+## Groups the selected nodes into one node. The name is asked first, because the
+## group node carries it and the whole point is to read the graph by names.
 func _on_group_pressed() -> void:
-	if _selected_ids.size() < 2:
+	var members := _selected_graph_node_ids()
+	if members.size() < 2:
 		# The status line is rewritten by the preview, so use the app notification.
-		Global.notification_label("先选中两个以上节点再组合")
+		Global.notification_label("先框选或选中两个以上节点再组合")
+		return
+	_show_group_dialog(members)
+
+
+func _show_group_dialog(members: Array[String]) -> void:
+	if not is_instance_valid(_group_dialog):
+		_group_dialog = ConfirmationDialog.new()
+		_group_dialog.title = "组合名称"
+		_group_name = LineEdit.new()
+		_group_name.custom_minimum_size = Vector2(220, TOUCH_SIZE)
+		_group_name.add_theme_font_size_override("font_size", TOUCH_FONT_SIZE)
+		_group_dialog.add_child(_group_name)
+		_group_dialog.confirmed.connect(_create_group)
+		add_child(_group_dialog)
+	_group_members = members
+	_group_name.text = "组 %d" % (graph.groups.size() + 1)
+	_group_dialog.popup_centered(Vector2i(340, 160))
+	_group_name.grab_focus()
+	_group_name.select_all()
+
+
+## Turns the pending selection into a group node, folded into a single node.
+func _create_group() -> void:
+	if _group_members.is_empty():
 		return
 	_push_undo()
-	var group_id: String = graph.add_group(_selected_ids)
+	var group_id: String = graph.add_group(_group_members, _group_name.text.strip_edges())
+	_group_members.clear()
 	if group_id.is_empty():
 		Global.notification_label("选中的节点已经在别的组里")
 		return
+	graph.set_group_collapsed(group_id, true)
 	_selected_ids.clear()
+	_selected_id = ""
+	_show_params("")
 	_refresh_graph()
+	Global.notification_label("已组合成「%s」，双击可以进入" % graph.get_group(group_id)["name"])
+
+
+## Opens a group: only its members stay on screen, and its input and output wires
+## are the ones that cross its border.
+func _enter_group(group_id: String) -> void:
+	var group: Dictionary = graph.get_group(group_id)
+	if group.is_empty() or not _open_group.is_empty():
+		return
+	graph.set_group_collapsed(group_id, false)
+	_open_group = group_id
+	_selected_id = ""
+	_selected_ids.clear()
+	_show_params("")
+	_refresh_graph()
+	Global.notification_label("进入「%s」，改完按「返回」回主画布" % str(group["name"]))
+
+
+## Back to the whole graph.
+func _leave_group() -> void:
+	if _open_group.is_empty():
+		return
+	_open_group = ""
+	_selected_id = ""
+	_selected_ids.clear()
+	_show_params("")
+	_refresh_graph()
+
+
+## Dissolves the group being edited and goes back to the main view.
+func _dissolve_open_group() -> void:
+	if _open_group.is_empty():
+		return
+	_dissolve_group(_open_group)
+
+
+## Shows the name of the group being edited, plus the way back, only while one is
+## open.
+func _update_group_bar() -> void:
+	if not is_instance_valid(_group_bar):
+		return
+	var group: Dictionary = graph.get_group(_open_group) if not _open_group.is_empty() else {}
+	_group_bar.visible = not group.is_empty()
+	if not group.is_empty():
+		_group_label.text = "组：%s" % str(group.get("name", "组"))
 
 
 func _make_graph_node(node: Dictionary) -> GraphNode:
@@ -1260,37 +1415,6 @@ func _on_copy_pressed() -> void:
 	_schedule_preview()
 
 
-## Secondary actions live here, so the main toolbar still fits a portrait phone.
-func _build_more_menu() -> void:
-	var popup := _more_menu.get_popup()
-	popup.clear()
-	popup.add_item("复制选中", 0)
-	popup.add_item("删除选中", 1)
-	popup.add_item("刷新预览", 2)
-	popup.add_item("断开选中输入", 3)
-	popup.add_item("导出 tscn…", 5)
-	popup.add_separator()
-	popup.add_check_item("放大参数面板", 4)
-	popup.set_item_checked(popup.get_item_index(4), _zen_mode)
-	if not popup.id_pressed.is_connected(_on_more_pressed):
-		popup.id_pressed.connect(_on_more_pressed)
-
-
-func _on_more_pressed(id: int) -> void:
-	match id:
-		0:
-			_on_copy_pressed()
-		1:
-			_on_delete_pressed()
-		2:
-			_refresh_preview()
-		3:
-			_disconnect_selected()
-		4:
-			_toggle_zen()
-			_build_more_menu()
-		5:
-			_show_export_dialog()
 
 
 ## Touch friendly way to drop a wire: dragging one off a port is fiddly with a
@@ -1311,6 +1435,8 @@ func _toggle_zen() -> void:
 	_zen_mode = not _zen_mode
 	if is_instance_valid(_graph_edit):
 		_graph_edit.visible = not _zen_mode
+	if is_instance_valid(_zen_button):
+		_zen_button.text = "退出全屏" if _zen_mode else "参数全屏"
 	_apply_layout()
 
 
@@ -2551,9 +2677,15 @@ func _on_node_menu_pressed(id: int) -> void:
 		2:
 			_disconnect_selected()
 		3:
-			if not _selected_ids.has(_hold_id):
-				_selected_ids.append(_hold_id)
-			_on_group_pressed()
+			# The pressed node is not necessarily part of the current selection, so
+			# it joins the others before the name is asked.
+			var members := _selected_graph_node_ids()
+			if not members.has(_hold_id):
+				members.append(_hold_id)
+			if members.size() < 2:
+				Global.notification_label("先框选或选中两个以上节点再组合")
+			else:
+				_show_group_dialog(members)
 		4:
 			_open_path_editor(_hold_id)
 		5:
