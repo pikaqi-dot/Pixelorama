@@ -1,8 +1,9 @@
 extends Control
 ## Curve strip for the line width along a stroke. The x axis is the position on
-## the curve and the y axis is a multiplier of the base width, so dragging a
-## point down thins that part of the line. Five samples are enough for a taper,
-## a bulge or a chunky middle without needing a full curve editor.
+## the path, from its start to its end. The y axis runs from the minimum width of
+## the node to its maximum, so dragging a point down thins that part of the line
+## and the area under the curve really is the stroke. Five samples are enough for
+## a taper, a bulge or a chunky middle without needing a full curve editor.
 ##
 ## The picture is painted from the same interpolation the rasteriser uses, so the
 ## strip is a true preview of the stroke instead of a sketch of it: the filled

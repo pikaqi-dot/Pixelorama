@@ -357,6 +357,19 @@ func from_dict(data: Dictionary) -> void:
 		var blur_params: Dictionary = node["params"]
 		if not blur_params.has("size") and blur_params.has("radius"):
 			blur_params["size"] = blur_params["radius"]
+	# A canvas stroke used to be one width scaled down by the profile. It is now a
+	# minimum and a maximum with the profile picking between them, and moving the
+	# old number to the maximum keeps the stroke exactly as it was.
+	for node: Dictionary in nodes:
+		if str(node["type"]) != "pixel_art":
+			continue
+		var art_params: Dictionary = node["params"]
+		if art_params.has("width_max"):
+			continue
+		var old_width := float(art_params.get("width", 0.06))
+		art_params["width_min"] = 0.0
+		art_params["width_max"] = old_width
+		art_params.erase("width")
 	groups.clear()
 	for entry in data.get("groups", []):
 		if entry is not Dictionary or not entry.has("id"):
@@ -737,9 +750,11 @@ static func default_params(type: String) -> Dictionary:
 				"frame": 0,
 				"channel": 0,
 				"invert": false,
-				# Stroke used in path mode. The profile holds the line width along
-				# the curve, from its start to its end, so a tip can taper out.
-				"width": 0.06,
+				# Stroke used in path mode. The profile is a curve from the start
+				# of the path to its end, and it picks the width between the
+				# thinnest and the thickest part of the line.
+				"width_min": 0.0,
+				"width_max": 0.06,
 				"soft": 0.0,
 				"fill": false,
 				"profile": [1.0, 1.0, 1.0, 1.0, 1.0],
@@ -2177,8 +2192,18 @@ func _canvas_path_image(
 	if flat.size() < 2:
 		return image
 	var shortest := float(mini(size.x, size.y))
-	var base := maxf(float(params.get("width", 0.06)) * shortest * 0.5, 0.5)
-	var soft := clampf(float(params.get("soft", 0.0)) * shortest, 0.0, base)
+	# The profile runs from 0 to 1 along the stroke and picks a width between the
+	# two numbers given on the node, so a taper is a curve between a thin tip and
+	# a thick middle instead of a fraction of one fixed width.
+	var low := float(params.get("width_min", params.get("width", 0.06)))
+	var high := float(params.get("width_max", params.get("width", 0.06)))
+	if low > high:
+		var swap := low
+		low = high
+		high = swap
+	var radius_low := maxf(clampf(low, 0.0, 0.6) * shortest * 0.5, 0.0)
+	var radius_high := maxf(clampf(high, 0.0, 0.6) * shortest * 0.5, 0.5)
+	var soft := clampf(float(params.get("soft", 0.0)) * shortest, 0.0, radius_high)
 	# Filling a half drawn outline would close the loop early, so the fill only
 	# appears once the whole path is there.
 	if closed and bool(params.get("fill", false)) and flat.size() >= 3:
@@ -2202,13 +2227,16 @@ func _canvas_path_image(
 		var t_from := walked / total
 		walked += segment
 		var t_to := walked / total
-		var radius_from := base * profile_at(profile, t_from)
-		var radius_to := base * profile_at(profile, t_to)
+		var radius_from := lerpf(radius_low, radius_high, profile_at(profile, t_from))
+		var radius_to := lerpf(radius_low, radius_high, profile_at(profile, t_to))
 		var span := maxi(int(ceil(from_point.distance_to(to_point) * 2.0)), 1)
 		for step in span + 1:
 			var ratio := float(step) / float(span)
+			var radius := lerpf(radius_from, radius_to, ratio)
+			# A tip thinner than the softening would smear the whole stroke, so the
+			# softening follows the local width.
 			_stamp_disc(
-				image, from_point.lerp(to_point, ratio), lerpf(radius_from, radius_to, ratio), soft
+				image, from_point.lerp(to_point, ratio), radius, minf(soft, radius)
 			)
 	return image
 
@@ -3045,7 +3073,10 @@ static func describe(node: Dictionary) -> String:
 			return path_text
 		"pixel_art":
 			if int(params.get("source", 0)) == 1:
-				var line_text := "路径线条 · 宽 %.3f" % float(params.get("width", 0.06))
+				var line_text := "路径线条 · 宽 %.3f–%.3f" % [
+					float(params.get("width_min", 0.0)),
+					float(params.get("width_max", params.get("width", 0.06))),
+				]
 				if bool(params.get("fill", false)):
 					line_text += " · 填充"
 				return line_text
@@ -3350,7 +3381,8 @@ func build_path_growth_preset() -> void:
 	get_node_by_id(canvas)["params"].merge(
 		{
 			"source": 1,
-			"width": 0.05,
+			"width_min": 0.0,
+			"width_max": 0.05,
 			"soft": 0.02,
 			"profile": [0.35, 1.0, 0.9, 1.0, 0.25],
 		},
@@ -3476,7 +3508,8 @@ func build_scatter_preset(layer_material := true) -> void:
 		get_node_by_id(brush)["params"].merge(
 			{
 				"source": 1,
-				"width": 0.02,
+				"width_min": 0.0,
+				"width_max": 0.02,
 				"soft": 0.01,
 				"fill": true,
 			},
@@ -3544,7 +3577,8 @@ func build_vine_preset() -> void:
 	get_node_by_id(stem_draw)["params"].merge(
 		{
 			"source": 1,
-			"width": 0.035,
+			"width_min": 0.0,
+			"width_max": 0.035,
 			"soft": 0.01,
 			"profile": [0.5, 1.0, 1.0, 0.75, 0.35],
 		},
@@ -3623,7 +3657,8 @@ func build_vine_preset() -> void:
 	get_node_by_id(brush)["params"].merge(
 		{
 			"source": 1,
-			"width": 0.02,
+			"width_min": 0.0,
+			"width_max": 0.02,
 			"soft": 0.01,
 			"fill": true,
 		},

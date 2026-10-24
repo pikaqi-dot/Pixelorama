@@ -2744,20 +2744,40 @@ func _build_canvas_image_section(id: String, params: Dictionary) -> void:
 func _build_canvas_line_section(id: String, params: Dictionary) -> void:
 	var line_hint := Label.new()
 	line_hint.text = (
-		"把「路径」节点接到输入 1，这里把曲线画成像素线条。"
-		+ "线宽按画布短边比例；下面的曲线是线宽沿路径的变化。"
+		"把「路径」节点接到输入 1，这里把曲线画成像素线条。宽度按画布短边比例："
+		+ "曲线 0 取最小宽度、1 取最大宽度，所以下面是沿路径的粗细变化。"
 		+ "这个模式只画路径，不读图层，所以绘画窗口画的内容不会出现在这里。"
 	)
 	line_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	line_hint.add_theme_font_size_override("font_size", 13)
 	_params_target.add_child(line_hint)
-	_add_slider("线宽", 0.005, 0.3, 0.005, float(params.get("width", 0.06)), params, "width")
+	# Two numbers instead of one: the curve slides between the thinnest and the
+	# thickest part, which is what makes a taper or a bulb easy to describe.
+	_add_slider(
+		"最小宽度",
+		0.0,
+		0.3,
+		0.005,
+		float(params.get("width_min", 0.0)),
+		params,
+		"width_min"
+	)
+	_add_slider(
+		"最大宽度",
+		0.0,
+		0.3,
+		0.005,
+		float(params.get("width_max", params.get("width", 0.06))),
+		params,
+		"width_max"
+	)
 	_add_slider("羽化", 0.0, 0.2, 0.005, float(params.get("soft", 0.0)), params, "soft")
 	_add_check("闭合填充（路径需闭合）", bool(params.get("fill", false)), params, "fill")
 	var curve_hint := Label.new()
 	curve_hint.text = (
-		"线宽曲线：横轴是从起点到终点的位置，纵轴是线宽倍率。直接点某一列就设成那个高度，"
-		+ "按住圆点拖动不会跳动，滚轮或 −2%/+2% 可以微调最后动过的圆点。"
+		"线宽曲线：横轴是从起点到终点的位置，纵轴 0 是最小宽度、1 是最大宽度。"
+		+ "直接点某一列就设成那个高度，按住圆点拖动不会跳动，"
+		+ "滚轮或 −2%/+2% 可以微调最后动过的圆点。"
 		+ "浅色面积就是这条线的实际粗细，下面的预设可以一键成形。"
 	)
 	curve_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
