@@ -27,6 +27,12 @@ const PREVIEW_LIMIT_PLAYBACK := 160
 const PREVIEW_BUDGET_MSEC := 180.0
 ## Tighter budget while playing, where a steady frame rate matters more.
 const PLAYBACK_BUDGET_MSEC := 90.0
+## How long after a change the preview still counts as being dragged. Until then
+## it renders a cheaper picture, so a slider under a finger stays responsive.
+const PREVIEW_FOLLOW_MSEC := 350.0
+## Share of the budget used while a change is still arriving. The last pass, once
+## the changes stop, runs at full size.
+const PREVIEW_FOLLOW_BUDGET := 0.55
 ## Longest time one slice of the preview may take before the frame is handed
 ## back, so input and scrolling stay responsive while a graph is painted.
 const PREVIEW_SLICE_MSEC := 12.0
@@ -222,6 +228,9 @@ var _preview_side := 0
 var _preview_msec := 0.0
 ## A sliced preview is in flight; new requests are merged into it.
 var _preview_busy := false
+## Time of the last change that asked for a preview, used to tell a slider being
+## dragged from a value that is already settled.
+var _last_change_msec := 0
 var _preview_pending := false
 ## Pauses previews while a one shot generation runs, so its caches are not
 ## cleared halfway through.
@@ -1035,10 +1044,12 @@ func _make_node_preview(node: Dictionary) -> Control:
 func _process(_delta: float) -> void:
 	if _thumb_queue.is_empty() or not visible:
 		return
-	if _preview_busy:
-		# A sliced generation is mid-frame; rasterising a thumbnail now would
-		# make it rebuild its cached nodes at the thumbnail size.
-		return
+	# A dragged slider keeps asking for a new preview, so a pass is running almost
+	# without a break. Waiting for it would leave every node picture frozen until
+	# the finger stops, which is exactly what made dragging feel stuck; the budget
+	# below is what keeps the two out of each other's way instead. The raster cache
+	# holds the preview size and the thumbnail size at the same time, so the slice
+	# that is mid-flight keeps finding its cached strokes.
 	var budget := THUMB_BUDGET_PLAYBACK_MSEC if _is_playing() else THUMB_BUDGET_MSEC
 	var deadline := Time.get_ticks_usec() + int(budget * 1000.0)
 	var index := 0
@@ -3634,6 +3645,7 @@ func _show_big_preview() -> void:
 ## alone: restarting it on every change would hold the picture back until the
 ## finger stops, which made dragging feel like it did not update at all.
 func _schedule_preview() -> void:
+	_last_change_msec = Time.get_ticks_msec()
 	if is_instance_valid(_preview_timer) and _preview_timer.is_stopped():
 		_preview_timer.start()
 
@@ -3672,6 +3684,14 @@ func _refresh_preview() -> void:
 		# Playback is judged by how smooth it looks, not by the last pixel.
 		cap = mini(cap, PREVIEW_LIMIT_PLAYBACK)
 	var budget := PLAYBACK_BUDGET_MSEC if playing else PREVIEW_BUDGET_MSEC
+	# A change that is still arriving — a slider under a finger, a stroke in the
+	# canvas window — is answered with a cheaper picture, so the preview follows
+	# the finger instead of freezing between passes. A full size pass runs as soon
+	# as the changes stop, and that is the one left on screen.
+	var change_at := _last_change_msec
+	var following := Time.get_ticks_msec() - change_at < int(PREVIEW_FOLLOW_MSEC)
+	if following:
+		budget *= PREVIEW_FOLLOW_BUDGET
 	var side := cap
 	if _preview_side > 0 and _preview_msec > 0.5:
 		side = clampi(int(float(_preview_side) * sqrt(budget / _preview_msec)), 48, cap)
@@ -3724,7 +3744,9 @@ func _refresh_preview() -> void:
 		"动态" if graph.uses_time() else "静态",
 	]
 	_preview_busy = false
-	if _preview_pending:
+	if _preview_pending or (following and _last_change_msec == change_at):
+		# A cheap pass is never the last one: when nothing new came in while it
+		# ran, one more pass at full size follows, so the sharp picture stays.
 		_preview_pending = false
 		_refresh_preview()
 

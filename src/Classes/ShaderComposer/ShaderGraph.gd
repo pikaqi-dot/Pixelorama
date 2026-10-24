@@ -202,8 +202,11 @@ const PREVIEW_EMPTY := 0.004
 ## How many different raster sizes are kept at once. A thumbnail, the picture in
 ## the side panel and the main preview each use their own size, so keeping them
 ## apart saves rebuilding every stroke and particle field whenever the size
-## changes. More distinct sizes than this drop everything, which bounds the memory.
-const RASTER_SIZES_MAX := 3
+## changes. The preview keeps generating while the thumbnails are painted, so the
+## four sizes of a drag in progress stay side by side instead of throwing the
+## strokes of the running pass away. More distinct sizes than this drop
+## everything, which bounds the memory.
+const RASTER_SIZES_MAX := 4
 
 ## Nodes of the graph, as dictionaries: id, type, position, params, inputs.
 var nodes: Array[Dictionary] = []
