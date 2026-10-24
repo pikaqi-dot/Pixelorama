@@ -46,6 +46,8 @@ const MAGNIFIER_MIN_INTERVAL_MSEC := 40
 ## How much larger than the lens the sampled square is when the view is rotated.
 ## A turned square has to cover the round lens with its own inscribed circle.
 const MAGNIFIER_ROTATION_SCALE := 1.42
+## Height of the tab strip that switches between drawing and the node editor.
+const VIEW_TABS_HEIGHT := 36
 
 var shader_disabled := false
 var transparency_material: ShaderMaterial
@@ -991,50 +993,43 @@ func open_shader_composer(layer: BaseLayer = null) -> void:
 		_show_composer_view(true)
 
 
-## Puts the drawing tab and the node editor tab next to the project tabs, so both
-## are always one tap away. The project tabs are moved into a row of their own,
-## which is the only change made to the existing interface tree.
+## Puts the two view tabs in a strip of their own above the dock, so the node
+## editor can hide the whole interface and still leave the way back to drawing.
 func _ensure_view_tabs() -> void:
 	if is_instance_valid(_view_tabs):
 		return
-	var main_canvas := get_node_or_null("DockableContainer/Main Canvas")
-	if main_canvas == null:
-		return
+	var bar := PanelContainer.new()
+	bar.name = "ViewTabsBar"
+	var style := StyleBoxFlat.new()
+	style.bg_color = Color(0.17, 0.17, 0.2)
+	style.content_margin_left = 8
+	style.content_margin_right = 8
+	bar.add_theme_stylebox_override("panel", style)
+	bar.set_anchors_and_offsets_preset(Control.PRESET_TOP_WIDE)
+	bar.offset_bottom = VIEW_TABS_HEIGHT
+	add_child(bar)
 	_view_tabs = TabBar.new()
 	_view_tabs.name = "ViewTabs"
 	_view_tabs.add_tab("绘画")
 	_view_tabs.add_tab("节点图层")
 	_view_tabs.tab_changed.connect(_on_view_tab_changed)
-	var tabs_container := main_canvas.get_node_or_null("TabsContainer")
-	if tabs_container == null:
-		main_canvas.add_child(_view_tabs)
-		main_canvas.move_child(_view_tabs, 1)
-		return
-	var row := tabs_container.get_node_or_null("ViewTabsRow") as HBoxContainer
-	if row == null:
-		row = HBoxContainer.new()
-		row.name = "ViewTabsRow"
-		row.add_theme_constant_override("separation", 10)
-		tabs_container.add_child(row)
-		tabs_container.move_child(row, 0)
-	var project_tabs := tabs_container.get_node_or_null("TabBar") as Control
-	if project_tabs != null and project_tabs.get_parent() != row:
-		project_tabs.reparent(row)
-		project_tabs.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	row.add_child(_view_tabs)
+	bar.add_child(_view_tabs)
+	# Both views start right below the strip, so nothing jumps when switching.
+	if is_instance_valid(dockable_container):
+		dockable_container.offset_top = VIEW_TABS_HEIGHT
 
 
-## Creates the node editor inside the canvas area, on first use.
+## Creates the node editor as a window sized overlay below the view tabs, on
+## first use. It covers the dock instead of squeezing into the canvas area, so
+## the graph gets every pixel the strip leaves free.
 func _ensure_shader_composer() -> void:
 	if is_instance_valid(_shader_composer):
 		return
-	var main_canvas := get_node_or_null("DockableContainer/Main Canvas")
-	if main_canvas == null:
-		return
 	_shader_composer = load("res://src/UI/ShaderComposer/ShaderComposerPage.gd").new()
-	main_canvas.add_child(_shader_composer)
-	_shader_composer.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	_shader_composer.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	add_child(_shader_composer)
+	_shader_composer.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	_shader_composer.offset_top = VIEW_TABS_HEIGHT
+	_shader_composer.visible = false
 	if _shader_composer.has_signal("page_closed"):
 		_shader_composer.connect("page_closed", _on_composer_closed)
 
@@ -1043,18 +1038,12 @@ func _on_view_tab_changed(tab: int) -> void:
 	_show_composer_view(tab == 1)
 
 
-## Swaps the canvas rows for the node editor. The project tabs and the rest of
-## the interface stay in place, so the drawing tools never move.
+## Hides the whole dock while the node editor is shown, which is what makes the
+## editor full screen. Everything comes back untouched when the drawing tab is
+## chosen again.
 func _show_composer_view(active: bool) -> void:
-	var main_canvas := get_node_or_null("DockableContainer/Main Canvas")
-	if main_canvas == null:
-		return
-	var ruler := main_canvas.get_node_or_null("HorizontalRuler") as CanvasItem
-	var viewport_row := main_canvas.get_node_or_null("ViewportandVerticalRuler") as CanvasItem
-	if ruler != null:
-		ruler.visible = not active
-	if viewport_row != null:
-		viewport_row.visible = not active
+	if is_instance_valid(dockable_container):
+		dockable_container.visible = not active
 	if not is_instance_valid(_shader_composer):
 		return
 	if active:
