@@ -26,6 +26,11 @@ const NODE_TYPES := {
 	"crop": {"label": "Crop", "inputs": 1},
 	"padding": {"label": "Padding", "inputs": 1},
 	"echo": {"label": "Echo", "inputs": 1},
+	"follow_path": {"label": "Follow Path", "inputs": 2},
+	"mesh_warp": {"label": "Mesh Warp", "inputs": 1},
+	"area_warp": {"label": "Area Warp", "inputs": 2},
+	"nine_slice": {"label": "Nine Slice", "inputs": 1},
+	"crop_content": {"label": "Crop Content", "inputs": 1},
 	"warp": {"label": "Warp", "inputs": 2},
 	"math": {"label": "Math", "inputs": 1},
 	"blend": {"label": "Blend", "inputs": 2},
@@ -46,6 +51,7 @@ const MATH_OPS := [
 const BLEND_OPS := ["Mix", "Add", "Multiply", "Screen", "Difference"]
 const POLAR_MODES := ["矩形 → 极坐标", "极坐标 → 矩形"]
 const ECHO_MODES := ["最大值（拖影）", "平均值（残影）"]
+const PATH_SHAPES := ["圆形", "水平", "垂直", "正弦", "方形", "8 字"]
 ## Coordinates closer than this to a pixel are treated as that pixel. Only used to
 ## cancel the floating point noise of rotations by right angles.
 const SNAP_STEP := 0.000001
@@ -57,6 +63,8 @@ var time := 0.0
 var _next_id := 1
 var _noise_cache := {}
 var _noise_signature := {}
+## Bounds of the non empty part of a branch, rebuilt for every generated image.
+var _bounds_cache := {}
 
 
 func _init() -> void:
@@ -256,6 +264,25 @@ static func default_params(type: String) -> Dictionary:
 			return {"amount": 0.15}
 		"echo":
 			return {"count": 4, "angle": 90.0, "distance": 0.2, "mode": 0}
+		"follow_path":
+			return {"shape": 0, "radius": 0.3, "loops": 1.0, "phase": 0.0}
+		"mesh_warp":
+			return {
+				"tl_x": 0.0,
+				"tl_y": 0.0,
+				"tr_x": 0.0,
+				"tr_y": 0.0,
+				"bl_x": 0.0,
+				"bl_y": 0.0,
+				"br_x": 0.0,
+				"br_y": 0.0,
+			}
+		"area_warp":
+			return {"center_x": 0.5, "center_y": 0.5, "radius": 0.35, "amount": 0.2}
+		"nine_slice":
+			return {"border": 0.2, "scale": 1.5}
+		"crop_content":
+			return {"threshold": 0.02, "margin": 0.0}
 		"warp":
 			return {"amount": 0.15}
 		"math":
@@ -278,6 +305,7 @@ func generate(size: Vector2i) -> Image:
 	size.x = maxi(size.x, 1)
 	size.y = maxi(size.y, 1)
 	var image := Image.create_empty(size.x, size.y, false, Image.FORMAT_RGBA8)
+	_bounds_cache.clear()
 	var output_id := output_node_id()
 	if output_id.is_empty():
 		image.fill(Color(0, 0, 0, 0))
@@ -464,6 +492,70 @@ func _eval(node_id: String, uv: Vector2, size: Vector2i, depth: int) -> float:
 			if int(params["mode"]) == 0:
 				return echo_best
 			return clampf(echo_total / float(echo_count), 0.0, 1.0)
+		"follow_path":
+			# Input 0 is the content, input 1 the phase. Without a phase input the
+			# node simply sits at the phase slider, so it can be placed statically.
+			var path_phase := float(params.get("phase", 0.0))
+			var phase_source := _input_id(node, 1)
+			if not phase_source.is_empty():
+				path_phase = clampf(_eval(phase_source, uv, size, depth + 1), 0.0, 1.0)
+			var path_offset := _path_offset(int(params["shape"]), path_phase, params, size_vec)
+			return _sample(node, 0, uv - path_offset, size, depth)
+		"mesh_warp":
+			# Bilinear quad: the corners carry the source position of the dest
+			# corners, so a 2×2 mesh can be pulled around with sliders.
+			var mesh_s := uv.x / size_vec.x
+			var mesh_t := uv.y / size_vec.y
+			var mesh_top := Vector2(
+				lerpf(float(params["tl_x"]), float(params["tr_x"]), mesh_s) + mesh_s,
+				lerpf(float(params["tl_y"]), float(params["tr_y"]), mesh_s) + mesh_t
+			)
+			var mesh_bottom := Vector2(
+				lerpf(float(params["bl_x"]), float(params["br_x"]), mesh_s) + mesh_s,
+				lerpf(float(params["bl_y"]), float(params["br_y"]), mesh_s) + mesh_t
+			)
+			var mesh_mapped := Vector2(
+				lerpf(mesh_top.x, mesh_bottom.x, mesh_t) * size_vec.x,
+				lerpf(mesh_top.y, mesh_bottom.y, mesh_t) * size_vec.y
+			)
+			return _sample(node, 0, mesh_mapped, size, depth)
+		"area_warp":
+			# Warp, but the displacement fades out towards the edge of a circle.
+			var area_center := Vector2(float(params["center_x"]), float(params["center_y"]))
+			var area_falloff := clampf(
+				1.0 - (normalized - area_center).length() / maxf(float(params["radius"]), 0.001),
+				0.0,
+				1.0
+			)
+			if area_falloff <= 0.0:
+				return clampf(_eval(_input_id(node, 1), uv, size, depth + 1), 0.0, 1.0)
+			var area_amount := float(params["amount"]) * size_vec.y * area_falloff
+			var area_field := _eval(_input_id(node, 0), uv, size, depth + 1) - 0.5
+			var area_field_y := (
+				_eval(_input_id(node, 0), uv + Vector2(37.0, 61.0), size, depth + 1) - 0.5
+			)
+			var area_shifted := uv + Vector2(area_field, area_field_y) * area_amount * 2.0
+			return _sample(node, 1, area_shifted, size, depth)
+		"nine_slice":
+			# Corners keep their size, the middle stretches, each axis separately.
+			var slice_border := clampf(float(params["border"]), 0.0, 0.49)
+			var slice_scale := clampf(float(params["scale"]), 0.2, 4.0)
+			var slice_mapped := Vector2(
+				_slice_axis(uv.x, size_vec.x, slice_border, slice_scale),
+				_slice_axis(uv.y, size_vec.y, slice_border, slice_scale)
+			)
+			return _sample(
+				node, 0, slice_mapped.snapped(Vector2(SNAP_STEP, SNAP_STEP)), size, depth
+			)
+		"crop_content":
+			# Stretches the non empty part of the branch over the whole canvas.
+			var content_bounds := _content_bounds(node)
+			if content_bounds.size.x <= 0.0 or content_bounds.size.y <= 0.0:
+				return clampf(_eval(_input_id(node, 0), uv, size, depth + 1), 0.0, 1.0)
+			var content_uv := (
+				content_bounds.position + (uv / size_vec) * content_bounds.size
+			) * size_vec
+			return _sample(node, 0, content_uv, size, depth)
 		"warp":
 			# The first input is the field, the second one the image being distorted.
 			var amount := float(params.get("amount", 0.15)) * size_vec.y
@@ -533,6 +625,92 @@ static func _scale_axis(value: float, extent: float, factor: float) -> float:
 	if scale < 0.01:
 		scale = 0.01
 	return (source - extent * 0.5) / scale + extent * 0.5
+
+
+## Offset of a point travelling along a closed path, in pixels. [param phase] runs
+## from 0 to 1 over the whole path.
+static func _path_offset(
+	shape: int, phase: float, params: Dictionary, size_vec: Vector2
+) -> Vector2:
+	var radius := clampf(float(params.get("radius", 0.3)), 0.0, 1.0)
+	var loops := maxf(float(params.get("loops", 1.0)), 0.25)
+	var angle := phase * TAU * loops
+	var shortest := minf(size_vec.x, size_vec.y) * radius
+	match shape:
+		1:  # 水平来回
+			return Vector2((phase * 2.0 - 1.0) * radius * size_vec.x, 0.0)
+		2:  # 垂直来回
+			return Vector2(0.0, (phase * 2.0 - 1.0) * radius * size_vec.y)
+		3:  # 正弦
+			return Vector2(
+				(phase * 2.0 - 1.0) * radius * size_vec.x, sin(angle) * shortest
+			)
+		4:  # 方形
+			var walk := fposmod(phase * loops, 1.0) * 4.0
+			var side := int(floorf(walk))
+			var along := walk - float(side)
+			match side:
+				0:
+					return Vector2(lerpf(-shortest, shortest, along), -shortest)
+				1:
+					return Vector2(shortest, lerpf(-shortest, shortest, along))
+				2:
+					return Vector2(lerpf(shortest, -shortest, along), shortest)
+			return Vector2(-shortest, lerpf(shortest, -shortest, along))
+		5:  # 8 字
+			return Vector2(sin(angle) * radius * size_vec.x, sin(angle * 2.0) * shortest)
+	# 圆形
+	return Vector2(cos(angle), sin(angle)) * shortest
+
+
+## Maps one axis of a nine slice: the borders stay rigid, the middle is stretched
+## by [param scale], and anything pushed past the canvas is simply cropped.
+static func _slice_axis(
+	value: float, extent: float, border_ratio: float, scale: float
+) -> float:
+	var border := border_ratio * extent
+	var middle := maxf(extent - border * 2.0, 0.001)
+	var split := border + middle * scale
+	if value < border:
+		return value
+	if split >= extent or value < split:
+		return border + (value - border) / maxf(scale, 0.001)
+	var along := (value - split) / maxf(extent - split, 0.001)
+	return (extent - border) + along * border
+
+
+## Bounding box of the non empty part of the branch, in 0..1 canvas units. Probed
+## at a reduced resolution and cached per generated image, because it needs a pass
+## over the whole branch before any pixel can be placed.
+func _content_bounds(node: Dictionary) -> Rect2:
+	var source := _input_id(node, 0)
+	var key := "%s|%s" % [node["id"], source]
+	if _bounds_cache.has(key):
+		return _bounds_cache[key]
+	var params: Dictionary = node["params"]
+	var threshold := clampf(float(params.get("threshold", 0.02)), 0.0, 1.0)
+	var margin := clampf(float(params.get("margin", 0.0)), 0.0, 0.4)
+	var probe := 48
+	var probe_size := Vector2i(probe, probe)
+	var found := false
+	var low := Vector2(float(probe), float(probe))
+	var high := Vector2(-1.0, -1.0)
+	for y in probe:
+		for x in probe:
+			if _eval(source, Vector2(x, y), probe_size, 1) > threshold:
+				found = true
+				low.x = minf(low.x, x)
+				low.y = minf(low.y, y)
+				high.x = maxf(high.x, x)
+				high.y = maxf(high.y, y)
+	var rect := Rect2()
+	if found:
+		rect = Rect2(low / float(probe), (high - low + Vector2.ONE) / float(probe))
+		var grow := Vector2(rect.size.x * margin, rect.size.y * margin)
+		rect = rect.grow_individual(grow.x, grow.y, grow.x, grow.y)
+		rect = rect.intersection(Rect2(0.0, 0.0, 1.0, 1.0))
+	_bounds_cache[key] = rect
+	return rect
 
 
 func _math_value(op: int, source: float, params: Dictionary) -> float:
@@ -632,6 +810,18 @@ static func describe(node: Dictionary) -> String:
 			return "%d · %s" % [
 				int(params["count"]), "Max" if int(params["mode"]) == 0 else "Avg"
 			]
+		"follow_path":
+			return "%s · %.2f" % [
+				PATH_SHAPES[int(params["shape"])], float(params["radius"])
+			]
+		"mesh_warp":
+			return "网格 2×2"
+		"area_warp":
+			return "r %.2f · %.2f" % [float(params["radius"]), float(params["amount"])]
+		"nine_slice":
+			return "边框 %.2f · ×%.2f" % [float(params["border"]), float(params["scale"])]
+		"crop_content":
+			return "阈值 %.2f" % float(params["threshold"])
 		"warp":
 			return "%.2f" % float(params.get("amount", 0.15))
 		"math":

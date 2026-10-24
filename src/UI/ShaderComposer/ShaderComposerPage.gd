@@ -470,6 +470,63 @@ func _show_params(id: String) -> void:
 			_add_option("合并", ShaderGraphScript.ECHO_MODES, int(params["mode"]), params, "mode")
 			_add_slider("角度", 0.0, 360.0, 1.0, float(params["angle"]), params, "angle")
 			_add_slider("距离", 0.0, 1.0, 0.01, float(params["distance"]), params, "distance")
+		"follow_path":
+			var path_hint := Label.new()
+			path_hint.text = (
+				"输入 1 是要移动的图案，输入 2 是相位（接 Time 才会动）。"
+				+ "没有相位输入时停在下面的相位值上。"
+			)
+			path_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+			path_hint.add_theme_font_size_override("font_size", 13)
+			_params_box.add_child(path_hint)
+			_add_option("路径", ShaderGraphScript.PATH_SHAPES, int(params["shape"]), params, "shape")
+			_add_slider("半径", 0.05, 1.0, 0.01, float(params["radius"]), params, "radius")
+			_add_slider("圈数", 0.25, 4.0, 0.25, float(params["loops"]), params, "loops")
+			_add_slider("相位", 0.0, 1.0, 0.01, float(params["phase"]), params, "phase")
+		"mesh_warp":
+			var mesh_hint := Label.new()
+			mesh_hint.text = (
+				"2×2 网格：每个角都能拉，中间自动插值。数值是相对画布的位移比例。"
+			)
+			mesh_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+			mesh_hint.add_theme_font_size_override("font_size", 13)
+			_params_box.add_child(mesh_hint)
+			_add_slider("左上 X", -0.5, 0.5, 0.01, float(params["tl_x"]), params, "tl_x")
+			_add_slider("左上 Y", -0.5, 0.5, 0.01, float(params["tl_y"]), params, "tl_y")
+			_add_slider("右上 X", -0.5, 0.5, 0.01, float(params["tr_x"]), params, "tr_x")
+			_add_slider("右上 Y", -0.5, 0.5, 0.01, float(params["tr_y"]), params, "tr_y")
+			_add_slider("左下 X", -0.5, 0.5, 0.01, float(params["bl_x"]), params, "bl_x")
+			_add_slider("左下 Y", -0.5, 0.5, 0.01, float(params["bl_y"]), params, "bl_y")
+			_add_slider("右下 X", -0.5, 0.5, 0.01, float(params["br_x"]), params, "br_x")
+			_add_slider("右下 Y", -0.5, 0.5, 0.01, float(params["br_y"]), params, "br_y")
+		"area_warp":
+			var area_hint := Label.new()
+			area_hint.text = "输入 1 是扰动场，输入 2 是被扭曲的图案。只在圆圈范围内生效。"
+			area_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+			area_hint.add_theme_font_size_override("font_size", 13)
+			_params_box.add_child(area_hint)
+			_add_slider("中心 X", 0.0, 1.0, 0.01, float(params["center_x"]), params, "center_x")
+			_add_slider("中心 Y", 0.0, 1.0, 0.01, float(params["center_y"]), params, "center_y")
+			_add_slider("半径", 0.05, 1.5, 0.01, float(params["radius"]), params, "radius")
+			_add_slider("强度", 0.0, 0.5, 0.01, float(params["amount"]), params, "amount")
+		"nine_slice":
+			var slice_hint := Label.new()
+			slice_hint.text = "四角保持原大小，中间按比例拉伸；超出画布的部分会被裁掉。"
+			slice_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+			slice_hint.add_theme_font_size_override("font_size", 13)
+			_params_box.add_child(slice_hint)
+			_add_slider("边框", 0.0, 0.49, 0.01, float(params["border"]), params, "border")
+			_add_slider("拉伸", 0.2, 4.0, 0.05, float(params["scale"]), params, "scale")
+		"crop_content":
+			var content_hint := Label.new()
+			content_hint.text = (
+				"自动找到图案非空的范围并铺满画布。阈值控制多亮的像素算内容。"
+			)
+			content_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+			content_hint.add_theme_font_size_override("font_size", 13)
+			_params_box.add_child(content_hint)
+			_add_slider("阈值", 0.0, 1.0, 0.01, float(params["threshold"]), params, "threshold")
+			_add_slider("边距", 0.0, 0.4, 0.01, float(params["margin"]), params, "margin")
 		"warp":
 			var warp_hint := Label.new()
 			warp_hint.text = "输入 1 是扰动场，输入 2 是被扭曲的图案。"
