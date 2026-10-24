@@ -74,6 +74,9 @@ const NODE_PREVIEW_SIZE_PLAYBACK := 36
 const SELECTED_PREVIEW_SIZE := 64
 ## Height of the cropped source preview in the pixel_art panel, in pixels.
 const SOURCE_PREVIEW_HEIGHT := 120
+## How close a double click has to land to a wire, in screen pixels, to remove it.
+## A finger is imprecise, so this is wider than the wire itself.
+const EDGE_HIT_DISTANCE := 14.0
 
 var graph: RefCounted
 var _graph_edit: GraphEdit
@@ -401,6 +404,9 @@ func _build_ui() -> void:
 	_graph_edit.delete_nodes_request.connect(_on_delete_nodes_request)
 	_graph_edit.node_selected.connect(_on_node_selected)
 	_graph_edit.node_deselected.connect(_on_node_deselected)
+	# Dragging a wire into empty space removes it, but finding the wire to drag is
+	# fiddly on a phone, so a double click on it does the same job.
+	_graph_edit.gui_input.connect(_on_graph_edit_input)
 	_graph_host = Control.new()
 	_graph_host.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	_graph_host.size_flags_vertical = Control.SIZE_EXPAND_FILL
@@ -1007,6 +1013,81 @@ func _on_disconnection_request(from_node: StringName, from_port: int, to_node: S
 	graph.disconnect_input(str(to_node), to_port)
 	_refresh_graph()
 	_schedule_preview()
+
+
+## Double clicking a wire removes it. Every point of the wire is known in graph
+## space, so the click is brought there first and the nearest wire wins.
+func _on_graph_edit_input(event: InputEvent) -> void:
+	if not (event is InputEventMouseButton):
+		return
+	var button := event as InputEventMouseButton
+	if not button.pressed or button.button_index != MOUSE_BUTTON_LEFT:
+		return
+	if not button.double_click:
+		return
+	var zoom := maxf(_graph_edit.zoom, 0.01)
+	var graph_point := (button.position + _graph_edit.scroll_offset) / zoom
+	var hit := _connection_at(graph_point, EDGE_HIT_DISTANCE / zoom)
+	if hit.is_empty():
+		return
+	_drop_connection(hit)
+	_graph_edit.accept_event()
+
+
+## Nearest connection to [param point] (graph space) within [param reach], or an
+## empty dictionary when the click is nowhere near a wire.
+func _connection_at(point: Vector2, reach: float) -> Dictionary:
+	var best := {}
+	var best_distance := reach
+	for entry: Dictionary in _graph_edit.get_connection_list():
+		var from_node := _graph_edit.get_node_or_null(NodePath(str(entry["from_node"])))
+		var to_node := _graph_edit.get_node_or_null(NodePath(str(entry["to_node"])))
+		if not (from_node is GraphNode) or not (to_node is GraphNode):
+			continue
+		var start := (
+			(from_node as GraphNode).position_offset
+			+ (from_node as GraphNode).get_output_port_position(int(entry["from_port"]))
+		)
+		var finish := (
+			(to_node as GraphNode).position_offset
+			+ (to_node as GraphNode).get_input_port_position(int(entry["to_port"]))
+		)
+		var distance := _distance_to_wire(
+			_graph_edit.get_connection_line(start, finish), point
+		)
+		if distance <= best_distance:
+			best_distance = distance
+			best = entry
+	return best
+
+
+## Shortest distance from [param point] to a polyline of wire points.
+static func _distance_to_wire(line: PackedVector2Array, point: Vector2) -> float:
+	if line.is_empty():
+		return 1e20
+	var best := 1e20
+	if line.size() == 1:
+		return point.distance_to(line[0])
+	for index in range(line.size() - 1):
+		var closest := Geometry2D.get_closest_point_to_segment(point, line[index], line[index + 1])
+		best = minf(best, point.distance_to(closest))
+	return best
+
+
+## Drops the input a connection feeds, as one undo step, and rebuilds the view.
+func _drop_connection(entry: Dictionary) -> void:
+	var to_id := str(entry["to_node"])
+	var slot := int(entry["to_port"])
+	if to_id.begins_with(ShaderGraphScript.GROUP_PREFIX):
+		# A collapsed group is only a stand-in; the wire belongs to a member node
+		# that is currently hidden, so it is opened instead of cut blind.
+		_status.text = "折叠组里的连接：展开这个组后就可以双击删除"
+		return
+	_push_undo()
+	graph.disconnect_input(to_id, slot)
+	_refresh_graph()
+	_schedule_preview()
+	_status.text = "已断开一条连接"
 
 
 func _on_delete_nodes_request(nodes: Array[StringName]) -> void:
