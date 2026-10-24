@@ -67,6 +67,8 @@ const NODE_PREVIEW_SIZE := 56
 ## Smaller thumbnails while the animation plays, so the moving nodes still fit
 ## in a frame and stay in step with the main preview.
 const NODE_PREVIEW_SIZE_PLAYBACK := 36
+## Side of the picture in the side panel, which shows the selected node.
+const SELECTED_PREVIEW_SIZE := 64
 ## Height of the cropped source preview in the pixel_art panel, in pixels.
 const SOURCE_PREVIEW_HEIGHT := 120
 
@@ -88,6 +90,13 @@ var _node_previews: Dictionary = {}
 ## Nodes whose preview frame the user folded away. Open is the default.
 var _preview_collapsed: Dictionary = {}
 var _preview: TextureRect
+## Picture of the node selected in the side panel.
+var _node_preview: TextureRect
+## Row that keeps the graph and the output picture next to each other.
+var _stage: HBoxContainer
+## Column of the output picture, narrowed on small screens so the graph keeps
+## most of the width.
+var _output_column: VBoxContainer
 ## Tapping the small preview opens it at a readable size.
 var _preview_popup: PopupPanel
 var _preview_big: TextureRect
@@ -358,7 +367,33 @@ func _build_ui() -> void:
 	_graph_edit.delete_nodes_request.connect(_on_delete_nodes_request)
 	_graph_edit.node_selected.connect(_on_node_selected)
 	_graph_edit.node_deselected.connect(_on_node_deselected)
-	_body.add_child(_graph_edit)
+	# The output picture sits beside the graph, so it stays visible while the
+	# nodes are edited instead of hiding under the sidebar.
+	_stage = HBoxContainer.new()
+	_stage.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_stage.add_theme_constant_override("separation", 6)
+	_body.add_child(_stage)
+	_stage.add_child(_graph_edit)
+
+	_output_column = VBoxContainer.new()
+	_output_column.custom_minimum_size = Vector2(150, 0)
+	_output_column.add_theme_constant_override("separation", 4)
+	_stage.add_child(_output_column)
+	var output_label := Label.new()
+	output_label.text = "输出预览（点一下放大）"
+	output_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	output_label.add_theme_font_size_override("font_size", 13)
+	_output_column.add_child(output_label)
+	_preview = TextureRect.new()
+	_preview.custom_minimum_size = Vector2(120, 140)
+	_preview.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	_preview.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+	_preview.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
+	_preview.texture_filter = CanvasItem.TEXTURE_FILTER_NEAREST
+	_preview.mouse_filter = Control.MOUSE_FILTER_STOP
+	_preview.tooltip_text = "输出节点的结果，点一下放大"
+	_preview.gui_input.connect(_on_preview_input)
+	_output_column.add_child(_preview)
 
 	_side = VBoxContainer.new()
 	_body.add_child(_side)
@@ -430,20 +465,20 @@ func _build_ui() -> void:
 	phase_row.add_child(_phase)
 	_side.add_child(phase_row)
 
-	var preview_label := Label.new()
-	preview_label.text = "预览（点一下放大）"
-	preview_label.add_theme_font_size_override("font_size", TOUCH_FONT_SIZE)
-	_side.add_child(preview_label)
-	_preview = TextureRect.new()
-	_preview.custom_minimum_size = Vector2(200, 180)
-	_preview.size_flags_vertical = Control.SIZE_EXPAND_FILL
-	_preview.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
-	_preview.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
-	_preview.texture_filter = CanvasItem.TEXTURE_FILTER_NEAREST
-	_preview.mouse_filter = Control.MOUSE_FILTER_STOP
-	_preview.tooltip_text = "点一下放大预览"
-	_preview.gui_input.connect(_on_preview_input)
-	_side.add_child(_preview)
+	# What the selected node outputs, which is what the parameters on the left
+	# of it are changing.
+	var node_preview_label := Label.new()
+	node_preview_label.text = "节点预览（当前选中）"
+	node_preview_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	node_preview_label.add_theme_font_size_override("font_size", TOUCH_FONT_SIZE)
+	_side.add_child(node_preview_label)
+	_node_preview = TextureRect.new()
+	_node_preview.custom_minimum_size = Vector2(200, 120)
+	_node_preview.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+	_node_preview.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
+	_node_preview.texture_filter = CanvasItem.TEXTURE_FILTER_NEAREST
+	_node_preview.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_side.add_child(_node_preview)
 
 	_preview_timer = Timer.new()
 	_preview_timer.one_shot = true
@@ -764,6 +799,19 @@ func _toggle_node_preview(node_id: String) -> void:
 		toggle.text = "▾ 预览" if show else "▸ 预览"
 	if show:
 		_refresh_node_preview(node_id, entry)
+
+
+## Picture of the node selected in the side panel. It is bigger than the
+## thumbnails so a parameter change can be judged without zooming the graph.
+func _refresh_selected_preview() -> void:
+	if not is_instance_valid(_node_preview):
+		return
+	if _selected_id.is_empty() or graph.get_node_by_id(_selected_id).is_empty():
+		_node_preview.texture = null
+		return
+	_node_preview.texture = ImageTexture.create_from_image(
+		graph.preview_node(_selected_id, Vector2i(SELECTED_PREVIEW_SIZE, SELECTED_PREVIEW_SIZE))
+	)
 
 
 ## Redraws the preview of one node.
@@ -1385,6 +1433,7 @@ func _show_params(id: String) -> void:
 	var node: Dictionary = graph.get_node_by_id(id)
 	if node.is_empty():
 		_params_hint.text = "选择一个节点来编辑参数"
+		_refresh_selected_preview()
 		return
 	_params_hint.text = "%s（%s）" % [
 		ShaderGraphScript.NODE_TYPES[node["type"]]["label"], node["id"]
@@ -2081,6 +2130,7 @@ func _show_params(id: String) -> void:
 			)
 	_build_animation_section(params)
 	_apply_param_filter()
+	_refresh_selected_preview()
 
 
 ## Starts a foldable group of parameters. Rows added after this call go into it,
@@ -3080,8 +3130,12 @@ func _refresh_preview() -> void:
 	# while playing instead of competing with the main preview.
 	if playing:
 		_queue_animated_previews()
+		# The side panel follows the clock too, but only for a node that moves.
+		if graph.time_dependent_ids().has(_selected_id):
+			_refresh_selected_preview()
 	else:
 		_refresh_node_previews()
+		_refresh_selected_preview()
 	if is_instance_valid(_preview_big) and _preview_popup.visible:
 		_preview_big.texture = _preview.texture
 	# A graph that reads the artwork keeps following it while the user draws.
@@ -3417,6 +3471,9 @@ func _apply_layout() -> void:
 		return
 	var narrow := size.x < NARROW_WIDTH
 	_body.vertical = narrow
+	if is_instance_valid(_output_column):
+		# A portrait phone keeps enough width for the nodes to stay usable.
+		_output_column.custom_minimum_size = Vector2(96 if narrow else 150, 0)
 	if _zen_mode:
 		# The graph is hidden, so the parameters can use the whole height.
 		_graph_edit.custom_minimum_size = Vector2.ZERO
