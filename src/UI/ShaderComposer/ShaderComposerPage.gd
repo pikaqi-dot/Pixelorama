@@ -2567,6 +2567,49 @@ func _show_params(id: String) -> void:
 			_add_slider(
 				"阈值", 0.0, 1.0, 0.01, float(params.get("tolerance", 0.5)), params, "tolerance"
 			)
+		"levels":
+			var levels_hint := Label.new()
+			levels_hint.text = (
+				"把输入的一段亮度拉伸到输出的一段，中间用伽马调中间调，"
+				+ "等于 Photoshop 的色阶。想把发灰的图压出黑白对比就用它。"
+			)
+			levels_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+			levels_hint.add_theme_font_size_override("font_size", 13)
+			_params_box.add_child(levels_hint)
+			_add_slider("输入黑场", 0.0, 0.95, 0.01, float(params.get("black", 0.0)), params, "black")
+			_add_slider("输入白场", 0.05, 1.0, 0.01, float(params.get("white", 1.0)), params, "white")
+			_add_slider("中间调", 0.2, 5.0, 0.05, float(params.get("gamma", 1.0)), params, "gamma")
+			_begin_section("输出范围", false)
+			_add_slider(
+				"输出黑场", 0.0, 1.0, 0.01, float(params.get("out_black", 0.0)), params, "out_black"
+			)
+			_add_slider(
+				"输出白场", 0.0, 1.0, 0.01, float(params.get("out_white", 1.0)), params, "out_white"
+			)
+			_end_section()
+		"threshold":
+			var threshold_hint := Label.new()
+			threshold_hint.text = (
+				"高于阈值的变成实心、低于的变空，等于一键二值化。"
+				+ "「过渡」给它一个软边：0 是硬切，越大边缘越柔，用作遮罩更耐看。"
+			)
+			threshold_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+			threshold_hint.add_theme_font_size_override("font_size", 13)
+			_params_box.add_child(threshold_hint)
+			_add_slider("阈值", 0.0, 1.0, 0.01, float(params.get("cut", 0.5)), params, "cut")
+			_add_slider("过渡", 0.0, 0.5, 0.005, float(params.get("soft", 0.0)), params, "soft")
+			_add_check("反相", bool(params.get("invert", false)), params, "invert")
+		"normalize":
+			var normalize_hint := Label.new()
+			normalize_hint.text = (
+				"先量出这一路真正用到的亮度范围，再把它拉满到 0–1，等于自动色阶。"
+				+ "「低位/高位」决定留掉多少两端，比如 5%–95% 能顺手削掉极值。"
+			)
+			normalize_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+			normalize_hint.add_theme_font_size_override("font_size", 13)
+			_params_box.add_child(normalize_hint)
+			_add_slider("低位", 0.0, 0.9, 0.01, float(params.get("low", 0.0)), params, "low")
+			_add_slider("高位", 0.1, 1.0, 0.01, float(params.get("high", 1.0)), params, "high")
 		"color_adjust":
 			var adjust_hint := Label.new()
 			adjust_hint.text = (

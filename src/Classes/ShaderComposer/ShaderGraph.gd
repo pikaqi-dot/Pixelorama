@@ -61,6 +61,9 @@ const NODE_TYPES := {
 	"glow": {"label": "发光", "inputs": 2},
 	"bloom": {"label": "泛光", "inputs": 2},
 	"color_adjust": {"label": "颜色调整", "inputs": 1},
+	"levels": {"label": "色阶", "inputs": 1},
+	"threshold": {"label": "阈值", "inputs": 1},
+	"normalize": {"label": "归一化", "inputs": 1},
 	"edge": {"label": "边缘检测", "inputs": 1},
 	"dither": {"label": "抖动", "inputs": 1},
 	"pixelate": {"label": "像素化", "inputs": 1},
@@ -178,6 +181,9 @@ const NODE_GROUPS := [
 			"glow",
 			"bloom",
 			"color_adjust",
+			"levels",
+			"threshold",
+			"normalize",
 			"edge",
 			"dither",
 			"pixelate",
@@ -997,6 +1003,24 @@ static func default_params(type: String) -> Dictionary:
 			return {"size": 3.0, "strength": 1.5, "tolerance": 0.35}
 		"bloom":
 			return {"size": 3.0, "strength": 1.0, "tolerance": 0.5}
+		"levels":
+			# The input range is stretched onto the output range, with gamma on the
+			# middle, which is the classic level adjustment.
+			return {
+				"black": 0.0,
+				"white": 1.0,
+				"gamma": 1.0,
+				"out_black": 0.0,
+				"out_white": 1.0,
+			}
+		"threshold":
+			# Above the cut is solid, below is empty. The soft edge keeps the border
+			# readable instead of a staircase, which matters for masks.
+			return {"cut": 0.5, "soft": 0.0, "invert": false}
+		"normalize":
+			# Stretch the range the branch really uses over the whole range, the way
+			# an auto level does. Low and high pick how much of that range to keep.
+			return {"low": 0.0, "high": 1.0}
 		"color_adjust":
 			return {
 				"brightness": 0.0,
@@ -1859,6 +1883,50 @@ func _eval(node_id: String, uv: Vector2, size: Vector2i, depth: int) -> float:
 		return lerpf(
 			adjust_source, graded, clampf(float(params.get("mix", 1.0)), 0.0, 1.0)
 		)
+	elif node_type == "levels":
+		# Stretch the input range onto the output range, with gamma on the middle,
+		# which is the classic level adjustment of a paint program.
+		var level_source := clampf(
+			_eval(_input_id(node, 0), uv, size, depth + 1), 0.0, 1.0
+		)
+		var level_black := clampf(float(params.get("black", 0.0)), 0.0, 0.99)
+		var level_white := maxf(float(params.get("white", 1.0)), level_black + 0.01)
+		var levelled := clampf(
+			(level_source - level_black) / (level_white - level_black), 0.0, 1.0
+		)
+		var level_gamma := maxf(float(params.get("gamma", 1.0)), 0.05)
+		if absf(level_gamma - 1.0) > 0.001:
+			levelled = pow(levelled, 1.0 / level_gamma)
+		return clampf(
+			lerpf(
+				clampf(float(params.get("out_black", 0.0)), 0.0, 1.0),
+				clampf(float(params.get("out_white", 1.0)), 0.0, 1.0),
+				levelled
+			),
+			0.0,
+			1.0
+		)
+	elif node_type == "threshold":
+		# Everything above the cut is solid and everything below is empty. The soft
+		# edge spreads the cut over a range, which keeps a mask readable.
+		var threshold_source := clampf(
+			_eval(_input_id(node, 0), uv, size, depth + 1), 0.0, 1.0
+		)
+		var cut := clampf(float(params.get("cut", 0.5)), 0.0, 1.0)
+		var edge_soft := maxf(float(params.get("soft", 0.0)), 0.0005)
+		var cut_value := clampf((threshold_source - cut) / edge_soft + 0.5, 0.0, 1.0)
+		return 1.0 - cut_value if bool(params.get("invert", false)) else cut_value
+	elif node_type == "normalize":
+		# Auto level: measure the range the branch really uses and stretch it over
+		# the whole range, so a faint branch becomes a full one.
+		var norm_source_id := _input_id(node, 0)
+		var norm_source := clampf(_eval(norm_source_id, uv, size, depth + 1), 0.0, 1.0)
+		var span := _value_range(norm_source_id, size, depth)
+		var norm_low := lerpf(span.x, span.y, clampf(float(params.get("low", 0.0)), 0.0, 0.9))
+		var norm_high := lerpf(span.x, span.y, clampf(float(params.get("high", 1.0)), 0.1, 1.0))
+		if norm_high - norm_low < 0.0001:
+			return norm_source
+		return clampf((norm_source - norm_low) / (norm_high - norm_low), 0.0, 1.0)
 	elif node_type == "edge":
 		# Difference between opposite neighbours, which outlines the branch.
 		var edge_step := maxf(float(params["radius"]), 0.5)
@@ -2096,6 +2164,29 @@ func _content_bounds(node: Dictionary) -> Rect2:
 		rect = rect.intersection(Rect2(0.0, 0.0, 1.0, 1.0))
 	_bounds_cache[key] = rect
 	return rect
+
+
+## Smallest and largest value a branch really produces, probed at a reduced
+## resolution and cached per generated image. Normalize needs it before a single
+## pixel can be mapped, the same way the content bounds are needed by a crop.
+func _value_range(node_id: String, size: Vector2i, depth: int) -> Vector2:
+	var key := "%s|range" % node_id
+	if _bounds_cache.has(key):
+		return _bounds_cache[key]
+	var probe := 32
+	var grid := Vector2i(mini(size.x, probe), mini(size.y, probe))
+	var low := 1.0
+	var high := 0.0
+	for y in grid.y:
+		for x in grid.x:
+			var value := clampf(_eval(node_id, Vector2(x, y), grid, depth + 1), 0.0, 1.0)
+			low = minf(low, value)
+			high = maxf(high, value)
+	if high - low < 0.001:
+		high = minf(low + 0.001, 1.0)
+	var span := Vector2(low, high)
+	_bounds_cache[key] = span
+	return span
 
 
 ## Bayer threshold matrix of 2^[param bits] per side, built once and cached.
@@ -3769,6 +3860,23 @@ static func describe(node: Dictionary) -> String:
 			return "r %d · ×%.1f" % [int(params.get("size", 3.0)), float(params.get("strength", 1.5))]
 		"bloom":
 			return "r %d · ×%.1f" % [int(params.get("size", 3.0)), float(params.get("strength", 1.0))]
+		"levels":
+			return "%.2f…%.2f · 伽马 %.2f" % [
+				float(params.get("black", 0.0)),
+				float(params.get("white", 1.0)),
+				float(params.get("gamma", 1.0)),
+			]
+		"threshold":
+			var threshold_text := "阈值 %.2f" % float(params.get("cut", 0.5))
+			if float(params.get("soft", 0.0)) > 0.0:
+				threshold_text += " · 过渡 %.2f" % float(params.get("soft", 0.0))
+			if bool(params.get("invert", false)):
+				threshold_text += " · 反相"
+			return threshold_text
+		"normalize":
+			return "拉伸 %.0f–%.0f%%" % [
+				float(params.get("low", 0.0)) * 100.0, float(params.get("high", 1.0)) * 100.0
+			]
 		"color_adjust":
 			return "亮度 %+.2f · 对比 %+.2f" % [
 				float(params.get("brightness", 0.0)), float(params.get("contrast", 0.0))
