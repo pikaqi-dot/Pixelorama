@@ -2679,6 +2679,13 @@ func _show_params(id: String) -> void:
 			_params_box.add_child(levels_hint)
 			_add_slider("输入黑场", 0.0, 0.95, 0.01, float(params.get("black", 0.0)), params, "black")
 			_add_slider("输入白场", 0.05, 1.0, 0.01, float(params.get("white", 1.0)), params, "white")
+			_params_box.add_child(
+				_make_button(
+					"自动拉伸",
+					func() -> void: _fit_levels_to_input(id, params),
+					"量出这一路真正用到的亮度，把输入黑场/白场设到实测的两端"
+				)
+			)
 			_add_slider("中间调", 0.2, 5.0, 0.05, float(params.get("gamma", 1.0)), params, "gamma")
 			_begin_section("输出范围", false)
 			_add_slider(
@@ -2699,6 +2706,13 @@ func _show_params(id: String) -> void:
 			_params_box.add_child(threshold_hint)
 			_add_slider("阈值", 0.0, 1.0, 0.01, float(params.get("cut", 0.5)), params, "cut")
 			_add_slider("过渡", 0.0, 0.5, 0.005, float(params.get("soft", 0.0)), params, "soft")
+			_params_box.add_child(
+				_make_button(
+					"自动阈值",
+					func() -> void: _fit_threshold_to_input(id, params),
+					"把阈值放到这一路亮度实测范围的中点上，正好切一半"
+				)
+			)
 			_add_check("反相", bool(params.get("invert", false)), params, "invert")
 		"normalize":
 			var normalize_hint := Label.new()
@@ -2735,6 +2749,13 @@ func _show_params(id: String) -> void:
 			_add_slider("低端", 0.0, 1.0, 0.01, float(params.get("low", 0.3)), params, "low")
 			_add_slider("高端", 0.0, 1.0, 0.01, float(params.get("high", 0.7)), params, "high")
 			_add_slider("过渡", 0.0, 0.5, 0.005, float(params.get("soft", 0.05)), params, "soft")
+			_params_box.add_child(
+				_make_button(
+					"自动取带",
+					func() -> void: _fit_band_to_input(id, params),
+					"把保留的色带放到这一路亮度实测范围的中间一半"
+				)
+			)
 			_add_check("反相", bool(params.get("invert", false)), params, "invert")
 		"color_adjust":
 			var adjust_hint := Label.new()
@@ -3273,6 +3294,58 @@ func _build_canvas_line_section(id: String, params: Dictionary) -> void:
 	curve_hint.add_theme_font_size_override("font_size", 13)
 	_params_target.add_child(curve_hint)
 	_add_width_profile(id, params)
+
+
+## Shared tail of the «自动» buttons: the graph measured the branch, the button
+## wrote the parameters, and this refreshes the panel and the pictures once.
+func _after_fit(id: String) -> void:
+	_mark_preview_dirty(id)
+	_schedule_preview()
+	if is_instance_valid(_params_box):
+		call_deferred("_show_params", id)
+
+
+## Sets the levels input points to the brightness the branch really contains, so
+## a washed out grey becomes one tap of work instead of two guessed numbers.
+func _fit_levels_to_input(id: String, params: Dictionary) -> void:
+	var span: Vector2 = graph.input_range(id)
+	if span.y - span.x < 0.02:
+		Global.notification_label("这一路几乎没有亮度变化，没法自动拉伸")
+		return
+	_push_undo()
+	params["black"] = snappedf(clampf(span.x, 0.0, 0.94), 0.01)
+	params["white"] = snappedf(clampf(span.y, 0.06, 1.0), 0.01)
+	if float(params["white"]) <= float(params["black"]):
+		params["white"] = minf(float(params["black"]) + 0.05, 1.0)
+	_after_fit(id)
+
+
+## Puts the threshold in the middle of what the branch actually uses, so it cuts
+## the picture roughly in half instead of at a guessed 0.5.
+func _fit_threshold_to_input(id: String, params: Dictionary) -> void:
+	var span: Vector2 = graph.input_range(id)
+	if span.y - span.x < 0.02:
+		Global.notification_label("这一路几乎没有亮度变化，阈值没有意义")
+		return
+	_push_undo()
+	params["cut"] = snappedf(clampf((span.x + span.y) * 0.5, 0.01, 0.99), 0.01)
+	_after_fit(id)
+
+
+## Centres the kept band on the middle half of what the branch contains, which is
+## the usual starting point for a noise mask.
+func _fit_band_to_input(id: String, params: Dictionary) -> void:
+	var span: Vector2 = graph.input_range(id)
+	if span.y - span.x < 0.02:
+		Global.notification_label("这一路几乎没有亮度变化，色带没有意义")
+		return
+	_push_undo()
+	var quarter: float = (span.y - span.x) * 0.25
+	params["low"] = snappedf(clampf(span.x + quarter, 0.0, 0.98), 0.01)
+	params["high"] = snappedf(clampf(span.y - quarter, 0.02, 1.0), 0.01)
+	if float(params["high"]) <= float(params["low"]):
+		params["high"] = minf(float(params["low"]) + 0.05, 1.0)
+	_after_fit(id)
 
 
 ## Curve strip for the width along the stroke. The values live in the node

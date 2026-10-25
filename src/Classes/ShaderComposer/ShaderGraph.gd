@@ -2203,6 +2203,21 @@ func _content_bounds(node: Dictionary) -> Rect2:
 	return rect
 
 
+## Brightness range the branch feeding [param node_id] really covers, measured
+## fresh so a button can set an adjustment up from what is actually there instead
+## of two numbers guessed from the preview.
+func input_range(node_id: String) -> Vector2:
+	var node := get_node_by_id(node_id)
+	if node.is_empty():
+		return Vector2(0.0, 1.0)
+	var source := _input_id(node, 0)
+	if source.is_empty():
+		return Vector2(0.0, 1.0)
+	_bounds_cache.erase("%s|range" % source)
+	_resolve_animations()
+	return _value_range(source, Vector2i(32, 32), 0)
+
+
 ## Smallest and largest value a branch really produces, probed at a reduced
 ## resolution and cached per generated image. Normalize needs it before a single
 ## pixel can be mapped, the same way the content bounds are needed by a crop.
