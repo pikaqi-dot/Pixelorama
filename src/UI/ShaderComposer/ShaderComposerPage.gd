@@ -2610,6 +2610,17 @@ func _show_params(id: String) -> void:
 			_params_box.add_child(normalize_hint)
 			_add_slider("低位", 0.0, 0.9, 0.01, float(params.get("low", 0.0)), params, "low")
 			_add_slider("高位", 0.1, 1.0, 0.01, float(params.get("high", 1.0)), params, "high")
+		"curve":
+			var curve_text_hint := Label.new()
+			curve_text_hint.text = (
+				"曲线：横轴是输入亮度，纵轴是输出亮度，五点样条。"
+				+ "往上拖变亮、往下拖压暗；两端一般留在 0 和 1 保住黑白场，"
+				+ "只动中间那一点就能做出 S 形对比或柔和的高光。"
+			)
+			curve_text_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+			curve_text_hint.add_theme_font_size_override("font_size", 13)
+			_params_box.add_child(curve_text_hint)
+			_add_curve_profile(id, params)
 		"color_adjust":
 			var adjust_hint := Label.new()
 			adjust_hint.text = (
@@ -3152,23 +3163,56 @@ func _build_canvas_line_section(id: String, params: Dictionary) -> void:
 ## Curve strip for the width along the stroke. The values live in the node
 ## parameters, so the graph stays a plain dictionary.
 func _add_width_profile(id: String, params: Dictionary) -> void:
+	# One tap for the shapes that would otherwise take several careful drags.
+	_add_profile_strip(
+		id,
+		params,
+		"profile",
+		"线宽曲线",
+		{
+			"均匀": [1.0, 1.0, 1.0, 1.0, 1.0],
+			"锥形": [1.0, 0.86, 0.62, 0.34, 0.08],
+			"反锥": [0.08, 0.34, 0.62, 0.86, 1.0],
+			"两头细": [0.12, 0.66, 1.0, 0.66, 0.12],
+		}
+	)
+
+
+## Curve strip of the tone curve. Five points are enough for a lift, a crush or an
+## S, and the same editor is used for the stroke width.
+func _add_curve_profile(id: String, params: Dictionary) -> void:
+	_add_profile_strip(
+		id,
+		params,
+		"curve",
+		"曲线",
+		{
+			"线性": [0.0, 0.25, 0.5, 0.75, 1.0],
+			"提亮": [0.0, 0.34, 0.62, 0.84, 1.0],
+			"压暗": [0.0, 0.14, 0.34, 0.58, 1.0],
+			"S 形": [0.0, 0.16, 0.5, 0.86, 1.0],
+			"反相": [1.0, 0.75, 0.5, 0.25, 0.0],
+		}
+	)
+
+
+## Five sample curve editor for one node parameter, with the presets that fit that
+## use and the small steps a touchscreen needs instead of a wheel.
+func _add_profile_strip(
+	id: String, params: Dictionary, key: String, title: String, presets: Dictionary
+) -> void:
 	var curve := ShaderWidthCurveScript.new()
 	curve.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	curve.set_profile(params.get("profile", []))
-	var apply := func(values: Array) -> void:
-		_push_undo("%s:profile" % id)
-		_mark_preview_dirty(id)
-		params["profile"] = values
-		_schedule_preview()
-	curve.changed.connect(apply)
+	curve.tooltip_text = "上下拖动圆点调整%s，滚轮微调，预设按钮可以一键成形" % title
+	curve.set_profile(params.get(key, []))
+	curve.changed.connect(
+		func(values: Array) -> void:
+			_push_undo("%s:%s" % [id, key])
+			_mark_preview_dirty(id)
+			params[key] = values
+			_schedule_preview()
+	)
 	_params_target.add_child(curve)
-	# One tap for the shapes that would otherwise take several careful drags.
-	var presets := {
-		"均匀": [1.0, 1.0, 1.0, 1.0, 1.0],
-		"锥形": [1.0, 0.86, 0.62, 0.34, 0.08],
-		"反锥": [0.08, 0.34, 0.62, 0.86, 1.0],
-		"两头细": [0.12, 0.66, 1.0, 0.66, 0.12],
-	}
 	# Wraps on its own, so the row still fits a phone in portrait.
 	var row := HFlowContainer.new()
 	row.add_theme_constant_override("h_separation", 4)
@@ -3179,14 +3223,12 @@ func _add_width_profile(id: String, params: Dictionary) -> void:
 			_make_button(
 				label,
 				func() -> void: curve.set_values(preset),
-				"把线宽曲线设成「%s」" % label,
+				"把%s设成「%s」" % [title, label],
 				Vector2(0, 34)
 			)
 		)
 	row.add_child(
-		_make_button(
-			"反向", func() -> void: curve.reverse(), "把线宽曲线左右翻转", Vector2(0, 34)
-		)
+		_make_button("反向", func() -> void: curve.reverse(), "把%s左右翻转" % title, Vector2(0, 34))
 	)
 	# A phone has no mouse wheel, so the last touched handle can also be tuned
 	# two percent at a time from here.

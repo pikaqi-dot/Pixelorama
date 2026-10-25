@@ -64,6 +64,7 @@ const NODE_TYPES := {
 	"levels": {"label": "色阶", "inputs": 1},
 	"threshold": {"label": "阈值", "inputs": 1},
 	"normalize": {"label": "归一化", "inputs": 1},
+	"curve": {"label": "曲线", "inputs": 1},
 	"edge": {"label": "边缘检测", "inputs": 1},
 	"dither": {"label": "抖动", "inputs": 1},
 	"pixelate": {"label": "像素化", "inputs": 1},
@@ -184,6 +185,7 @@ const NODE_GROUPS := [
 			"levels",
 			"threshold",
 			"normalize",
+			"curve",
 			"edge",
 			"dither",
 			"pixelate",
@@ -1021,6 +1023,10 @@ static func default_params(type: String) -> Dictionary:
 			# Stretch the range the branch really uses over the whole range, the way
 			# an auto level does. Low and high pick how much of that range to keep.
 			return {"low": 0.0, "high": 1.0}
+		"curve":
+			# Five output values for five evenly spaced inputs. A straight line is
+			# the identity, so a fresh node changes nothing until a point is moved.
+			return {"curve": [0.0, 0.25, 0.5, 0.75, 1.0]}
 		"color_adjust":
 			return {
 				"brightness": 0.0,
@@ -1927,6 +1933,17 @@ func _eval(node_id: String, uv: Vector2, size: Vector2i, depth: int) -> float:
 		if norm_high - norm_low < 0.0001:
 			return norm_source
 		return clampf((norm_source - norm_low) / (norm_high - norm_low), 0.0, 1.0)
+	elif node_type == "curve":
+		# A five point curve through the value, drawn by the same spline the stroke
+		# width uses: the samples are output values for evenly spaced inputs, so a
+		# point dragged up brightens that part of the range.
+		var curve_source := clampf(
+			_eval(_input_id(node, 0), uv, size, depth + 1), 0.0, 1.0
+		)
+		var curve_values: Array = params.get("curve", [])
+		if curve_values.size() < 2:
+			return curve_source
+		return profile_at(curve_values, curve_source)
 	elif node_type == "edge":
 		# Difference between opposite neighbours, which outlines the branch.
 		var edge_step := maxf(float(params["radius"]), 0.5)
@@ -3877,6 +3894,11 @@ static func describe(node: Dictionary) -> String:
 			return "拉伸 %.0f–%.0f%%" % [
 				float(params.get("low", 0.0)) * 100.0, float(params.get("high", 1.0)) * 100.0
 			]
+		"curve":
+			var curve_values: Array = params.get("curve", [])
+			if curve_values.size() < 3:
+				return "未设曲线"
+			return "中 %.2f" % float(curve_values[2])
 		"color_adjust":
 			return "亮度 %+.2f · 对比 %+.2f" % [
 				float(params.get("brightness", 0.0)), float(params.get("contrast", 0.0))
