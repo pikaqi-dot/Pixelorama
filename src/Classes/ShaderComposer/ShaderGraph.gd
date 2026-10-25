@@ -332,7 +332,10 @@ func to_dict() -> Dictionary:
 	}
 
 
-## Restores a snapshot made by [method to_dict].
+## Restores a snapshot made by [method to_dict]. A project file stores the graph
+## as JSON, which knows neither Color nor Vector2, so those come back as text and
+## are turned into the values the nodes expect here. Without this, opening a saved
+## project left every colour and position a string and the editor could not open.
 func from_dict(data: Dictionary) -> void:
 	var stored: Array = data.get("nodes", [])
 	nodes.clear()
@@ -341,7 +344,23 @@ func from_dict(data: Dictionary) -> void:
 	for entry in stored:
 		if entry is not Dictionary or not entry.has("id") or not entry.has("type"):
 			continue
-		nodes.append((entry as Dictionary).duplicate(true))
+		var node: Dictionary = (entry as Dictionary).duplicate(true)
+		node["position"] = _restore_value(node.get("position", Vector2.ZERO))
+		var defaults: Dictionary = default_params(str(node["type"]))
+		var params: Dictionary = node.get("params", {})
+		var restored := {}
+		for key in params:
+			restored[key] = _restore_value(params[key], defaults.get(key, null))
+		node["params"] = restored
+		# Input slots are keyed by port number, and JSON turns those keys into text.
+		# Without this the graph came back with every wire lost, which is what left a
+		# reopened project with an empty looking composer.
+		var inputs: Dictionary = node.get("inputs", {})
+		var restored_inputs := {}
+		for slot in inputs:
+			restored_inputs[int(slot)] = str(inputs[slot])
+		node["inputs"] = restored_inputs
+		nodes.append(node)
 	_next_id = maxi(int(data.get("next_id", 1)), 1)
 	# Keep ids unique even if the snapshot came from an older graph.
 	for node: Dictionary in nodes:
@@ -383,6 +402,8 @@ func from_dict(data: Dictionary) -> void:
 		if entry is not Dictionary or not entry.has("id"):
 			continue
 		var group: Dictionary = (entry as Dictionary).duplicate(true)
+		if group.has("position"):
+			group["position"] = _restore_value(group["position"])
 		var members: Array = []
 		for member in group.get("nodes", []):
 			if not get_node_by_id(str(member)).is_empty():
@@ -400,6 +421,48 @@ func from_dict(data: Dictionary) -> void:
 		var group_suffix := str(group["id"]).get_slice("_", -1)
 		if group_suffix.is_valid_int():
 			_next_group_id = maxi(_next_group_id, int(group_suffix) + 1)
+
+
+## Turns a value that came back from a project file into what the graph expects.
+## JSON has no Color and no Vector2, so both are written as text like
+## [code]"(0.2, 0.5, 0.1, 1)"[/code] and read back here. [param default] is the
+## value the node would use, which tells a Color and a Vector2 apart; without one
+## the number of parts decides. Anything that is not such a text is returned as is.
+static func _restore_value(value: Variant, default: Variant = null) -> Variant:
+	if value is Dictionary:
+		var restored := {}
+		for key in (value as Dictionary):
+			restored[key] = _restore_value((value as Dictionary)[key])
+		return restored
+	if value is Array:
+		var items: Array = []
+		for item in (value as Array):
+			items.append(_restore_value(item))
+		return items
+	if not (value is String):
+		return value
+	var text := str(value).strip_edges()
+	if not text.begins_with("(") or not text.ends_with(")"):
+		return value
+	if default is Color:
+		return _tuple_value(text, "Color", value)
+	if default is Vector3:
+		return _tuple_value(text, "Vector3", value)
+	if default is Vector2:
+		return _tuple_value(text, "Vector2", value)
+	if default is Vector2i:
+		return _tuple_value(text, "Vector2i", value)
+	# Nothing to judge by, so three or more parts can only have been a colour.
+	if text.count(",") >= 2:
+		return _tuple_value(text, "Color", value)
+	return _tuple_value(text, "Vector2", value)
+
+
+## Builds [code]Color(0.1, 0.2, 0.3, 1)[/code] out of the bare tuple a project file
+## left behind, and keeps [param fallback] when the text does not parse.
+static func _tuple_value(body: String, kind: String, fallback: Variant) -> Variant:
+	var parsed: Variant = str_to_var(kind + body)
+	return fallback if parsed == null else parsed
 
 
 ## Puts the given nodes into a new collapsible group. A node can only be in one
