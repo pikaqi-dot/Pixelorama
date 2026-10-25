@@ -3326,11 +3326,12 @@ func _scatter_image(
 	var source_node := get_node_by_id(source_id)
 	if not source_node.is_empty() and str(source_node["type"]) == "pixel_art":
 		var brush_params := params_for(source_node)
-		# Only the layer mode of a canvas node has an image with an aspect; a
-		# path brush is square and keeps the square footprint.
+		var brush_mode := int(brush_params.get("source", 0))
+		# A layer or a painting has an aspect worth keeping; a path brush is square
+		# and keeps the square footprint.
 		var brush := (
-			_source_image(source_node, brush_params)
-			if int(brush_params.get("source", 0)) == 0
+			_canvas_image(source_node, brush_params, size, depth)
+			if brush_mode == 0 or brush_mode == 2
 			else null
 		)
 		if brush != null and not brush.is_empty():
@@ -3515,9 +3516,26 @@ static func _scatter_has_room(placements: Array, position: Vector2, min_gap: flo
 	return true
 	
 	
+## Picture a canvas node stands for: the layer of its drawing area, the painting
+## made in its window, or the stroke it draws from its path. The scatter uses it
+## for both the area it stamps over and the opacity of the brush, so a canvas
+## painted in the drawing window scatters over its own picture instead of over a
+## project layer that has nothing to do with it.
+func _canvas_image(
+	node: Dictionary, params: Dictionary, size: Vector2i, depth: int
+) -> Image:
+	match int(params.get("source", 0)):
+		1:
+			return _canvas_path_image(node, params, size, depth)
+		2:
+			return painting_image(node, params)
+	return _source_image(node, params)
+
+
 ## Image a branch can hand out directly, or null when it has to be sampled. A
-## canvas node answers with its drawing area or its stroke, a path node with its
-## line, which is what makes "scatter over this drawing" exact and cheap.
+## canvas node answers with its drawing area, its painting or its stroke, a path
+## node with its line, which is what makes "scatter over this drawing" exact and
+## cheap.
 func _branch_image(node_id: String, size: Vector2i, depth: int) -> Image:
 	var owner := get_node_by_id(node_id)
 	if owner.is_empty():
@@ -3525,9 +3543,7 @@ func _branch_image(node_id: String, size: Vector2i, depth: int) -> Image:
 	var params: Dictionary = params_for(owner)
 	match str(owner["type"]):
 		"pixel_art":
-			if int(params.get("source", 0)) == 1:
-				return _canvas_path_image(owner, params, size, depth)
-			return _source_image(owner, params)
+			return _canvas_image(owner, params, size, depth)
 		"path":
 			return _path_image(owner, params, size)
 	return null
@@ -3546,11 +3562,20 @@ func _coverage_points(node_id: String, size: Vector2i, depth: int) -> PackedVect
 		grid = Vector2i(image.get_width(), image.get_height())
 	if grid.x <= 0 or grid.y <= 0:
 		return points
+	# The scan only needs red and alpha, so an RGBA image is read as bytes. A
+	# painting of a full canvas is 16k samples otherwise, and this runs again for
+	# every stroke that changes it.
+	var bytes := PackedByteArray()
+	if use_image and image.get_format() == Image.FORMAT_RGBA8:
+		bytes = image.get_data()
 	var step := maxi(int(ceil(float(maxi(grid.x, grid.y)) / 128.0)), 1)
 	for y in range(0, grid.y, step):
 		for x in range(0, grid.x, step):
 			var coverage := 0.0
-			if use_image:
+			if not bytes.is_empty():
+				var at: int = (y * grid.x + x) * 4
+				coverage = maxf(float(bytes[at]), float(bytes[at + 3])) / 255.0
+			elif use_image:
 				var color := image.get_pixel(x, y)
 				# A stroke keeps its coverage in the brightness, a drawn area
 				# keeps it in the alpha channel, so the larger of the two counts.
@@ -3590,10 +3615,12 @@ func _stamp_source(
 	var source_node := get_node_by_id(source_id)
 	if not source_node.is_empty() and str(source_node["type"]) == "pixel_art":
 		var source_params := params_for(source_node)
-		# A canvas node in layer mode stamps the opacity of the artwork. In path
-		# mode it already is a mask, so the node value is used as it is.
-		if int(source_params.get("source", 0)) == 0:
-			mask_image = _source_image(source_node, source_params)
+		# A canvas that shows a layer or a painting stamps the opacity of that
+		# picture, so a brush painted in the drawing window keeps its shape. In path
+		# mode the node already is a mask, so its value is used as it is.
+		var brush_mode := int(source_params.get("source", 0))
+		if brush_mode == 0 or brush_mode == 2:
+			mask_image = _canvas_image(source_node, source_params, size, depth)
 			if mask_image == null or mask_image.is_empty():
 				return
 			mask_crop = source_crop(
