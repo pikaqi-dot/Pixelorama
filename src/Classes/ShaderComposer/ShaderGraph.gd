@@ -228,6 +228,14 @@ const RASTER_SIZES_MAX := 4
 ## size in use, and the graph editor shows three of them at once (preview,
 ## thumbnail, side panel), so this leaves room for a good handful of rasters.
 const RASTER_CACHE_MAX := 32
+## Painting is split over the cores above this many rows and pixels. Below it the
+## hand off costs more than the rows are worth.
+const PARALLEL_MIN_ROWS := 4
+const PARALLEL_MIN_PIXELS := 2048
+## Most worker threads used for one picture. Measured on a 16 core machine, four
+## threads nearly halve a heavy picture while six or more are slower again: the
+## hand off and the memory traffic cost more than the extra rows are worth.
+const PARALLEL_MAX_THREADS := 4
 
 ## Nodes of the graph, as dictionaries: id, type, position, params, inputs.
 var nodes: Array[Dictionary] = []
@@ -261,6 +269,10 @@ var _raster_sigs: Dictionary = {}
 ## change without a single parameter moving, so rasters of such a graph must not
 ## be reused across generations.
 var _source_generation := 0
+## Threads the paint loop may use. Zero follows the cores of the machine; a
+## positive number pins it, which is how a single threaded picture is produced
+## for comparisons and how the splitting can be switched off.
+var paint_threads := 0
 ## Bounds of the non empty part of a branch, rebuilt for every generated image.
 var _bounds_cache := {}
 var _bayer_cache := {}
@@ -1097,16 +1109,23 @@ func generate_sliced(size: Vector2i, slice_msec := 16.0) -> Image:
 	var height: int = int((state["size"] as Vector2i).y)
 	var tree := Engine.get_main_loop() as SceneTree
 	while int(state["row"]) < height:
-		var deadline := Time.get_ticks_usec() + int(slice_msec * 1000.0)
+		var start := Time.get_ticks_usec()
 		var row: int = int(state["row"])
-		# Always paint one row, then stop as soon as the slice is used up.
-		while row < height:
-			_paint_rows(state, row, row + 1)
-			row += 1
-			if Time.get_ticks_usec() >= deadline:
-				break
-		state["row"] = row
-		if row < height and tree != null:
+		var batch: int = maxi(int(state.get("batch", 1)), 1)
+		var end_row: int = mini(row + batch, height)
+		_paint_rows(state, row, end_row)
+		state["row"] = end_row
+		# The band is grown while it stays cheap and halved when a slice runs long,
+		# so a light graph is not painted one row at a time and a heavy one still
+		# hands the frame back. Wide bands are also what makes the rows worth
+		# spreading over the cores.
+		var spent := float(Time.get_ticks_usec() - start) / 1000.0
+		if spent > slice_msec:
+			batch = maxi(int(floorf(float(batch) * 0.5)), 1)
+		elif spent < slice_msec * 0.4:
+			batch = mini(batch * 2, maxi(int(floorf(float(height) * 0.5)), 1))
+		state["batch"] = batch
+		if int(state["row"]) < height and tree != null:
 			await tree.process_frame
 	return state["image"]
 
@@ -1148,6 +1167,7 @@ func _begin_generation(size: Vector2i) -> Dictionary:
 		"size": size,
 		"done": false,
 		"row": 0,
+		"batch": 1,
 		"source": source,
 		"field_data": field_data,
 		"tint": source_colour(source),
@@ -1165,9 +1185,100 @@ func _begin_generation(size: Vector2i) -> Dictionary:
 	}
 
 
-## Paints rows [param from_row] to [param to_row] of a generation.
+## Paints rows [param from_row] to [param to_row] of a generation, spreading a
+## wide band over the cores. Every band draws into its own image, so no two
+## threads ever write into the same buffer.
 func _paint_rows(state: Dictionary, from_row: int, to_row: int) -> void:
-	var image: Image = state["image"]
+	var size: Vector2i = state["size"]
+	var threads := _paint_threads()
+	var rows := to_row - from_row
+	if threads > 1 and rows >= PARALLEL_MIN_ROWS and size.x * rows >= PARALLEL_MIN_PIXELS:
+		_paint_rows_parallel(state, from_row, to_row, threads)
+		return
+	_paint_into(state, state["image"], 0, from_row, to_row)
+
+
+## How many worker threads a picture may use on this machine.
+func _paint_threads() -> int:
+	if paint_threads > 0:
+		return mini(paint_threads, PARALLEL_MAX_THREADS)
+	# One thread is left for the interface on a two core machine; a big desktop
+	# stops at [constant PARALLEL_MAX_THREADS].
+	return clampi(OS.get_processor_count() - 1, 1, PARALLEL_MAX_THREADS)
+
+
+## Evaluates every node once, so anything the evaluator fills the first time it
+## visits a node is filled before the worker threads start reading. Without this
+## the threads would race on the raster and noise caches, and a cache the
+## interface dropped between two slices would be rebuilt from several threads at
+## once; with it the paint loop only reads.
+func _warm_caches(state: Dictionary) -> void:
+	var size: Vector2i = state["size"]
+	var probe := Vector2(0.5, 0.5)
+	for node: Dictionary in nodes:
+		_eval(str(node["id"]), probe, size, 0)
+
+
+## Paints the band in [param band] into its own image and hands it back under the
+## mutex, which is the only shared state the threads touch.
+func _paint_band(
+	state: Dictionary, band: int, bands: Array, results: Array, mutex: Mutex
+) -> void:
+	var pair: Array = bands[band]
+	var from_row: int = int(pair[0])
+	var to_row: int = int(pair[1])
+	var size: Vector2i = state["size"]
+	var band_image := Image.create_empty(size.x, to_row - from_row, false, Image.FORMAT_RGBA8)
+	_paint_into(state, band_image, from_row, from_row, to_row)
+	mutex.lock()
+	results[band] = band_image
+	mutex.unlock()
+
+
+## Splits rows [param from_row] to [param to_row] over [param threads] workers and
+## joins the bands into the picture once they are all done.
+func _paint_rows_parallel(
+	state: Dictionary, from_row: int, to_row: int, threads: int
+) -> void:
+	var size: Vector2i = state["size"]
+	_warm_caches(state)
+	var rows := to_row - from_row
+	var count: int = mini(threads, rows)
+	var step: int = int(ceilf(float(rows) / float(count)))
+	var bands: Array = []
+	var start := from_row
+	while start < to_row:
+		bands.append([start, mini(start + step, to_row)])
+		start += step
+	count = bands.size()
+	var results: Array = []
+	results.resize(count)
+	var mutex := Mutex.new()
+	var group := WorkerThreadPool.add_group_task(
+		func(band: int) -> void: _paint_band(state, band, bands, results, mutex),
+		count,
+		count,
+		false,
+		"shader composer rows"
+	)
+	WorkerThreadPool.wait_for_group_task_completion(group)
+	var target: Image = state["image"]
+	for index in count:
+		var band_image: Variant = results[index]
+		if not (band_image is Image):
+			continue
+		var pair: Array = bands[index]
+		var band_rows: int = int(pair[1]) - int(pair[0])
+		target.blit_rect(
+			band_image, Rect2i(0, 0, size.x, band_rows), Vector2i(0, int(pair[0]))
+		)
+
+
+## Paints rows [param from_row] to [param to_row] into [param image], whose first
+## row corresponds to row [param offset] of the generation.
+func _paint_into(
+	state: Dictionary, image: Image, offset: int, from_row: int, to_row: int
+) -> void:
 	var size: Vector2i = state["size"]
 	var source: String = state["source"]
 	var tint: Variant = state["tint"]
@@ -1194,7 +1305,7 @@ func _paint_rows(state: Dictionary, from_row: int, to_row: int) -> void:
 			else:
 				value = clampf(_eval(source, Vector2(x, y), size, 0), 0.0, 1.0)
 			if transparent and value <= alpha_cut:
-				image.set_pixel(x, y, Color(0.0, 0.0, 0.0, 0.0))
+				image.set_pixel(x, y - offset, Color(0.0, 0.0, 0.0, 0.0))
 				continue
 			var color: Color
 			if tint == null:
@@ -1213,7 +1324,7 @@ func _paint_rows(state: Dictionary, from_row: int, to_row: int) -> void:
 				color = Color(base.r * value, base.g * value, base.b * value, 1.0)
 			if transparent and alpha_from_value:
 				color.a = value
-			image.set_pixel(x, y, color)
+			image.set_pixel(x, y - offset, color)
 
 
 ## Colour a branch carries, or null when it carries none. A node that owns a
