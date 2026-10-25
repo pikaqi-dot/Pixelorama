@@ -795,6 +795,15 @@ static func default_params(type: String) -> Dictionary:
 				"sort_y": false,
 				# Wrap the stamps around the edges, for a pattern that tiles.
 				"tile": false,
+				# Take the brightness of a stamp from the second input at its
+				# position, so a gradient or a drawing lights the scatter.
+				"level_from_map": false,
+				# Radial shaping: point every stamp at the middle, turn it by its
+				# distance, and grow or shrink it with that distance. Together they
+				# turn the same field into a burst, a ring or a spiral.
+				"point_at_center": false,
+				"spin": 0.0,
+				"scale_per_radius": 0.0,
 			}
 		"particles":
 			return {
@@ -2706,6 +2715,10 @@ func _scatter_image(
 	var jitter := clampf(float(params.get("jitter", 0.35)), 0.0, 1.0)
 	var sort_y := bool(params.get("sort_y", false))
 	var tile := bool(params.get("tile", false))
+	var level_from_map := bool(params.get("level_from_map", false))
+	var point_at_center := bool(params.get("point_at_center", false))
+	var spin := clampf(float(params.get("spin", 0.0)), -2.0, 2.0)
+	var scale_per_radius := clampf(float(params.get("scale_per_radius", 0.0)), -1.0, 1.0)
 	var field_offset := (
 		Vector2(float(params.get("offset_x", 0.0)), float(params.get("offset_y", 0.0)))
 		* Vector2(size)
@@ -2834,9 +2847,30 @@ func _scatter_image(
 		position += field_offset
 		if align:
 			position = position.round()
-		if not along_path and mode != 2 and not density_id.is_empty():
-			if _eval(density_id, position, size, depth + 1) < chance:
+		var density := 1.0
+		if not density_id.is_empty() and not along_path and mode != 2:
+			density = clampf(_eval(density_id, position, size, depth + 1), 0.0, 1.0)
+			if density < chance:
 				continue
+		if level_from_map and not density_id.is_empty():
+			# The stamp takes the brightness the second input has at its position,
+			# which is what lets a gradient or a drawing light the scatter.
+			brightness = clampf(
+				brightness * clampf(_eval(density_id, position, size, depth + 1), 0.0, 1.0),
+				0.0,
+				1.0
+			)
+		# Radial shaping: with these the same field becomes a burst, a ring or a
+		# spiral, because each stamp turns and grows with its distance to the middle.
+		var radius := position.distance_to(center)
+		if point_at_center:
+			rotation += (position - center).angle()
+		if not is_zero_approx(spin):
+			rotation += radius / maxf(shortest, 1.0) * spin * TAU
+		if not is_zero_approx(scale_per_radius):
+			stamp_scale *= maxf(
+				1.0 + scale_per_radius * (radius / maxf(shortest * 0.5, 1.0)), 0.05
+			)
 		if distribution == 1 and not _scatter_has_room(placements, position, min_gap):
 			continue
 		placements.append(

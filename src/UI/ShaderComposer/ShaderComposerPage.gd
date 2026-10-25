@@ -1996,6 +1996,8 @@ func _show_params(id: String) -> void:
 				+ "「分布方式」里，均匀间距不会扎堆，网格按列×行排成阵列；"
 				+ "「按 Y 排序」让下方的印章盖住上方的，做出前后层次；"
 				+ "「平铺」让越界的印章从另一侧回绕，做无缝图案。"
+				+ "「亮度取自输入 2」用第二路在该点的亮度决定每枚印章的明暗，适合渐变打光；"
+				+ "「朝向中心 / 按半径旋转 / 按半径缩放」把同一片散布变成放射、环形或螺旋。"
 			)
 			scatter_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 			scatter_hint.add_theme_font_size_override("font_size", 13)
@@ -2084,6 +2086,12 @@ func _show_params(id: String) -> void:
 				params,
 				"level_random"
 			)
+			_add_check(
+				"亮度取自输入 2",
+				bool(params.get("level_from_map", false)),
+				params,
+				"level_from_map"
+			)
 			# The colour belongs to this node: it travels down the chain to the
 			# output, so the artwork does not need a palette on the output node.
 			_add_check("上色", bool(params.get("tint", false)), params, "tint", true)
@@ -2143,6 +2151,30 @@ func _show_params(id: String) -> void:
 				"scale_max"
 			)
 			_add_number("种子", 0, 9999, 1, int(params.get("seed", 1)), params, "seed")
+			_add_check(
+				"朝向中心",
+				bool(params.get("point_at_center", false)),
+				params,
+				"point_at_center"
+			)
+			_add_slider(
+				"按半径旋转",
+				-2.0,
+				2.0,
+				0.05,
+				float(params.get("spin", 0.0)),
+				params,
+				"spin"
+			)
+			_add_slider(
+				"按半径缩放",
+				-1.0,
+				1.0,
+				0.05,
+				float(params.get("scale_per_radius", 0.0)),
+				params,
+				"scale_per_radius"
+			)
 			_end_section()
 			_add_check("对齐像素", bool(params.get("align", true)), params, "align")
 		"path":
