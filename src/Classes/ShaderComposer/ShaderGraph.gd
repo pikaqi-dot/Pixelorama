@@ -65,6 +65,7 @@ const NODE_TYPES := {
 	"threshold": {"label": "阈值", "inputs": 1},
 	"normalize": {"label": "归一化", "inputs": 1},
 	"curve": {"label": "曲线", "inputs": 1},
+	"band": {"label": "色阶选择", "inputs": 1},
 	"edge": {"label": "边缘检测", "inputs": 1},
 	"dither": {"label": "抖动", "inputs": 1},
 	"pixelate": {"label": "像素化", "inputs": 1},
@@ -186,6 +187,7 @@ const NODE_GROUPS := [
 			"threshold",
 			"normalize",
 			"curve",
+			"band",
 			"edge",
 			"dither",
 			"pixelate",
@@ -1027,6 +1029,10 @@ static func default_params(type: String) -> Dictionary:
 			# Five output values for five evenly spaced inputs. A straight line is
 			# the identity, so a fresh node changes nothing until a point is moved.
 			return {"curve": [0.0, 0.25, 0.5, 0.75, 1.0]}
+		"band":
+			# Picks the values inside a range, which is how a mask is cut out of a
+			# brightness field: mid tones, highlights, a slice of a gradient.
+			return {"low": 0.3, "high": 0.7, "soft": 0.05, "invert": false}
 		"color_adjust":
 			return {
 				"brightness": 0.0,
@@ -1944,6 +1950,20 @@ func _eval(node_id: String, uv: Vector2, size: Vector2i, depth: int) -> float:
 		if curve_values.size() < 2:
 			return curve_source
 		return profile_at(curve_values, curve_source)
+	elif node_type == "band":
+		# Picks the values inside a range, which is the level selector of a paint
+		# program: a mask out of the mid tones, the highlights, a slice of a ramp.
+		var band_source := clampf(_eval(_input_id(node, 0), uv, size, depth + 1), 0.0, 1.0)
+		var band_low := clampf(float(params.get("low", 0.3)), 0.0, 1.0)
+		var band_high := maxf(float(params.get("high", 0.7)), band_low)
+		var band_soft := maxf(float(params.get("soft", 0.05)), 0.0005)
+		# The window rises over the softness at the low end and falls at the high
+		# end, so the mask keeps a readable edge instead of a staircase.
+		var band_value := minf(
+			clampf((band_source - band_low) / band_soft + 0.5, 0.0, 1.0),
+			clampf((band_high - band_source) / band_soft + 0.5, 0.0, 1.0)
+		)
+		return 1.0 - band_value if bool(params.get("invert", false)) else band_value
 	elif node_type == "edge":
 		# Difference between opposite neighbours, which outlines the branch.
 		var edge_step := maxf(float(params["radius"]), 0.5)
@@ -3899,6 +3919,15 @@ static func describe(node: Dictionary) -> String:
 			if curve_values.size() < 3:
 				return "未设曲线"
 			return "中 %.2f" % float(curve_values[2])
+		"band":
+			var band_text := "%.2f–%.2f" % [
+				float(params.get("low", 0.3)), float(params.get("high", 0.7))
+			]
+			if float(params.get("soft", 0.05)) > 0.0:
+				band_text += " · 过渡 %.2f" % float(params.get("soft", 0.05))
+			if bool(params.get("invert", false)):
+				band_text += " · 反相"
+			return band_text
 		"color_adjust":
 			return "亮度 %+.2f · 对比 %+.2f" % [
 				float(params.get("brightness", 0.0)), float(params.get("contrast", 0.0))

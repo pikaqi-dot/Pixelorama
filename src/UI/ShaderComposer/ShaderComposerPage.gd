@@ -2621,6 +2621,20 @@ func _show_params(id: String) -> void:
 			curve_text_hint.add_theme_font_size_override("font_size", 13)
 			_params_box.add_child(curve_text_hint)
 			_add_curve_profile(id, params)
+		"band":
+			var band_hint := Label.new()
+			band_hint.text = (
+				"只留下亮度落在这一段里的像素，其余变空，等于按色阶选区域。"
+				+ "接在噪声或渐变后面就是一张随机遮罩，"
+				+ "「过渡」给窗口两端一点软边，接混合的遮罩输入最自然。"
+			)
+			band_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+			band_hint.add_theme_font_size_override("font_size", 13)
+			_params_box.add_child(band_hint)
+			_add_slider("低端", 0.0, 1.0, 0.01, float(params.get("low", 0.3)), params, "low")
+			_add_slider("高端", 0.0, 1.0, 0.01, float(params.get("high", 0.7)), params, "high")
+			_add_slider("过渡", 0.0, 0.5, 0.005, float(params.get("soft", 0.05)), params, "soft")
+			_add_check("反相", bool(params.get("invert", false)), params, "invert")
 		"color_adjust":
 			var adjust_hint := Label.new()
 			adjust_hint.text = (
