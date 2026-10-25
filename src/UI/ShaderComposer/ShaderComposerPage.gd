@@ -44,6 +44,8 @@ const THUMB_BUDGET_PLAYBACK_MSEC := 8.0
 ## Minimum height of every interactive row, which keeps it usable with a finger.
 const TOUCH_SIZE := 40
 const TOUCH_FONT_SIZE := 15
+## Item id of the search entry in the add menu. The node entries start at one.
+const SEARCH_ITEM_ID := 0
 ## Below this width the page stacks the graph above the parameters.
 const NARROW_WIDTH := 760
 ## Frames per second of the looping preview.
@@ -139,6 +141,10 @@ var _preview_big_back: TextureRect
 var _status: Label
 ## Categorised add menu. Picking an item adds that node straight away.
 var _add_menu: MenuButton
+## Search over every node type, for a graph with far more types than fit a menu.
+var _search_dialog: AcceptDialog
+var _search_field: LineEdit
+var _search_list: VBoxContainer
 ## Item id of every entry in the add menu, mapped to its node type.
 var _menu_types: Dictionary = {}
 var _menu_next_id := 1
@@ -1305,7 +1311,8 @@ func _on_delete_nodes_request(nodes: Array[StringName]) -> void:
 
 
 ## Builds the add menu: every category is a submenu, and picking an entry adds
-## that node right away, which is one tap less than before on a phone.
+## that node right away, which is one tap less than before on a phone. The search
+## entry comes first, because there are more types than fit in a menu on a phone.
 func _build_add_menu() -> void:
 	var root := _add_menu.get_popup()
 	root.clear()
@@ -1315,6 +1322,8 @@ func _build_add_menu() -> void:
 			child.queue_free()
 	_menu_types.clear()
 	_menu_next_id = 1
+	root.add_item("搜索节点…", SEARCH_ITEM_ID)
+	root.add_separator()
 	var index := 0
 	for group: Dictionary in ShaderGraphScript.NODE_GROUPS:
 		var submenu := PopupMenu.new()
@@ -1332,9 +1341,18 @@ func _build_add_menu() -> void:
 
 
 func _on_add_menu_pressed(item_id: int) -> void:
+	if item_id == SEARCH_ITEM_ID:
+		_show_node_search()
+		return
 	var type: String = str(_menu_types.get(item_id, ""))
 	if type.is_empty():
 		return
+	_add_node_of_type(type)
+
+
+## Adds a node of [param type] next to the visible area and selects it, which is
+## what both the menu and the search dialog end up doing.
+func _add_node_of_type(type: String) -> void:
 	_push_undo()
 	# New nodes land next to the visible area instead of on top of each other.
 	var offset := Vector2(60 + graph.nodes.size() * 24, 40 + graph.nodes.size() * 18)
@@ -1343,6 +1361,89 @@ func _on_add_menu_pressed(item_id: int) -> void:
 	_selected_id = node_id
 	_show_params(node_id)
 	_schedule_preview()
+
+
+## Search dialog over every node type. A name match and a group match both count,
+## so typing 滤镜 lists that whole category, and Enter adds the first result.
+func _show_node_search() -> void:
+	if not is_instance_valid(_search_dialog):
+		_search_dialog = AcceptDialog.new()
+		_search_dialog.title = "添加节点"
+		var box := VBoxContainer.new()
+		box.custom_minimum_size = Vector2(320, 380)
+		_search_field = LineEdit.new()
+		_search_field.custom_minimum_size = Vector2(0, TOUCH_SIZE)
+		_search_field.add_theme_font_size_override("font_size", TOUCH_FONT_SIZE)
+		_search_field.placeholder_text = "输入名字，比如 噪声 / 曲线 / 散布"
+		_search_field.text_changed.connect(_filter_node_search)
+		_search_field.text_submitted.connect(
+			func(_text: String) -> void: _add_first_match()
+		)
+		box.add_child(_search_field)
+		var scroll := ScrollContainer.new()
+		scroll.size_flags_vertical = Control.SIZE_EXPAND_FILL
+		scroll.custom_minimum_size = Vector2(0, 300)
+		box.add_child(scroll)
+		_search_list = VBoxContainer.new()
+		_search_list.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		scroll.add_child(_search_list)
+		_search_dialog.add_child(box)
+		add_child(_search_dialog)
+	_search_field.text = ""
+	_filter_node_search("")
+	_search_dialog.popup_centered(Vector2i(340, 430))
+	_search_field.grab_focus()
+
+
+## Rebuilds the result list for [param query], grouped like the add menu so the
+## category is visible next to every name.
+func _filter_node_search(query: String) -> void:
+	if not is_instance_valid(_search_list):
+		return
+	for child in _search_list.get_children():
+		_search_list.remove_child(child)
+		child.queue_free()
+	var needle := query.strip_edges().to_lower()
+	var added := 0
+	for group: Dictionary in ShaderGraphScript.NODE_GROUPS:
+		var group_label := str(group["label"])
+		var group_hit := not needle.is_empty() and group_label.to_lower().contains(needle)
+		for type: String in group["types"]:
+			var label := str(ShaderGraphScript.NODE_TYPES[type]["label"])
+			if not needle.is_empty() and not group_hit:
+				if not label.to_lower().contains(needle) and not type.contains(needle):
+					continue
+			var button := _make_button(
+				"%s · %s" % [label, group_label],
+				func() -> void: _add_from_search(type),
+				"添加「%s」" % label,
+				Vector2(0, TOUCH_SIZE)
+			)
+			button.alignment = HORIZONTAL_ALIGNMENT_LEFT
+			_search_list.add_child(button)
+			added += 1
+	if added == 0:
+		var empty := Label.new()
+		empty.text = "没有匹配的节点"
+		empty.add_theme_font_size_override("font_size", 13)
+		_search_list.add_child(empty)
+
+
+## Adds the first result of the current query, which is what Enter does.
+func _add_first_match() -> void:
+	if not is_instance_valid(_search_list):
+		return
+	for child in _search_list.get_children():
+		if child is Button:
+			(child as Button).pressed.emit()
+			return
+
+
+## Adds a node picked in the search dialog and closes it.
+func _add_from_search(type: String) -> void:
+	if is_instance_valid(_search_dialog):
+		_search_dialog.hide()
+	_add_node_of_type(type)
 
 
 ## Remembers the graph before a change. Repeating the same key shortly after
