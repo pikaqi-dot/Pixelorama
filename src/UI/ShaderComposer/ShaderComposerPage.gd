@@ -204,6 +204,10 @@ var _preset_name: LineEdit
 ## Dialog used to name an exported scene.
 var _export_dialog: ConfirmationDialog
 var _export_name: LineEdit
+## Toolbar button of the export, kept so its label can show the progress.
+var _export_button: Button
+## True while frames are being written, which pauses the thumbnail queue.
+var _exporting := false
 var _can_draw_before := true
 ## Animation phase shown in the preview, and how many frames a dynamic graph
 ## generates.
@@ -392,7 +396,8 @@ func _build_ui() -> void:
 	toolbar.add_child(_make_button("删除", _on_delete_pressed, "删除选中的节点"))
 	toolbar.add_child(_make_button("断开输入", _disconnect_selected, "断开选中节点的输入连线"))
 	toolbar.add_child(_make_button("刷新", func() -> void: _refresh_preview(), "重新生成预览"))
-	toolbar.add_child(_make_button("导出…", _show_export_dialog, "导出成 Godot 场景"))
+	_export_button = _make_button("导出…", _show_export_dialog, "导出成 Godot 场景")
+	toolbar.add_child(_export_button)
 	_zen_button = _make_button("参数全屏", _toggle_zen, "把参数面板铺满整个页面")
 	toolbar.add_child(_zen_button)
 	toolbar.add_child(_make_button("撤销", _undo, "Ctrl+Z"))
@@ -1040,7 +1045,9 @@ func _make_node_preview(node: Dictionary) -> Control:
 ## Paints queued thumbnails a few milliseconds at a time, so a graph with many
 ## nodes never blocks one frame after a change or a playback tick.
 func _process(_delta: float) -> void:
-	if _thumb_queue.is_empty() or not visible:
+	# The export walks the clock through every frame and bakes each one; painting
+	# thumbnails in between would throw away the rasters of the frame being baked.
+	if _thumb_queue.is_empty() or not visible or _exporting:
 		return
 	# A dragged slider keeps asking for a new preview, so a pass is running almost
 	# without a break. Waiting for it would leave every node picture frozen until
@@ -1531,13 +1538,30 @@ func _show_export_dialog() -> void:
 	if not is_instance_valid(_export_dialog):
 		_export_dialog = ConfirmationDialog.new()
 		_export_dialog.title = "导出为 Godot 场景"
+		var box := VBoxContainer.new()
 		_export_name = LineEdit.new()
-		_export_name.custom_minimum_size = Vector2(240, TOUCH_SIZE)
+		_export_name.custom_minimum_size = Vector2(300, TOUCH_SIZE)
 		_export_name.add_theme_font_size_override("font_size", TOUCH_FONT_SIZE)
-		_export_dialog.add_child(_export_name)
+		box.add_child(_export_name)
+		var hint := Label.new()
+		hint.text = (
+			"会把每一帧画成 PNG，场景只引用这些图：不动的图输出一张，"
+			+ "动画每帧一张并配好播放速度和时间轴预览一致。"
+			+ "文件夹在 res://shader_exports/ 下，可以整个复制到别的工程。"
+		)
+		hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+		hint.custom_minimum_size = Vector2(300, 0)
+		hint.add_theme_font_size_override("font_size", 13)
+		box.add_child(hint)
+		_export_dialog.add_child(box)
 		_export_dialog.confirmed.connect(_export_scene)
 		add_child(_export_dialog)
-	_export_dialog.popup_centered(Vector2i(340, 150))
+	if _export_name.text.strip_edges().is_empty():
+		var project := Global.current_project
+		_export_name.text = (
+			project.name if project != null and not project.name.is_empty() else "shader_scene"
+		)
+	_export_dialog.popup_centered(Vector2i(340, 210))
 	_export_name.grab_focus()
 	_export_name.select_all()
 
@@ -1546,14 +1570,23 @@ func _show_export_dialog() -> void:
 ## those textures. Nothing is generated when the scene opens, so it loads at once
 ## and the folder can be dropped into any Godot project.
 func _export_scene() -> void:
+	if _exporting:
+		return
 	# A sliced preview may still own the per frame caches, so let it finish
 	# before the one shot generation clears them.
+	_exporting = true
 	_suspend_preview = true
 	await _wait_for_preview()
-	_export_scene_now()
+	await _export_scene_now()
 	_suspend_preview = false
+	_exporting = false
+	_set_export_text("导出…")
+	# The export moved the clock through every frame, so the preview follows back.
+	_schedule_preview()
 
 
+## Bakes the frames one idle step at a time, so a long animation does not freeze
+## the composer while it is written out.
 func _export_scene_now() -> void:
 	var typed := _export_name.text.strip_edges()
 	if typed.is_empty():
@@ -1572,13 +1605,21 @@ func _export_scene_now() -> void:
 	var count: int = _frame_count_value() if animated else 1
 	var paths: Array[String] = []
 	var first_frame: Image = null
+	var tree := get_tree()
 	for index in count:
 		graph.time = float(index) / float(count)
-		var image: Image = graph.generate(image_size)
+		_set_export_text("导出中 %d/%d" % [index + 1, count])
+		# Hand the frame back between pictures, so the composer keeps answering.
+		if tree != null:
+			await tree.process_frame
+		var image: Image = await graph.generate_sliced(image_size, PREVIEW_SLICE_MSEC)
 		if index == 0:
 			first_frame = image
 		var file_name := ("%s.png" % base) if count == 1 else ("frame_%03d.png" % index)
-		image.save_png(absolute.path_join(file_name))
+		var written := image.save_png(absolute.path_join(file_name))
+		if written != OK:
+			Global.notification_label("无法写入 %s（错误 %d）" % [file_name, written])
+			return
 		paths.append(file_name)
 	graph.time = _phase.value if is_instance_valid(_phase) else 0.0
 	if count > 1 and first_frame != null:
@@ -1595,6 +1636,16 @@ func _export_scene_now() -> void:
 		Global.notification_label("已导出 %d 帧到 %s" % [count, folder])
 	else:
 		Global.notification_label("已导出到 %s" % folder)
+
+
+## Shows the export progress on the toolbar button. The button is disabled while
+## frames are written, because a second export would fight over the same folder
+## and over the clock the first one is walking.
+func _set_export_text(text: String) -> void:
+	if not is_instance_valid(_export_button):
+		return
+	_export_button.text = text
+	_export_button.disabled = _exporting
 
 
 ## Removes what an earlier export left in the folder, so re-exporting a longer
