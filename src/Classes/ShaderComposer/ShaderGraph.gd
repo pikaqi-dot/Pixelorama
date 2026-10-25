@@ -1212,11 +1212,15 @@ func _paint_threads() -> int:
 ## the threads would race on the raster and noise caches, and a cache the
 ## interface dropped between two slices would be rebuilt from several threads at
 ## once; with it the paint loop only reads.
-func _warm_caches(state: Dictionary) -> void:
-	var size: Vector2i = state["size"]
+func _warm_caches(size: Vector2i) -> void:
 	var probe := Vector2(0.5, 0.5)
 	for node: Dictionary in nodes:
-		_eval(str(node["id"]), probe, size, 0)
+		var node_id := str(node["id"])
+		# A noise field is sampled for the whole picture at once, and this is the
+		# main thread: building it here is what keeps the workers off that cache.
+		if str(node["type"]) == "noise":
+			_noise_field(node_id, params_for(node), size)
+		_eval(node_id, probe, size, 0)
 
 
 ## Paints the band in [param band] into its own image and hands it back under the
@@ -1241,7 +1245,7 @@ func _paint_rows_parallel(
 	state: Dictionary, from_row: int, to_row: int, threads: int
 ) -> void:
 	var size: Vector2i = state["size"]
-	_warm_caches(state)
+	_warm_caches(size)
 	var rows := to_row - from_row
 	var count: int = mini(threads, rows)
 	var step: int = int(ceilf(float(rows) / float(count)))
@@ -1511,7 +1515,7 @@ func _eval(node_id: String, uv: Vector2, size: Vector2i, depth: int) -> float:
 			blended = absf(a - b)
 		return clampf(lerpf(a, blended, factor), 0.0, 1.0)
 	elif node_type == "noise":
-		return _noise_value(node_id, params, uv)
+		return _noise_at(node_id, params, size, uv)
 	elif node_type == "gradient":
 		var direction := Vector2.from_angle(deg_to_rad(float(params["angle"])))
 		var shift := float(params.get("offset", 0.0))
@@ -2535,38 +2539,136 @@ func preview_node(node_id: String, size: Vector2i) -> Image:
 	var field_data := PackedByteArray()
 	if field != null:
 		field_data = field.get_data()
-	var has_field := not field_data.is_empty()
-	# Written into one byte buffer and handed to the image at the end. A preview
-	# is rebuilt on every edit and every playback tick, so per pixel set_pixel
-	# calls are the difference between smooth and laggy on a phone.
+	# A preview is rebuilt on every edit and every playback tick, and a thumbnail
+	# of a long branch was the slowest single thing the interface did, so the rows
+	# go over the cores here as well. Written into bytes and handed to the image at
+	# the end, because per pixel set_pixel calls are what made it crawl on a phone.
 	var bytes := PackedByteArray()
-	bytes.resize(size.x * size.y * 4)
-	var index := 0
-	for y in size.y:
+	var threads := _paint_threads()
+	if threads > 1 and size.y >= PARALLEL_MIN_ROWS and size.x * size.y >= PARALLEL_MIN_PIXELS:
+		bytes = _preview_parallel(
+			node_id, size, tint, fade, alpha_cut, field_data, threads
+		)
+	else:
+		bytes = _preview_into(node_id, size, tint, fade, alpha_cut, field_data, 0, 0, size.y)
+	return Image.create_from_data(size.x, size.y, false, Image.FORMAT_RGBA8, bytes)
+
+
+## Paints rows [param from_row] to [param to_row] of the preview of [param node_id]
+## and returns them as one byte block, whose first row is row [param offset]. A
+## block of its own per band is what lets the workers stay out of each other's way,
+## packed arrays being copied when they are handed to a function.
+func _preview_into(
+	node_id: String,
+	size: Vector2i,
+	tint: Variant,
+	fade: bool,
+	alpha_cut: float,
+	field_data: PackedByteArray,
+	offset: int,
+	from_row: int,
+	to_row: int
+) -> PackedByteArray:
+	var row_bytes: int = size.x * 4
+	var target := PackedByteArray()
+	target.resize(row_bytes * (to_row - from_row))
+	var has_field := not field_data.is_empty()
+	for y in range(from_row, to_row):
+		var row_start: int = (y - offset) * row_bytes
 		for x in size.x:
 			var value := (
-				float(field_data[index]) / 255.0
+				float(field_data[y * row_bytes + x * 4]) / 255.0
 				if has_field
 				else clampf(_eval(node_id, Vector2(x, y), size, 0), 0.0, 1.0)
 			)
-			if value > alpha_cut:
-				var color: Color
-				if tint == null:
-					color = Color(value, value, value, 1.0)
-				else:
-					var base: Color = tint
-					color = Color(base.r * value, base.g * value, base.b * value, 1.0)
-				if fade:
-					color.a = value
-				# to_rgba32 packs red in the highest byte, so it is written out in
-				# the RGBA order the image expects.
-				var packed := color.to_rgba32()
-				bytes[index] = (packed >> 24) & 0xFF
-				bytes[index + 1] = (packed >> 16) & 0xFF
-				bytes[index + 2] = (packed >> 8) & 0xFF
-				bytes[index + 3] = packed & 0xFF
-			index += 4
-	return Image.create_from_data(size.x, size.y, false, Image.FORMAT_RGBA8, bytes)
+			if value <= alpha_cut:
+				continue
+			var color: Color
+			if tint == null:
+				color = Color(value, value, value, 1.0)
+			else:
+				var base: Color = tint
+				color = Color(base.r * value, base.g * value, base.b * value, 1.0)
+			if fade:
+				color.a = value
+			# to_rgba32 packs red in the highest byte, so it is written out in the
+			# RGBA order the image expects.
+			var packed := color.to_rgba32()
+			var at: int = row_start + x * 4
+			target[at] = (packed >> 24) & 0xFF
+			target[at + 1] = (packed >> 16) & 0xFF
+			target[at + 2] = (packed >> 8) & 0xFF
+			target[at + 3] = packed & 0xFF
+	return target
+
+
+## Paints one band of a preview into its own block and hands it back under the
+## mutex, so the block is the only thing the workers share.
+func _preview_band(
+	node_id: String,
+	size: Vector2i,
+	tint: Variant,
+	fade: bool,
+	alpha_cut: float,
+	field_data: PackedByteArray,
+	band: int,
+	bands: Array,
+	results: Array,
+	mutex: Mutex
+) -> void:
+	var pair: Array = bands[band]
+	var from_row: int = int(pair[0])
+	var to_row: int = int(pair[1])
+	var piece := _preview_into(
+		node_id, size, tint, fade, alpha_cut, field_data, from_row, from_row, to_row
+	)
+	mutex.lock()
+	results[band] = piece
+	mutex.unlock()
+
+
+## Splits a preview over [param threads] workers and joins the blocks in order.
+func _preview_parallel(
+	node_id: String,
+	size: Vector2i,
+	tint: Variant,
+	fade: bool,
+	alpha_cut: float,
+	field_data: PackedByteArray,
+	threads: int
+) -> PackedByteArray:
+	_warm_caches(size)
+	var count: int = mini(threads, size.y)
+	var step: int = int(ceilf(float(size.y) / float(count)))
+	var bands: Array = []
+	var start := 0
+	while start < size.y:
+		bands.append([start, mini(start + step, size.y)])
+		start += step
+	count = bands.size()
+	var results: Array = []
+	results.resize(count)
+	var mutex := Mutex.new()
+	var group := WorkerThreadPool.add_group_task(
+		func(band: int) -> void: _preview_band(
+			node_id, size, tint, fade, alpha_cut, field_data, band, bands, results, mutex
+		),
+		count,
+		count,
+		false,
+		"shader composer preview"
+	)
+	WorkerThreadPool.wait_for_group_task_completion(group)
+	var bytes := PackedByteArray()
+	var expected: int = size.x * size.y * 4
+	for index in count:
+		var piece: Variant = results[index]
+		if piece is PackedByteArray:
+			bytes.append_array(piece)
+	if bytes.size() != expected:
+		# A band that came back broken would otherwise shift the whole picture.
+		return _preview_into(node_id, size, tint, fade, alpha_cut, field_data, 0, 0, size.y)
+	return bytes
 
 
 ## Value below which a preview leaves a pixel transparent. The output says where
@@ -3945,11 +4047,11 @@ func _math_value(op: int, source: float, params: Dictionary) -> float:
 	return source
 
 
-## Noise is sampled with [FastNoiseLite], which is cached per node.
-func _noise_value(node_id: String, params: Dictionary, uv: Vector2) -> float:
+## [FastNoiseLite] of a noise node, rebuilt only when its settings changed. The
+## signature string is wanted once per frame per node; building it on every pixel
+## was one of the most expensive parts of the preview.
+func _noise_object(node_id: String, params: Dictionary) -> FastNoiseLite:
 	var noise: FastNoiseLite = _noise_cache.get(node_id, null)
-	# The signature string is only needed once per frame per node. Building it on
-	# every pixel was one of the most expensive parts of the preview.
 	if noise == null or not _noise_checked.has(node_id):
 		_noise_checked[node_id] = true
 		var signature := "%d|%.4f|%d|%d|%.4f" % [
@@ -3969,7 +4071,51 @@ func _noise_value(node_id: String, params: Dictionary, uv: Vector2) -> float:
 			noise.fractal_gain = clampf(float(params["gain"]), 0.05, 0.95)
 			_noise_cache[node_id] = noise
 			_noise_signature[node_id] = signature
+	return noise
+
+
+## Noise is sampled with [FastNoiseLite], which is cached per node.
+func _noise_value(node_id: String, params: Dictionary, uv: Vector2) -> float:
+	var noise := _noise_object(node_id, params)
 	return clampf(noise.get_noise_2d(uv.x, uv.y) * 0.5 + 0.5, 0.0, 1.0)
+
+
+## Value of a noise node at [param uv]. A whole pixel comes out of a field that was
+## sampled once for the whole picture, so a noise source costs one native sample
+## per pixel of its area instead of a full evaluator call per pixel; a mapped
+## position (a transform above it) still samples on demand.
+func _noise_at(node_id: String, params: Dictionary, size: Vector2i, uv: Vector2) -> float:
+	if uv.x < 0.0 or uv.y < 0.0 or uv.x >= float(size.x) or uv.y >= float(size.y):
+		return 0.0
+	var x := int(uv.x)
+	var y := int(uv.y)
+	if float(x) != uv.x or float(y) != uv.y:
+		return _noise_value(node_id, params, uv)
+	var field := _noise_field(node_id, params, size)
+	if field.is_empty():
+		return _noise_value(node_id, params, uv)
+	return field[y * size.x + x]
+
+
+## Noise of [param node_id] sampled over [param size] and kept with the rasters, so
+## it is dropped the same way and only when the node itself changed.
+func _noise_field(
+	node_id: String, params: Dictionary, size: Vector2i
+) -> PackedFloat32Array:
+	var key := "%s#noise" % _raster_key(node_id, size)
+	var cached: Variant = _path_cache.get(key, null)
+	if cached is PackedFloat32Array:
+		return cached
+	var field := PackedFloat32Array()
+	field.resize(size.x * size.y)
+	var noise := _noise_object(node_id, params)
+	var index := 0
+	for y in size.y:
+		for x in size.x:
+			field[index] = clampf(noise.get_noise_2d(float(x), float(y)) * 0.5 + 0.5, 0.0, 1.0)
+			index += 1
+	_path_cache[key] = field
+	return field
 
 
 ## Small description of a node, used by the interface.
