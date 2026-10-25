@@ -273,6 +273,9 @@ var _source_generation := 0
 ## positive number pins it, which is how a single threaded picture is produced
 ## for comparisons and how the splitting can be switched off.
 var paint_threads := 0
+## False when the graph has a node that moves the shared clock while it samples,
+## which is the one thing the threads cannot do side by side.
+var _parallel_safe := true
 ## Bounds of the non empty part of a branch, rebuilt for every generated image.
 var _bounds_cache := {}
 var _bayer_cache := {}
@@ -1200,6 +1203,8 @@ func _paint_rows(state: Dictionary, from_row: int, to_row: int) -> void:
 
 ## How many worker threads a picture may use on this machine.
 func _paint_threads() -> int:
+	if not _parallel_safe:
+		return 1
 	if paint_threads > 0:
 		return mini(paint_threads, PARALLEL_MAX_THREADS)
 	# One thread is left for the interface on a two core machine; a big desktop
@@ -1404,9 +1409,14 @@ func _resolve_animations() -> void:
 	# other node of the graph.
 	_raster_keys.clear()
 	_raster_sigs.clear()
+	_parallel_safe = true
 	for node: Dictionary in nodes:
 		var node_id := str(node["id"])
 		var params: Dictionary = node["params"]
+		# An echo that walks the clock back moves [member time] while it samples,
+		# so a graph holding one is painted on the main thread only.
+		if str(node["type"]) == "echo" and bool(params.get("animated", false)):
+			_parallel_safe = false
 		var anim: Variant = params.get("anim", null)
 		if anim is Dictionary:
 			var setting: Dictionary = anim
@@ -2733,7 +2743,12 @@ func _raster_signature(node_id: String) -> int:
 		var stored: Array = entry
 		var node: Dictionary = stored[0]
 		var params: Dictionary = stored[1]
-		signature = hash([params, time, _source_generation, node.get("bypass", false)])
+		var node_type := str(node["type"])
+		# Only a tree and a particle field read the clock while they are drawn;
+		# everything else is drawn from its parameters, so it keeps its raster from
+		# one frame to the next even while the animation plays.
+		var clock := time if node_type == "tree" or node_type == "particles" else 0.0
+		signature = hash([params, clock, _source_generation, node.get("bypass", false)])
 		for slot in 2:
 			var upstream := _input_id(node, slot)
 			if not upstream.is_empty():
