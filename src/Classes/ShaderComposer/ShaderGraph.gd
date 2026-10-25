@@ -221,6 +221,13 @@ const PREVIEW_EMPTY := 0.004
 ## strokes of the running pass away. More distinct sizes than this drop
 ## everything, which bounds the memory.
 const RASTER_SIZES_MAX := 4
+## Most rasters kept at once. Keys carry the parameters and the time they were
+## drawn from, so an untouched stroke survives the next generation instead of
+## being redrawn for every step of an unrelated slider; this cap is what keeps
+## that from growing without end while a graph plays. A node needs one entry per
+## size in use, and the graph editor shows three of them at once (preview,
+## thumbnail, side panel), so this leaves room for a good handful of rasters.
+const RASTER_CACHE_MAX := 32
 
 ## Nodes of the graph, as dictionaries: id, type, position, params, inputs.
 var nodes: Array[Dictionary] = []
@@ -243,9 +250,17 @@ var _eval_nodes: Dictionary = {}
 ## Noise nodes already prepared this frame, so their signature string is built
 ## once instead of once per pixel.
 var _noise_checked: Dictionary = {}
-## Time the images in [member _path_cache] were built at. A new frame throws
-## them away, so they only have to be keyed by node id and size.
-var _raster_time := -1.0
+## Cache key of the raster of every node of this frame, so the evaluator formats
+## one string per node instead of one per pixel it visits.
+var _raster_keys: Dictionary = {}
+## Signature of the parameters, inputs and time a raster is drawn from. It is
+## part of the key, which is what lets an unchanged stroke be found again in the
+## next generation instead of being redrawn.
+var _raster_sigs: Dictionary = {}
+## Bumped once per generation while the graph reads the project. The artwork can
+## change without a single parameter moving, so rasters of such a graph must not
+## be reused across generations.
+var _source_generation := 0
 ## Bounds of the non empty part of a branch, rebuilt for every generated image.
 var _bounds_cache := {}
 var _bayer_cache := {}
@@ -1101,9 +1116,11 @@ func generate_sliced(size: Vector2i, slice_msec := 16.0) -> Image:
 func _begin_generation(size: Vector2i) -> Dictionary:
 	size = Vector2i(maxi(size.x, 1), maxi(size.y, 1))
 	_bounds_cache.clear()
-	_path_cache.clear()
-	_raster_sizes.clear()
 	_source_cache.clear()
+	# A graph that reads the project can see the artwork change underneath it
+	# without any parameter moving, so its rasters belong to this generation only.
+	if uses_source():
+		_source_generation += 1
 	# Resolved once per frame, so an animated parameter costs a lookup per pixel.
 	_resolve_animations()
 	var image := Image.create_empty(size.x, size.y, false, Image.FORMAT_RGBA8)
@@ -1119,12 +1136,20 @@ func _begin_generation(size: Vector2i) -> Dictionary:
 	# picture is that colour where that node is the one feeding the output.
 	var legacy := output_params.has("color_a") and output_params.has("color_b")
 	var color_a: Color = output_params.get("color_a", Color.WHITE)
+	# A node that draws its picture once per generation is walked byte by byte
+	# instead of through the evaluator, which cuts the cost of a particle or
+	# scatter field to the price of reading its bytes.
+	var field := _raster_field(source, size)
+	var field_data := PackedByteArray()
+	if field != null:
+		field_data = field.get_data()
 	return {
 		"image": image,
 		"size": size,
 		"done": false,
 		"row": 0,
 		"source": source,
+		"field_data": field_data,
 		"tint": source_colour(source),
 		"ramp": legacy,
 		"steps": maxi(int(output_params.get("steps", 2)), 2),
@@ -1155,9 +1180,19 @@ func _paint_rows(state: Dictionary, from_row: int, to_row: int) -> void:
 	var transparent: bool = state["transparent"]
 	var alpha_cut: float = state["alpha_cut"]
 	var alpha_from_value: bool = state["alpha_from_value"]
+	# When the branch is one picture that was already drawn at this size, its
+	# bytes are the values: 255 steps, exactly what reading the pixel back gives.
+	var field_data: PackedByteArray = state.get("field_data", PackedByteArray())
+	var has_field := not field_data.is_empty()
+	var row_bytes: int = size.x * 4
 	for y in range(from_row, to_row):
+		var row_start: int = y * row_bytes
 		for x in size.x:
-			var value := clampf(_eval(source, Vector2(x, y), size, 0), 0.0, 1.0)
+			var value: float
+			if has_field:
+				value = float(field_data[row_start + x * 4]) / 255.0
+			else:
+				value = clampf(_eval(source, Vector2(x, y), size, 0), 0.0, 1.0)
 			if transparent and value <= alpha_cut:
 				image.set_pixel(x, y, Color(0.0, 0.0, 0.0, 0.0))
 				continue
@@ -1248,12 +1283,12 @@ func _resolve_animations() -> void:
 	_live_params.clear()
 	_eval_nodes.clear()
 	_noise_checked.clear()
-	# Cached strokes, trees and particle fields only last for one frame, so a
-	# node id plus the size is enough to find them again inside the pixel loop.
-	if not is_equal_approx(time, _raster_time):
-		_raster_time = time
-		_path_cache.clear()
-		_raster_sizes.clear()
+	# The keys and the signatures are rebuilt for every frame, the rasters they
+	# point at are not: a stroke whose node, inputs and time did not change keeps
+	# the image it already has, so dragging one slider no longer redraws every
+	# other node of the graph.
+	_raster_keys.clear()
+	_raster_sigs.clear()
 	for node: Dictionary in nodes:
 		var node_id := str(node["id"])
 		var params: Dictionary = node["params"]
@@ -2383,6 +2418,13 @@ func preview_node(node_id: String, size: Vector2i) -> Image:
 	var tint: Variant = source_colour(node_id)
 	var fade := _preview_fades_alpha()
 	var alpha_cut := _preview_alpha_cut()
+	# A node that draws its own picture is read straight out of it, so the preview
+	# of a particle or scatter field costs the copy instead of a sample per pixel.
+	var field := _raster_field(node_id, size)
+	var field_data := PackedByteArray()
+	if field != null:
+		field_data = field.get_data()
+	var has_field := not field_data.is_empty()
 	# Written into one byte buffer and handed to the image at the end. A preview
 	# is rebuilt on every edit and every playback tick, so per pixel set_pixel
 	# calls are the difference between smooth and laggy on a phone.
@@ -2391,7 +2433,11 @@ func preview_node(node_id: String, size: Vector2i) -> Image:
 	var index := 0
 	for y in size.y:
 		for x in size.x:
-			var value := clampf(_eval(node_id, Vector2(x, y), size, 0), 0.0, 1.0)
+			var value := (
+				float(field_data[index]) / 255.0
+				if has_field
+				else clampf(_eval(node_id, Vector2(x, y), size, 0), 0.0, 1.0)
+			)
 			if value > alpha_cut:
 				var color: Color
 				if tint == null:
@@ -2438,14 +2484,75 @@ func _preview_fades_alpha() -> bool:
 ## Cache key of a rasterised node image. The size is part of the key, so the
 ## thumbnail, the side panel picture and the main preview do not throw each
 ## other's rasters away whenever the size changes, which used to rebuild every
-## stroke, tree and particle field several times per frame.
+## stroke, tree and particle field several times per frame. The signature of the
+## node is in there as well: a stroke that did not change is found again in the
+## next generation instead of being drawn from scratch, and the finished key is
+## remembered per node because this runs for every pixel of the picture.
 func _raster_key(node_id: String, size: Vector2i) -> String:
+	var cached: Variant = _raster_keys.get(node_id, null)
+	if cached != null and (cached as Array)[0] == size:
+		return str((cached as Array)[1])
 	if not _raster_sizes.has(size):
 		if _raster_sizes.size() >= RASTER_SIZES_MAX:
 			_path_cache.clear()
 			_raster_sizes.clear()
+			_raster_keys.clear()
 		_raster_sizes[size] = true
-	return "%s@%dx%d" % [node_id, size.x, size.y]
+	if _path_cache.size() >= RASTER_CACHE_MAX:
+		_path_cache.clear()
+	var key := "%s|%d@%dx%d" % [node_id, _raster_signature(node_id), size.x, size.y]
+	_raster_keys[node_id] = [size, key]
+	return key
+
+
+## Everything the raster of [param node_id] is drawn from: its parameters, the
+## node itself (a bypass change rewires it), the signatures of the branches it
+## reads and the clock. Built once per node per frame, it is what tells the cache
+## an untouched stroke from an edited one.
+func _raster_signature(node_id: String) -> int:
+	if _raster_sigs.has(node_id):
+		return int(_raster_sigs[node_id])
+	var signature := 0
+	var entry: Variant = _eval_nodes.get(node_id, null)
+	if entry == null:
+		signature = hash([node_id, time])
+	else:
+		var stored: Array = entry
+		var node: Dictionary = stored[0]
+		var params: Dictionary = stored[1]
+		signature = hash([params, time, _source_generation, node.get("bypass", false)])
+		for slot in 2:
+			var upstream := _input_id(node, slot)
+			if not upstream.is_empty():
+				signature = signature ^ (int(_raster_signature(upstream)) * (slot + 3))
+	_raster_sigs[node_id] = signature
+	return signature
+
+
+## Picture behind [param node_id] when the node is one that draws itself once per
+## generation, or null. The paint loop and the node previews walk those bytes
+## directly, so a particle or scatter field costs a read per pixel instead of a
+## call into the evaluator.
+func _raster_field(node_id: String, size: Vector2i) -> Image:
+	var entry: Variant = _eval_nodes.get(node_id, null)
+	if entry == null:
+		return null
+	var stored: Array = entry
+	var node: Dictionary = stored[0]
+	var params: Dictionary = stored[1]
+	if bool(node.get("bypass", false)):
+		# A bypassed node hands its input through, so it owns no picture.
+		return null
+	match str(node["type"]):
+		"path":
+			return _path_image(node, params, size)
+		"tree":
+			return _tree_image(node, params, size)
+		"particles":
+			return _particles_image(node, params, size)
+		"scatter":
+			return _scatter_image(node, params, size, 0)
+	return null
 
 
 ## Rasterises the stroke of a path node at [param size] and caches it, so the
@@ -3526,9 +3633,14 @@ func source_cel(node: Dictionary) -> BaseCel:
 
 
 ## Drops the cached layer images, so the preview reads the artwork again after
-## the drawing window painted into it.
+## the drawing window painted into it. Rasters can have the artwork baked into
+## them, so they cannot outlive it either.
 func clear_source_cache() -> void:
 	_source_cache.clear()
+	_path_cache.clear()
+	_raster_keys.clear()
+	_raster_sigs.clear()
+	_source_generation += 1
 
 
 ## The picture behind a pixel_art node, for the editor preview. It is either the
