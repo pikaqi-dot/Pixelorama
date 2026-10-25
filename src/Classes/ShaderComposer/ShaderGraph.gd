@@ -105,6 +105,8 @@ const PARTICLE_SPAWN := ["底部升起", "顶部下落", "中心爆发", "全画
 const PARTICLE_SHAPES := ["方形", "圆形"]
 ## Shape index that uses the control points edited in the path editor.
 const PATH_CUSTOM := 6
+## How the stamps of a scatter are laid out.
+const SCATTER_DISTRIBUTIONS := ["随机", "均匀间距", "网格"]
 ## Prefix of the ids of groups, so a group node can be told from a real node.
 const GROUP_PREFIX := "group_"
 const DITHER_SIZES_TEXT := ["2×2", "4×4", "8×8"]
@@ -774,6 +776,25 @@ static func default_params(type: String) -> Dictionary:
 				"scale_max": 1.3,
 				"seed": 1,
 				"align": true,
+				# 0 scatters at random, 1 keeps a minimum distance between the stamps
+				# so nothing clumps, 2 lays them on a lattice. Only the lattice
+				# replaces the amount, with one stamp per cell.
+				"distribution": 0,
+				"distance": 0.12,
+				"grid_x": 4,
+				"grid_y": 4,
+				"jitter": 0.35,
+				# Whole field shift in canvas units, so one node can be nudged
+				# without moving the branch that feeds it.
+				"offset_x": 0.0,
+				"offset_y": 0.0,
+				# How far the brightness of a single stamp may wander, which keeps a
+				# patch of leaves from looking painted with one brush.
+				"level_random": 0.0,
+				# Stamp the lower stamps last, so they cover the higher ones.
+				"sort_y": false,
+				# Wrap the stamps around the edges, for a pattern that tiles.
+				"tile": false,
 			}
 		"particles":
 			return {
@@ -2677,6 +2698,18 @@ func _scatter_image(
 	var scale_max := maxf(float(params.get("scale_max", 1.3)), scale_min)
 	var align := bool(params.get("align", true))
 	var level := clampf(float(params.get("level", 1.0)), 0.0, 1.0)
+	var level_random := clampf(float(params.get("level_random", 0.0)), 0.0, 1.0)
+	var distribution := clampi(int(params.get("distribution", 0)), 0, 2)
+	var min_gap := shortest * clampf(float(params.get("distance", 0.12)), 0.01, 1.0)
+	var columns := clampi(int(params.get("grid_x", 4)), 1, 32)
+	var rows := clampi(int(params.get("grid_y", 4)), 1, 32)
+	var jitter := clampf(float(params.get("jitter", 0.35)), 0.0, 1.0)
+	var sort_y := bool(params.get("sort_y", false))
+	var tile := bool(params.get("tile", false))
+	var field_offset := (
+		Vector2(float(params.get("offset_x", 0.0)), float(params.get("offset_y", 0.0)))
+		* Vector2(size)
+	)
 	var rng := RandomNumberGenerator.new()
 	rng.seed = int(params.get("seed", 1))
 	# Keep the aspect of a layer brush, so a wide leaf stays wide.
@@ -2705,6 +2738,11 @@ func _scatter_image(
 	var center := Vector2(size) * 0.5
 	var reach := Vector2(shortest * spread * 0.5, shortest * spread * 0.5)
 	var mode := int(params.get("mode", 0))
+	# A lattice needs cells, so it replaces the amount with one stamp per cell. It
+	# only applies to the area mode, where a grid over the canvas means something.
+	var lattice := distribution == 2 and mode == 0
+	if lattice:
+		amount = columns * rows
 	# Over a drawing: the stamps sit on the opaque part of the second input, so a
 	# canvas that grows from a path animates the scatter by itself — the shape it
 	# shows is exactly what is being scattered over.
@@ -2731,21 +2769,52 @@ func _scatter_image(
 				path_points = flat
 				along_path = true
 	var size_vec := Vector2(size)
-	for index in amount:
+	# Every placement is decided before anything is stamped, so the stamps can be
+	# sorted by Y and a minimum distance can be kept between them.
+	var placements: Array = []
+	# The distance rule turns some candidates down, so more of them are drawn than
+	# the amount of stamps that is wanted.
+	var attempts := amount if distribution != 1 else mini(amount * 4, 512)
+	for index in attempts:
 		# Every random value is taken before the density test, so hiding one
 		# stamp does not reshuffle the rest of the field.
 		var across := rng.randf_range(-1.0, 1.0)
 		var down := rng.randf_range(-1.0, 1.0)
 		var rotation := angle + deg_to_rad(rng.randf_range(-angle_random, angle_random))
-		var scale := rng.randf_range(scale_min, scale_max)
+		var stamp_scale := rng.randf_range(scale_min, scale_max)
 		var chance := rng.randf()
+		var brightness := level
+		if level_random > 0.0:
+			# Each stamp keeps a brightness of its own, which is what turns a patch
+			# of leaves into something with depth instead of a flat cut out.
+			brightness = clampf(
+				level * (1.0 + rng.randf_range(-level_random, level_random)), 0.0, 1.0
+			)
 		var position: Vector2
-		if mode == 2:
+		if lattice:
+			# One stamp per cell, nudged inside it so the grid does not read as
+			# machine made. The lattice covers the area the random mode uses.
+			var column := index % columns
+			var row := floori(float(index) / float(columns))
+			var cell := Vector2(float(column) + 0.5, float(row) + 0.5)
+			position = (
+				size_vec * 0.5
+				+ (cell / Vector2(float(columns), float(rows)) - Vector2(0.5, 0.5))
+				* size_vec
+				* spread
+			)
+			position += (
+				Vector2(rng.randf_range(-0.5, 0.5), rng.randf_range(-0.5, 0.5))
+				* size_vec
+				/ Vector2(float(columns), float(rows))
+				* jitter
+			)
+		elif mode == 2:
 			if mask_points.is_empty():
 				continue
 			# Stratified slots over the scanned points, so the stamps arrive along
 			# the shape the way it was drawn instead of clumping.
-			var slot := (float(index) + rng.randf_range(0.0, 1.0)) / float(amount)
+			var slot := (float(index) + rng.randf_range(0.0, 1.0)) / float(attempts)
 			var pick := clampi(
 				int(slot * float(mask_points.size())), 0, mask_points.size() - 1
 			)
@@ -2753,7 +2822,7 @@ func _scatter_image(
 			position += Vector2(across, down) * shortest * spread * 0.06
 		elif along_path:
 			# Stratified slots keep the stamps spread evenly instead of clumping.
-			var slot := (float(index) + rng.randf_range(0.0, 1.0)) / float(amount)
+			var slot := (float(index) + rng.randf_range(0.0, 1.0)) / float(attempts)
 			var sample: Dictionary = _path_point_at(path_points, slot)
 			var direction: Vector2 = sample["direction"]
 			if follow_tangent and direction.length_squared() > 0.0:
@@ -2762,14 +2831,58 @@ func _scatter_image(
 			position += Vector2(-direction.y, direction.x) * across * shortest * path_width * 0.5
 		else:
 			position = center + Vector2(across * reach.x, down * reach.y)
+		position += field_offset
 		if align:
 			position = position.round()
 		if not along_path and mode != 2 and not density_id.is_empty():
 			if _eval(density_id, position, size, depth + 1) < chance:
 				continue
-		_stamp_source(image, source_id, position, rotation, scale, footprint, size, depth, level)
+		if distribution == 1 and not _scatter_has_room(placements, position, min_gap):
+			continue
+		placements.append(
+			{
+				"position": position,
+				"rotation": rotation,
+				"scale": stamp_scale,
+				"level": brightness,
+			}
+		)
+		if distribution == 1 and placements.size() >= amount:
+			break
+	if sort_y:
+		# Smaller Y first, so the stamps lower on the canvas are drawn last and end
+		# up in front. That is what gives a bush of leaves its depth.
+		placements.sort_custom(
+			func(a: Dictionary, b: Dictionary) -> bool:
+				return float((a["position"] as Vector2).y) < float((b["position"] as Vector2).y)
+		)
+	for place: Dictionary in placements:
+		_stamp_source(
+			image,
+			source_id,
+			place["position"],
+			float(place["rotation"]),
+			float(place["scale"]),
+			footprint,
+			size,
+			depth,
+			float(place["level"]),
+			tile,
+			sort_y
+		)
 	_path_cache[key] = image
 	return image
+
+
+## True when a stamp at [param position] keeps the minimum gap to the stamps that
+## were already placed, which is what spreads a scatter evenly instead of letting
+## it clump in one corner.
+static func _scatter_has_room(placements: Array, position: Vector2, min_gap: float) -> bool:
+	var limit := min_gap * min_gap
+	for place: Dictionary in placements:
+		if (place["position"] as Vector2).distance_squared_to(position) < limit:
+			return false
+	return true
 	
 	
 ## Image a branch can hand out directly, or null when it has to be sampled. A
@@ -2831,7 +2944,9 @@ func _stamp_source(
 	footprint: Vector2,
 	size: Vector2i,
 	depth: int,
-	level := 1.0
+	level := 1.0,
+	tile := false,
+	overwrite := false
 ) -> void:
 	var scaled := footprint * maxf(scale, 0.01)
 	var reach := int(ceil(scaled.length() * 0.5)) + 1
@@ -2856,11 +2971,17 @@ func _stamp_source(
 			)
 	for offset_y in range(-reach, reach + 1):
 		var y := center.y + offset_y
-		if y < 0 or y >= size.y:
+		if tile:
+			# A tiled pattern continues on the other side instead of stopping at
+			# the edge, which is what makes the artwork seamless.
+			y = wrapi(y, 0, size.y)
+		elif y < 0 or y >= size.y:
 			continue
 		for offset_x in range(-reach, reach + 1):
 			var x := center.x + offset_x
-			if x < 0 or x >= size.x:
+			if tile:
+				x = wrapi(x, 0, size.x)
+			elif x < 0 or x >= size.x:
 				continue
 			# -0.5..0.5 across the brush, then rotated back into brush space.
 			var local := Vector2(float(offset_x), float(offset_y)) / scaled
@@ -2876,7 +2997,10 @@ func _stamp_source(
 			var value := clampf(mask * level, 0.0, 1.0)
 			if value <= 0.0:
 				continue
-			if value > image.get_pixel(x, y).r:
+			# A stamp ordered by Y paints over what is already there, which is what
+			# lets a nearer leaf cover a farther one. Without ordering the brightest
+			# stamp wins instead, so overlapping stamps never get darker.
+			if overwrite or value > image.get_pixel(x, y).r:
 				image.set_pixel(x, y, Color(value, value, value, 1.0))
 
 
@@ -3332,6 +3456,18 @@ static func describe(node: Dictionary) -> String:
 			var level := float(params.get("level", 1.0))
 			if not is_equal_approx(level, 1.0):
 				scatter_text += " · 亮度 %.2f" % level
+			match clampi(int(params.get("distribution", 0)), 0, 2):
+				1:
+					scatter_text += " · 均匀间距"
+				2:
+					if int(params.get("mode", 0)) == 0:
+						scatter_text += " · %d×%d 网格" % [
+							int(params.get("grid_x", 4)), int(params.get("grid_y", 4))
+						]
+			if bool(params.get("sort_y", false)):
+				scatter_text += " · 前后排序"
+			if bool(params.get("tile", false)):
+				scatter_text += " · 平铺"
 			if bool(params.get("tint", false)):
 				scatter_text += " · 上色"
 			return scatter_text
@@ -3797,6 +3933,10 @@ func build_scatter_preset(layer_material := true) -> void:
 			"scale_max": 1.4,
 			"seed": 4,
 			"align": true,
+			# Leaves overlap, so the ones lower on the canvas are drawn last and end
+			# up in front, and each of them keeps a brightness of its own.
+			"sort_y": true,
+			"level_random": 0.25,
 		},
 		true
 	)
@@ -3933,6 +4073,8 @@ func build_vine_preset() -> void:
 			"scale_max": 1.2,
 			"seed": 3,
 			"align": true,
+			"sort_y": true,
+			"level_random": 0.15,
 		},
 		true
 	)

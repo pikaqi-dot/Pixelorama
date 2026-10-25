@@ -1993,6 +1993,9 @@ func _show_params(id: String) -> void:
 				+ "笔刷只取不透明的形状，像素画本身的颜色不参与，"
 				+ "盖章的明暗由下面的「亮度」决定，颜色则打开「上色」自己选，"
 				+ "并沿着连线一路传给后面的节点和输出。"
+				+ "「分布方式」里，均匀间距不会扎堆，网格按列×行排成阵列；"
+				+ "「按 Y 排序」让下方的印章盖住上方的，做出前后层次；"
+				+ "「平铺」让越界的印章从另一侧回绕，做无缝图案。"
 			)
 			scatter_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 			scatter_hint.add_theme_font_size_override("font_size", 13)
@@ -2030,11 +2033,56 @@ func _show_params(id: String) -> void:
 				_add_slider(
 					"范围", 0.0, 1.5, 0.01, float(params.get("spread", 0.6)), params, "spread"
 				)
+			_add_option(
+				"分布方式",
+				ShaderGraphScript.SCATTER_DISTRIBUTIONS,
+				int(params.get("distribution", 0)),
+				params,
+				"distribution",
+				true
+			)
+			match int(params.get("distribution", 0)):
+				1:
+					_add_slider(
+						"最小间距",
+						0.02,
+						0.8,
+						0.01,
+						float(params.get("distance", 0.12)),
+						params,
+						"distance"
+					)
+				2:
+					if int(params.get("mode", 0)) == 0:
+						_add_number(
+							"列", 1, 32, 1, int(params.get("grid_x", 4)), params, "grid_x"
+						)
+						_add_number(
+							"行", 1, 32, 1, int(params.get("grid_y", 4)), params, "grid_y"
+						)
+						_add_slider(
+							"网格抖动",
+							0.0,
+							1.0,
+							0.01,
+							float(params.get("jitter", 0.35)),
+							params,
+							"jitter"
+						)
 			_add_slider(
 				"笔刷大小", 0.02, 0.6, 0.01, float(params.get("stamp", 0.3)), params, "stamp"
 			)
 			_add_slider(
 				"亮度", 0.0, 1.0, 0.01, float(params.get("level", 1.0)), params, "level"
+			)
+			_add_slider(
+				"亮度抖动",
+				0.0,
+				1.0,
+				0.01,
+				float(params.get("level_random", 0.0)),
+				params,
+				"level_random"
 			)
 			# The colour belongs to this node: it travels down the chain to the
 			# output, so the artwork does not need a palette on the output node.
@@ -2043,6 +2091,26 @@ func _show_params(id: String) -> void:
 				_add_color(
 					"颜色", params.get("color", Color(1.0, 1.0, 1.0)), params, "color"
 				)
+			_add_check("按 Y 排序", bool(params.get("sort_y", false)), params, "sort_y")
+			_add_check("平铺", bool(params.get("tile", false)), params, "tile")
+			_add_slider(
+				"横向偏移",
+				-0.5,
+				0.5,
+				0.01,
+				float(params.get("offset_x", 0.0)),
+				params,
+				"offset_x"
+			)
+			_add_slider(
+				"纵向偏移",
+				-0.5,
+				0.5,
+				0.01,
+				float(params.get("offset_y", 0.0)),
+				params,
+				"offset_y"
+			)
 			_begin_section("随机", true)
 			_add_slider(
 				"角度", -180.0, 180.0, 1.0, float(params.get("angle", 0.0)), params, "angle"
