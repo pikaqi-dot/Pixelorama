@@ -826,6 +826,10 @@ static func default_params(type: String) -> Dictionary:
 				"twinkle": 0.0,
 				"shape": 0,
 				"soft": 0.0,
+				# How fast and how big a particle ends up compared to its birth, so a
+				# spark can slow down and shrink while smoke speeds up and grows.
+				"speed_end": 1.0,
+				"size_end": 1.0,
 				# Each particle keeps its own size and brightness, which is what
 				# makes a field of sparks look lit instead of printed.
 				"size_random": 0.0,
@@ -2648,6 +2652,8 @@ func _particles_image(node: Dictionary, params: Dictionary, size: Vector2i) -> I
 	var trail := clampf(float(params.get("trail", 0.0)), 0.0, 0.6)
 	var size_random := clampf(float(params.get("size_random", 0.0)), 0.0, 1.0)
 	var level_random := clampf(float(params.get("level_random", 0.0)), 0.0, 1.0)
+	var speed_end := clampf(float(params.get("speed_end", 1.0)), 0.1, 3.0)
+	var size_end := clampf(float(params.get("size_end", 1.0)), 0.1, 3.0)
 	# A field that never moves is a plain scattered pattern: every particle shows
 	# up for good instead of blinking in and out of the lifetime window.
 	var animated := particles_animate(params)
@@ -2658,9 +2664,9 @@ func _particles_image(node: Dictionary, params: Dictionary, size: Vector2i) -> I
 		var particle_speed := speed * rng.randf_range(0.65, 1.35)
 		var offset := rng.randf()
 		var spawn := _particle_spawn(spawn_mode, rng.randf(), rng.randf(), size_vec)
-		var particle_radius := radius
+		var base_radius := radius
 		if size_random > 0.0:
-			particle_radius = maxf(
+			base_radius = maxf(
 				radius * (1.0 + rng.randf_range(-size_random, size_random)), 0.5
 			)
 		var particle_level := 1.0
@@ -2679,8 +2685,14 @@ func _particles_image(node: Dictionary, params: Dictionary, size: Vector2i) -> I
 			turbulence,
 			shortest,
 			age_phase,
-			offset
+			offset,
+			speed_end
 		)
+		# A particle can end up bigger or smaller than it was born, which is what
+		# turns a spark into a shrinking glint and smoke into a growing puff.
+		var radius_now := base_radius
+		if not is_equal_approx(size_end, 1.0):
+			radius_now = maxf(base_radius * lerpf(1.0, size_end, age), 0.5)
 		var brightness := particle_level
 		if fade and animated:
 			# Fade in at birth and out towards the end, so a recycled particle
@@ -2691,7 +2703,7 @@ func _particles_image(node: Dictionary, params: Dictionary, size: Vector2i) -> I
 				1.0 - twinkle * 0.5 * (1.0 - sin(phase * TAU * 4.0 + offset * 40.0))
 			)
 		if brightness > 0.004:
-			_particle_stamp(image, position, particle_radius, soft, brightness, shape)
+			_particle_stamp(image, position, radius_now, soft, brightness, shape)
 		if trail <= 0.0 or not animated:
 			continue
 		# The trail is the same particle a moment earlier, dimmed a step at a time.
@@ -2710,12 +2722,20 @@ func _particles_image(node: Dictionary, params: Dictionary, size: Vector2i) -> I
 				turbulence,
 				shortest,
 				past,
-				offset
+				offset,
+				speed_end
 			)
+			# The trail follows the same size ramp, so a shrinking particle leaves a
+			# tapered streak instead of a bar of equal width.
+			var behind_radius := base_radius
+			if not is_equal_approx(size_end, 1.0):
+				behind_radius = maxf(
+					base_radius * lerpf(1.0, size_end, past / lifetime), 0.5
+				)
 			_particle_stamp(
 				image,
 				behind,
-				particle_radius,
+				behind_radius,
 				soft,
 				brightness * (1.0 - float(step + 1) / float(steps + 1)),
 				shape
@@ -2736,11 +2756,17 @@ static func _particle_at(
 	turbulence: float,
 	shortest: float,
 	age_phase: float,
-	offset: float
+	offset: float,
+	speed_end := 1.0
 ) -> Vector2:
+	# A speed that changes over the life of a particle changes how far it has
+	# travelled, which is the only thing the shape of the path needs.
+	var travel := age_phase
+	if not is_equal_approx(speed_end, 1.0):
+		travel = age_phase * lerpf(1.0, speed_end, clampf(age_phase, 0.0, 1.0))
 	var position := (
 		spawn
-		+ Vector2.from_angle(angle) * speed * shortest * age_phase
+		+ Vector2.from_angle(angle) * speed * shortest * travel
 		+ Vector2(wind * shortest * age_phase, 0.5 * gravity * shortest * age_phase * age_phase)
 	)
 	if turbulence > 0.0:
@@ -3632,9 +3658,18 @@ static func describe(node: Dictionary) -> String:
 				scatter_text += " · 上色"
 			return scatter_text
 		"particles":
-			return "%d 颗 · %.1fpx" % [
+			var particles_text := "%d 颗 · %.1fpx" % [
 				int(params.get("count", 48)), float(params.get("size", 1.5))
 			]
+			if float(params.get("trail", 0.0)) > 0.0:
+				particles_text += " · 拖尾"
+			if not is_equal_approx(float(params.get("speed_end", 1.0)), 1.0):
+				particles_text += " · 末端速度 %.2f" % float(params.get("speed_end", 1.0))
+			if not is_equal_approx(float(params.get("size_end", 1.0)), 1.0):
+				particles_text += " · 末端大小 %.2f" % float(params.get("size_end", 1.0))
+			if bool(params.get("tint", false)):
+				particles_text += " · 上色"
+			return particles_text
 		"constant":
 			return "%.2f" % float(params.get("value", 0.5))
 		"path":

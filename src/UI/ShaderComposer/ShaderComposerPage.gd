@@ -1980,6 +1980,15 @@ func _show_params(id: String) -> void:
 			_add_slider(
 				"拖尾", 0.0, 0.6, 0.01, float(params.get("trail", 0.0)), params, "trail"
 			)
+			_add_slider(
+				"末端速度",
+				0.1,
+				3.0,
+				0.05,
+				float(params.get("speed_end", 1.0)),
+				params,
+				"speed_end"
+			)
 			_end_section()
 			_begin_section("外观", false)
 			_add_option(
@@ -1994,6 +2003,15 @@ func _show_params(id: String) -> void:
 				float(params.get("size_random", 0.0)),
 				params,
 				"size_random"
+			)
+			_add_slider(
+				"末端大小",
+				0.1,
+				3.0,
+				0.05,
+				float(params.get("size_end", 1.0)),
+				params,
+				"size_end"
 			)
 			_add_slider(
 				"亮度抖动",
