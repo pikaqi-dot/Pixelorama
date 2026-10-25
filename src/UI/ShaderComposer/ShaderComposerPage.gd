@@ -2677,6 +2677,7 @@ func _show_params(id: String) -> void:
 			levels_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 			levels_hint.add_theme_font_size_override("font_size", 13)
 			_params_box.add_child(levels_hint)
+			_add_input_range_label(id)
 			_add_slider("输入黑场", 0.0, 0.95, 0.01, float(params.get("black", 0.0)), params, "black")
 			_add_slider("输入白场", 0.05, 1.0, 0.01, float(params.get("white", 1.0)), params, "white")
 			_params_box.add_child(
@@ -2704,6 +2705,7 @@ func _show_params(id: String) -> void:
 			threshold_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 			threshold_hint.add_theme_font_size_override("font_size", 13)
 			_params_box.add_child(threshold_hint)
+			_add_input_range_label(id)
 			_add_slider("阈值", 0.0, 1.0, 0.01, float(params.get("cut", 0.5)), params, "cut")
 			_add_slider("过渡", 0.0, 0.5, 0.005, float(params.get("soft", 0.0)), params, "soft")
 			_params_box.add_child(
@@ -2746,6 +2748,7 @@ func _show_params(id: String) -> void:
 			band_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 			band_hint.add_theme_font_size_override("font_size", 13)
 			_params_box.add_child(band_hint)
+			_add_input_range_label(id)
 			_add_slider("低端", 0.0, 1.0, 0.01, float(params.get("low", 0.3)), params, "low")
 			_add_slider("高端", 0.0, 1.0, 0.01, float(params.get("high", 0.7)), params, "high")
 			_add_slider("过渡", 0.0, 0.5, 0.005, float(params.get("soft", 0.05)), params, "soft")
@@ -3294,6 +3297,19 @@ func _build_canvas_line_section(id: String, params: Dictionary) -> void:
 	curve_hint.add_theme_font_size_override("font_size", 13)
 	_params_target.add_child(curve_hint)
 	_add_width_profile(id, params)
+
+
+## Prints the brightness the branch really covers above the sliders, so the range
+## a filter should sit in can be read instead of guessed. Only the nodes whose
+## whole job is picking a part of that range ask for it.
+func _add_input_range_label(id: String) -> void:
+	var span: Vector2 = graph.input_range(id)
+	var line := Label.new()
+	line.text = "实测输入亮度：%.2f – %.2f" % [span.x, span.y]
+	line.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	line.add_theme_font_size_override("font_size", 13)
+	line.modulate = Color(1.0, 1.0, 1.0, 0.65)
+	_params_box.add_child(line)
 
 
 ## Shared tail of the «自动» buttons: the graph measured the branch, the button
