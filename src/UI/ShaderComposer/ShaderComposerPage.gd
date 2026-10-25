@@ -1939,6 +1939,8 @@ func _show_params(id: String) -> void:
 			particles_hint.text = (
 				"像素粒子：位置按相位直接算出，不存状态，所以任意一帧都能单独生成、循环精确。"
 				+ "底部升起做火花/尘埃，顶部下落做雪/雨，全画布做萤火。"
+				+ "「风」给下落加横向漂移，「拖尾」把圆点拉成流线，"
+				+ "「大小/亮度抖动」让同一片粒子不再整齐划一。"
 			)
 			particles_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 			particles_hint.add_theme_font_size_override("font_size", 13)
@@ -1962,6 +1964,7 @@ func _show_params(id: String) -> void:
 			_add_slider(
 				"重力", -2.0, 2.0, 0.05, float(params.get("gravity", 0.0)), params, "gravity"
 			)
+			_add_slider("风", -1.0, 1.0, 0.05, float(params.get("wind", 0.0)), params, "wind")
 			_end_section()
 			_begin_section("运动", true)
 			_add_slider(
@@ -1974,12 +1977,38 @@ func _show_params(id: String) -> void:
 			_add_slider(
 				"闪烁", 0.0, 1.0, 0.01, float(params.get("twinkle", 0.0)), params, "twinkle"
 			)
+			_add_slider(
+				"拖尾", 0.0, 0.6, 0.01, float(params.get("trail", 0.0)), params, "trail"
+			)
 			_end_section()
 			_begin_section("外观", false)
 			_add_option(
 				"形状", ShaderGraphScript.PARTICLE_SHAPES, int(params.get("shape", 0)), params, "shape"
 			)
 			_add_slider("柔边", 0.0, 0.2, 0.005, float(params.get("soft", 0.0)), params, "soft")
+			_add_slider(
+				"大小抖动",
+				0.0,
+				1.0,
+				0.01,
+				float(params.get("size_random", 0.0)),
+				params,
+				"size_random"
+			)
+			_add_slider(
+				"亮度抖动",
+				0.0,
+				1.0,
+				0.01,
+				float(params.get("level_random", 0.0)),
+				params,
+				"level_random"
+			)
+			_add_check("上色", bool(params.get("tint", false)), params, "tint", true)
+			if bool(params.get("tint", false)):
+				_add_color(
+					"颜色", params.get("color", Color(1.0, 1.0, 1.0)), params, "color"
+				)
 			_end_section()
 		"scatter":
 			var scatter_hint := Label.new()

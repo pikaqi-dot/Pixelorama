@@ -102,7 +102,7 @@ const PATH_SHAPES := ["圆形", "水平", "垂直", "正弦", "方形", "8 字",
 const SHAPE_KINDS := ["圆形", "方形", "三角形", "菱形", "星形", "圆环"]
 ## Where the pixel particles are born.
 const PARTICLE_SPAWN := ["底部升起", "顶部下落", "中心爆发", "全画布"]
-const PARTICLE_SHAPES := ["方形", "圆形"]
+const PARTICLE_SHAPES := ["方形", "圆形", "菱形", "十字"]
 ## Shape index that uses the control points edited in the path editor.
 const PATH_CUSTOM := 6
 ## How the stamps of a scatter are laid out.
@@ -816,11 +816,24 @@ static func default_params(type: String) -> Dictionary:
 				"speed": 0.5,
 				"gravity": 0.0,
 				"turbulence": 0.0,
+				# Sideways drift, which bends rain and makes leaves travel on the wind.
+				"wind": 0.0,
+				# How much of its own life a particle drags behind it, so a dot
+				# becomes a streak. Purely visual: nothing is simulated.
+				"trail": 0.0,
 				"lifetime": 0.8,
 				"fade": true,
 				"twinkle": 0.0,
 				"shape": 0,
 				"soft": 0.0,
+				# Each particle keeps its own size and brightness, which is what
+				# makes a field of sparks look lit instead of printed.
+				"size_random": 0.0,
+				"level_random": 0.0,
+				# The colour this node paints its particles in, the same way a
+				# scatter carries one.
+				"tint": false,
+				"color": Color(1.0, 1.0, 1.0, 1.0),
 			}
 		"path":
 			return {
@@ -2631,6 +2644,10 @@ func _particles_image(node: Dictionary, params: Dictionary, size: Vector2i) -> I
 	var radius := maxf(float(params.get("size", 1.5)), 0.5)
 	var soft := clampf(float(params.get("soft", 0.0)) * shortest, 0.0, 2.0)
 	var spawn_mode := int(params.get("spawn", 0))
+	var wind := clampf(float(params.get("wind", 0.0)), -1.0, 1.0)
+	var trail := clampf(float(params.get("trail", 0.0)), 0.0, 0.6)
+	var size_random := clampf(float(params.get("size_random", 0.0)), 0.0, 1.0)
+	var level_random := clampf(float(params.get("level_random", 0.0)), 0.0, 1.0)
 	# A field that never moves is a plain scattered pattern: every particle shows
 	# up for good instead of blinking in and out of the lifetime window.
 	var animated := particles_animate(params)
@@ -2641,42 +2658,117 @@ func _particles_image(node: Dictionary, params: Dictionary, size: Vector2i) -> I
 		var particle_speed := speed * rng.randf_range(0.65, 1.35)
 		var offset := rng.randf()
 		var spawn := _particle_spawn(spawn_mode, rng.randf(), rng.randf(), size_vec)
+		var particle_radius := radius
+		if size_random > 0.0:
+			particle_radius = maxf(
+				radius * (1.0 + rng.randf_range(-size_random, size_random)), 0.5
+			)
+		var particle_level := 1.0
+		if level_random > 0.0:
+			particle_level = 1.0 - level_random * rng.randf()
 		var age_phase := fposmod(phase + offset, 1.0) if animated else 0.0
 		if animated and age_phase > lifetime:
 			continue
 		var age := age_phase / lifetime if animated else 0.0
-		var position := (
-			spawn
-			+ Vector2.from_angle(particle_angle) * particle_speed * shortest * age_phase
-			+ Vector2(0.0, 0.5 * gravity * shortest * age_phase * age_phase)
+		var position := _particle_at(
+			spawn,
+			particle_angle,
+			particle_speed,
+			gravity,
+			wind,
+			turbulence,
+			shortest,
+			age_phase,
+			offset
 		)
-		if turbulence > 0.0:
-			position += (
-				Vector2(
-					sin(age_phase * TAU * 2.0 + offset * 31.0),
-					cos(age_phase * TAU * 3.0 + offset * 17.0)
-				)
-				* turbulence
-				* shortest
-				* 0.08
-			)
-		var brightness := 1.0
+		var brightness := particle_level
 		if fade and animated:
 			# Fade in at birth and out towards the end, so a recycled particle
 			# never pops into view.
-			brightness = clampf(age / 0.12, 0.0, 1.0) * (1.0 - age)
+			brightness *= clampf(age / 0.12, 0.0, 1.0) * (1.0 - age)
 		if twinkle > 0.0:
 			brightness *= (
 				1.0 - twinkle * 0.5 * (1.0 - sin(phase * TAU * 4.0 + offset * 40.0))
 			)
-		if brightness <= 0.004:
+		if brightness > 0.004:
+			_particle_stamp(image, position, particle_radius, soft, brightness, shape)
+		if trail <= 0.0 or not animated:
 			continue
-		if shape == 1:
-			_stamp_disc(image, position, radius, soft, brightness)
-		else:
-			_stamp_square(image, position, radius, brightness)
+		# The trail is the same particle a moment earlier, dimmed a step at a time.
+		# Nothing is simulated, so a streak costs only a few more stamps.
+		var steps := 3
+		for step in steps:
+			var past := age_phase - trail * float(step + 1) / float(steps + 1)
+			if past <= 0.0:
+				continue
+			var behind := _particle_at(
+				spawn,
+				particle_angle,
+				particle_speed,
+				gravity,
+				wind,
+				turbulence,
+				shortest,
+				past,
+				offset
+			)
+			_particle_stamp(
+				image,
+				behind,
+				particle_radius,
+				soft,
+				brightness * (1.0 - float(step + 1) / float(steps + 1)),
+				shape
+			)
 	_path_cache[key] = image
 	return image
+
+
+## Where a particle is at [param age_phase] of its life. Everything is computed
+## from the phase instead of being stepped, so any frame renders on its own, the
+## sequence loops exactly, and a trail is just the same particle a little earlier.
+static func _particle_at(
+	spawn: Vector2,
+	angle: float,
+	speed: float,
+	gravity: float,
+	wind: float,
+	turbulence: float,
+	shortest: float,
+	age_phase: float,
+	offset: float
+) -> Vector2:
+	var position := (
+		spawn
+		+ Vector2.from_angle(angle) * speed * shortest * age_phase
+		+ Vector2(wind * shortest * age_phase, 0.5 * gravity * shortest * age_phase * age_phase)
+	)
+	if turbulence > 0.0:
+		position += (
+			Vector2(
+				sin(age_phase * TAU * 2.0 + offset * 31.0),
+				cos(age_phase * TAU * 3.0 + offset * 17.0)
+			)
+			* turbulence
+			* shortest
+			* 0.08
+		)
+	return position
+
+
+## Draws one particle in the shape the node was given.
+static func _particle_stamp(
+	image: Image, center: Vector2, radius: float, soft: float, brightness: float, shape: int
+) -> void:
+	match shape:
+		1:
+			_stamp_disc(image, center, radius, soft, brightness)
+		2:
+			_stamp_diamond(image, center, radius, brightness)
+		3:
+			_stamp_cross(image, center, radius, brightness)
+		_:
+			_stamp_square(image, center, radius, brightness)
 
 
 ## Stamps the brush of the first input over the canvas at random angles and sizes
@@ -3149,6 +3241,40 @@ static func _stamp_square(
 				continue
 			if brightness > image.get_pixel(x, y).r:
 				image.set_pixel(x, y, Color(brightness, brightness, brightness, 1.0))
+
+
+## Stamps a diamond, which reads as a sparkle or a leaf at pixel sizes.
+static func _stamp_diamond(
+	image: Image, center: Vector2, radius: float, brightness: float
+) -> void:
+	var extent := maxi(int(ceil(radius)), 1)
+	var middle := Vector2i(roundi(center.x), roundi(center.y))
+	for offset_y in range(-extent, extent + 1):
+		for offset_x in range(-extent, extent + 1):
+			var x := middle.x + offset_x
+			var y := middle.y + offset_y
+			if x < 0 or y < 0 or x >= image.get_width() or y >= image.get_height():
+				continue
+			if absf(float(offset_x)) + absf(float(offset_y)) > radius:
+				continue
+			if brightness > image.get_pixel(x, y).r:
+				image.set_pixel(x, y, Color(brightness, brightness, brightness, 1.0))
+
+
+## Stamps a plus sign, the classic pixel glint.
+static func _stamp_cross(
+	image: Image, center: Vector2, radius: float, brightness: float
+) -> void:
+	var middle := Vector2i(roundi(center.x), roundi(center.y))
+	var arm := maxi(int(round(radius)), 1)
+	for step in range(-arm, arm + 1):
+		for point: Vector2i in [middle + Vector2i(step, 0), middle + Vector2i(0, step)]:
+			if point.x < 0 or point.y < 0:
+				continue
+			if point.x >= image.get_width() or point.y >= image.get_height():
+				continue
+			if brightness > image.get_pixel(point.x, point.y).r:
+				image.set_pixel(point.x, point.y, Color(brightness, brightness, brightness, 1.0))
 
 
 ## Stamps a line of discs, the way a branch of the tree is drawn.
