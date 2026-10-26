@@ -138,7 +138,15 @@ var _hold_pick_started_msec := 0
 ## Node editor, created the first time it is opened. It lives in the canvas area
 ## as a tab, so the drawing view stays one tap away.
 var _shader_composer: Control
-## Tab strip that switches between the drawing view and the node editor.
+## Tilemap design page, made the first time its tab is chosen.
+var _tilemap_page: Control
+## Game playground that tries a tilemap with a controllable hero.
+var _game_page: Control
+## Project whose page data the pages currently hold, so switching tabs does not
+## reload the pages (and their unsaved work) over and over.
+var _state_project: Project
+## Tab strip that switches between the drawing view, the node editor, the
+## tilemap page and the game page.
 var _view_tabs: TabBar
 ## Last theme color applied to the lens, so it is only restyled when it changes.
 var _lens_edge_cache := Color(-1, -1, -1, -1)
@@ -184,6 +192,11 @@ func _process(_delta: float) -> void:
 func _ready() -> void:
 	_ensure_view_tabs()
 	Global.cel_switched.connect(_on_cel_switched)
+	# The feature pages keep their work inside the project: the outgoing project
+	# takes their state with it, and the incoming one hands its own state back.
+	Global.project_about_to_switch.connect(_collect_page_states)
+	Global.project_switched.connect(_on_project_switched)
+	_on_project_switched()
 	Global.single_tool_mode_changed.connect(_on_single_tool_mode_changed)
 	if Global.window_transparency:
 		transparency_material = ShaderMaterial.new()
@@ -201,8 +214,12 @@ func _ready() -> void:
 func _input(event: InputEvent) -> void:
 	if not DisplayServer.is_touchscreen_available():
 		return
-	# The node editor covers the canvas, so its gestures must not reach the view.
+	# An open page covers the canvas, so its gestures must not reach the view.
 	if is_instance_valid(_shader_composer) and _shader_composer.call("is_open"):
+		return
+	if is_instance_valid(_tilemap_page) and _tilemap_page.call("is_open"):
+		return
+	if is_instance_valid(_game_page) and _game_page.call("is_open"):
 		return
 	# A recognized pan/zoom means these touches are not a multi-finger tap.
 	if event is InputEventMagnifyGesture or event is InputEventPanGesture:
@@ -989,8 +1006,52 @@ func open_shader_composer(layer: BaseLayer = null) -> void:
 	if is_instance_valid(_view_tabs):
 		if _view_tabs.current_tab != 1:
 			_view_tabs.current_tab = 1
+		else:
+			_show_view(1)
 	else:
-		_show_composer_view(true)
+		_show_view(1)
+
+
+## Opens the tilemap design workspace in its own tab. It works on a map of its
+## own, so no project layer is needed and the drawing view stays untouched.
+func open_tilemap_page() -> void:
+	_ensure_view_tabs()
+	_ensure_tilemap_page()
+	if not is_instance_valid(_tilemap_page):
+		return
+	_tilemap_page.call("open_page")
+	if is_instance_valid(_view_tabs):
+		if _view_tabs.current_tab != 2:
+			_view_tabs.current_tab = 2
+		else:
+			_show_view(2)
+	else:
+		_show_view(2)
+
+
+## Opens the game playground in its own tab. It reads the map of the Tilemap
+## page and the frames of the drawing area, and never edits the project.
+func open_game_page() -> void:
+	_ensure_view_tabs()
+	_ensure_game_page()
+	if not is_instance_valid(_game_page):
+		return
+	_game_page.call("open_page")
+	if is_instance_valid(_view_tabs):
+		if _view_tabs.current_tab != 3:
+			_view_tabs.current_tab = 3
+		else:
+			_show_view(3)
+	else:
+		_show_view(3)
+
+
+## The map currently being designed in the Tilemap page, as plain data. The Game
+## page imports it directly, so a level can be tried without saving a file.
+func tilemap_map_data() -> Dictionary:
+	if is_instance_valid(_tilemap_page):
+		return _tilemap_page.call("map_data")
+	return {}
 
 
 ## Puts the two view tabs in a strip of their own above the dock, so the node
@@ -1012,6 +1073,8 @@ func _ensure_view_tabs() -> void:
 	_view_tabs.name = "ViewTabs"
 	_view_tabs.add_tab("绘画")
 	_view_tabs.add_tab("节点图层")
+	_view_tabs.add_tab("Tilemap")
+	_view_tabs.add_tab("游戏")
 	_view_tabs.tab_changed.connect(_on_view_tab_changed)
 	bar.add_child(_view_tabs)
 	# Both views start right below the strip, so nothing jumps when switching.
@@ -1032,31 +1095,141 @@ func _ensure_shader_composer() -> void:
 	_shader_composer.visible = false
 	if _shader_composer.has_signal("page_closed"):
 		_shader_composer.connect("page_closed", _on_composer_closed)
+	_apply_page_state(_shader_composer, "shader_composer")
+
+
+## Creates the tilemap page on first use. It covers the dock like the node
+## editor, so both pages share the same tab strip and the same way back.
+func _ensure_tilemap_page() -> void:
+	if is_instance_valid(_tilemap_page):
+		return
+	_tilemap_page = load("res://src/UI/Tilemap/TilemapPage.gd").new()
+	add_child(_tilemap_page)
+	_tilemap_page.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	_tilemap_page.offset_top = VIEW_TABS_HEIGHT
+	_tilemap_page.visible = false
+	if _tilemap_page.has_signal("page_closed"):
+		_tilemap_page.connect("page_closed", _on_tilemap_closed)
+	_apply_page_state(_tilemap_page, "tilemap")
+
+
+## Creates the game page on first use, next to the other full screen pages.
+func _ensure_game_page() -> void:
+	if is_instance_valid(_game_page):
+		return
+	_game_page = load("res://src/UI/Game/GamePage.gd").new()
+	add_child(_game_page)
+	_game_page.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	_game_page.offset_top = VIEW_TABS_HEIGHT
+	_game_page.visible = false
+	if _game_page.has_signal("page_closed"):
+		_game_page.connect("page_closed", _on_game_closed)
+	_apply_page_state(_game_page, "game")
 
 
 func _on_view_tab_changed(tab: int) -> void:
-	_show_composer_view(tab == 1)
+	if tab == 1 and not is_instance_valid(_shader_composer):
+		_ensure_shader_composer()
+		_shader_composer.call("open_page")
+	if tab == 2:
+		_ensure_tilemap_page()
+		if not _tilemap_page.call("is_open"):
+			_tilemap_page.call("open_page")
+	if tab == 3:
+		_ensure_game_page()
+		if not _game_page.call("is_open"):
+			_game_page.call("open_page")
+	_show_view(tab)
 
 
-## Hides the whole dock while the node editor is shown, which is what makes the
-## editor full screen. Everything comes back untouched when the drawing tab is
-## chosen again.
-func _show_composer_view(active: bool) -> void:
+## Hides the dock while a full page is shown, which is what makes the page full
+## screen. Everything comes back untouched when the drawing tab is chosen again.
+func _show_view(tab: int) -> void:
+	var show_drawing := tab == 0
 	if is_instance_valid(dockable_container):
-		dockable_container.visible = not active
-	if not is_instance_valid(_shader_composer):
-		return
-	if active:
-		_shader_composer.call("resume_page")
-	else:
+		dockable_container.visible = show_drawing
+	# Every page that is not the current tab is hidden first, so the page that
+	# is shown keeps the last word about input and drawing.
+	if tab != 1 and is_instance_valid(_shader_composer):
 		_shader_composer.call("pause_page")
+	if tab != 2 and is_instance_valid(_tilemap_page):
+		_tilemap_page.call("pause_page")
+	if tab != 3 and is_instance_valid(_game_page):
+		_game_page.call("pause_page")
+	if tab == 1 and is_instance_valid(_shader_composer):
+		_shader_composer.call("resume_page")
+	if tab == 2 and is_instance_valid(_tilemap_page):
+		_tilemap_page.call("resume_page")
+	if tab == 3 and is_instance_valid(_game_page):
+		_game_page.call("resume_page")
+	Global.can_draw = show_drawing
 
 
-## The close button of the editor brings the drawing tab back.
+## The close button of the node editor brings the drawing tab back.
 func _on_composer_closed() -> void:
 	if is_instance_valid(_view_tabs):
 		_view_tabs.current_tab = 0
-	_show_composer_view(false)
+	_show_view(0)
+
+
+## The close button of the tilemap page brings the drawing tab back.
+func _on_tilemap_closed() -> void:
+	if is_instance_valid(_view_tabs):
+		_view_tabs.current_tab = 0
+	_show_view(0)
+
+
+## The close button of the game page brings the drawing tab back.
+func _on_game_closed() -> void:
+	if is_instance_valid(_view_tabs):
+		_view_tabs.current_tab = 0
+	_show_view(0)
+
+
+## Hands one key of the project page data to a page, so a freshly created page
+## starts with the work that project already had.
+func _apply_page_state(page: Node, key: String) -> void:
+	if not is_instance_valid(page) or not page.has_method("load_state"):
+		return
+	var project := Global.current_project
+	if project == null:
+		return
+	page.call("load_state", project.page_state.get(key, {}))
+
+
+## Reloads every existing page from the project that was just opened, and makes
+## sure that project asks for the page data when it is saved. Switching tabs
+## re-emits the signal for the same project, and the pages must keep their work.
+func _on_project_switched() -> void:
+	var project := Global.current_project
+	if project == null:
+		return
+	if not project.about_to_serialize.is_connected(_collect_page_states):
+		project.about_to_serialize.connect(_collect_page_states)
+	if project == _state_project:
+		return
+	_state_project = project
+	_apply_page_state(_shader_composer, "shader_composer")
+	_apply_page_state(_tilemap_page, "tilemap")
+	_apply_page_state(_game_page, "game")
+
+
+## Writes the state of the feature pages into the project right before it is
+## saved. Pages that were never created keep whatever the project already had.
+func _collect_page_states() -> void:
+	var project := Global.current_project
+	if project == null:
+		return
+	# The composer already keeps its graph on the layers it produced, so it only
+	# has a state of its own while a page implements these two methods.
+	for pair in [
+		[_shader_composer, "shader_composer"],
+		[_tilemap_page, "tilemap"],
+		[_game_page, "game"]
+	]:
+		var page: Node = pair[0]
+		if is_instance_valid(page) and page.has_method("save_state"):
+			project.page_state[pair[1]] = page.call("save_state")
 
 
 func update_transparent_shader() -> void:

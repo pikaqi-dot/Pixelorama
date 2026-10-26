@@ -2220,9 +2220,24 @@ func _show_params(id: String) -> void:
 							params,
 							"jitter"
 						)
-			_add_slider(
-				"笔刷大小", 0.02, 0.6, 0.01, float(params.get("stamp", 0.3)), params, "stamp"
-			)
+			if _scatter_brush_painting(id):
+				# A painted element has a pixel size of its own, so it is measured in
+				# pixels: 0 keeps the size of the painting. A leaf drawn on a 16 px
+				# canvas then stays 16 px inside a much larger scatter canvas.
+				_add_number(
+					"笔刷像素（0=原画布）",
+					0,
+					256,
+					1,
+					int(params.get("brush_px", 0)),
+					params,
+					"brush_px",
+					false
+				)
+			else:
+				_add_slider(
+					"笔刷大小", 0.02, 0.6, 0.01, float(params.get("stamp", 0.3)), params, "stamp"
+				)
 			_add_slider(
 				"亮度", 0.0, 1.0, 0.01, float(params.get("level", 1.0)), params, "level"
 			)
@@ -3552,6 +3567,19 @@ func _reset_source_crop(node_id: String, params: Dictionary) -> void:
 ## Opens the drawing window of a canvas node. It edits the picture the node owns,
 ## which is stored in the graph as a PNG and saved with the project. No layer is
 ## touched, so other canvas nodes never change because of a stroke here.
+## True when the brush input of a scatter node is a canvas that paints its own
+## picture. Such a brush is a small element with a pixel size of its own, so the
+## panel asks for pixels instead of a fraction of the canvas.
+func _scatter_brush_painting(id: String) -> bool:
+	var brush: Dictionary = graph.brush_node(id)
+	if brush.is_empty() or str(brush["type"]) != "pixel_art":
+		return false
+	var brush_params: Dictionary = brush["params"]
+	if int(brush_params.get("source", 0)) != 2:
+		return false
+	return not str(brush_params.get("painting", "")).is_empty()
+
+
 func _open_canvas_editor(node_id: String) -> void:
 	var node: Dictionary = graph.get_node_by_id(node_id)
 	if node.is_empty():
@@ -3577,6 +3605,10 @@ func _open_canvas_editor(node_id: String) -> void:
 		frame.add_child(_canvas_editor)
 		_canvas_editor.finished.connect(_finish_canvas_editor)
 		_canvas_popup.popup_hide.connect(_finish_canvas_editor)
+		# A change of the canvas size inside the window re-fits the window, and
+		# the page status line names that canvas too, so it has to follow.
+		_canvas_editor.size_changed.connect(_popup_canvas_editor)
+		_canvas_editor.size_changed.connect(func() -> void: _update_status())
 	_canvas_node_id = node_id
 	# The window works at canvas size at all times, which is also the size the
 	# stored painting has.
@@ -3584,13 +3616,19 @@ func _open_canvas_editor(node_id: String) -> void:
 	_popup_canvas_editor()
 
 
-## Transparent picture at the project size, which is what a new painting starts on.
+## Side a fresh painting starts on: small enough to be a single element, big
+## enough to draw one with a 1 px pencil. The drawing window changes it later.
+const SMALL_CANVAS := 64
+
+
+## Transparent picture at the small starting size, which is what a new painting
+## begins with.
 func _blank_canvas_image() -> Image:
 	var project := Global.current_project
 	if project == null:
 		return null
 	var image := Image.create_empty(
-		maxi(project.size.x, 1), maxi(project.size.y, 1), false, Image.FORMAT_RGBA8
+		SMALL_CANVAS, SMALL_CANVAS, false, Image.FORMAT_RGBA8
 	)
 	image.fill(Color(0.0, 0.0, 0.0, 0.0))
 	return image
@@ -3606,14 +3644,20 @@ func _popup_canvas_editor() -> void:
 	var image_size: Vector2i = _canvas_editor.image_size()
 	if image_size.x <= 0 or image_size.y <= 0:
 		image_size = Vector2i(64, 64)
-	var room_for_board := Vector2(room) * Vector2(0.86, 0.72)
+	# The tools, the two size sliders, the brush row and the hint are a fixed
+	# height, so the board only gets the rest of the window.
+	var room_for_board := Vector2(room) * Vector2(0.86, 0.55)
 	var factor := minf(
 		room_for_board.x / float(image_size.x), room_for_board.y / float(image_size.y)
 	)
-	factor = maxf(factor, 1.0)
+	# Whole pixels, between 1x and 16x: a 16 px element still gets a window
+	# that can be drawn in, and a large canvas is never blown up past the
+	# screen. The board fits the image again on its own, so both stay on
+	# the same zoom.
+	factor = clampf(floorf(factor), 1.0, 16.0)
 	var target := Vector2i(
-		mini(int(float(image_size.x) * factor) + 26, room.x),
-		mini(int(float(image_size.y) * factor) + 160, room.y)
+		mini(int(float(image_size.x) * factor) + 30, room.x),
+		mini(int(float(image_size.y) * factor) + 290, room.y)
 	)
 	_canvas_popup.popup_centered_clamped(target, 0.95)
 
@@ -3630,6 +3674,8 @@ func _finish_canvas_editor() -> void:
 		_canvas_popup.hide()
 		_canvas_popup.queue_free()
 		_canvas_popup = null
+	# The drawing canvas it named is gone, so the status line drops it.
+	_update_status()
 	if node_id.is_empty() or not editor.is_modified():
 		return
 	var image: Image = editor.take_result()
@@ -4175,7 +4221,29 @@ func _refresh_preview() -> void:
 			_source_timer.start()
 		elif not graph.uses_source() and not _source_timer.is_stopped():
 			_source_timer.stop()
-	_status.text = "预览 %d×%d · 输出 %d×%d · 节点 %d · %s" % [
+	_update_status(preview_size)
+	_preview_busy = false
+	if _preview_pending or (following and _last_change_msec == change_at):
+		# A cheap pass is never the last one: when nothing new came in while it
+		# ran, one more pass at full size follows, so the sharp picture stays.
+		_preview_pending = false
+		_refresh_preview()
+
+
+## Bottom status line of the page. It names the preview resolution, the canvas
+## the graph generates at and, while the drawing window is open, the canvas that
+## window edits: changing the latter only changes the stored painting, so it is
+## written out instead of leaving the numbers looking stale.
+func _update_status(preview_size := Vector2i.ZERO) -> void:
+	if not is_instance_valid(_status):
+		return
+	var project := Global.current_project
+	if project == null:
+		return
+	if preview_size.x <= 0 or preview_size.y <= 0:
+		var side := maxi(_preview_side, 1)
+		preview_size = Vector2i(mini(project.size.x, side), mini(project.size.y, side))
+	var text := "预览 %d×%d · 输出 %d×%d · 节点 %d · %s" % [
 		preview_size.x,
 		preview_size.y,
 		project.size.x,
@@ -4183,12 +4251,11 @@ func _refresh_preview() -> void:
 		graph.nodes.size(),
 		"动态" if graph.uses_time() else "静态",
 	]
-	_preview_busy = false
-	if _preview_pending or (following and _last_change_msec == change_at):
-		# A cheap pass is never the last one: when nothing new came in while it
-		# ran, one more pass at full size follows, so the sharp picture stays.
-		_preview_pending = false
-		_refresh_preview()
+	if is_instance_valid(_canvas_editor):
+		var drawing: Vector2i = _canvas_editor.image_size()
+		if drawing.x > 0 and drawing.y > 0:
+			text += " · 画笔布 %d×%d" % [drawing.x, drawing.y]
+	_status.text = text
 
 
 ## Launches the echo of earlier frames, which is the quickest way to judge an

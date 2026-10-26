@@ -5,11 +5,20 @@ extends Control
 ## drawing view, not here.
 
 signal finished
+## The canvas got a different size, so the window around it has to be re-fitted.
+signal size_changed
 
 const TOOLS := ["铅笔", "橡皮", "填充", "方形", "圆形"]
 const TOUCH_SIZE := 40
 ## Snapshots kept for the undo button inside the window.
 const UNDO_LIMIT := 24
+## Side limits of the canvas, in pixels. The low end is what a single leaf or a
+## stone needs, the high end a whole texture.
+const SIZE_MIN := 1
+const SIZE_MAX := 512
+## Shortest a size slider may get. Two of them share one row with their arrows,
+## so the track still has to be wide enough to aim a value on a phone.
+const SIZE_SLIDER_MIN_WIDTH := 60.0
 
 var _board: Board
 var _undo: Array[Image] = []
@@ -17,10 +26,20 @@ var _dirty := false
 var _brush_slider: HSlider
 var _brush_value: Label
 var _status: Label
+var _size_x: HSlider
+var _size_y: HSlider
+var _size_x_readout: Label
+var _size_y_readout: Label
+## Picture handed over before the window was ready. A popup only readies its
+## children some time after the page adds them, so the painting is parked here
+## and shown as soon as the board exists, instead of being dropped.
+var _pending_image: Image
 
 
 func _ready() -> void:
-	custom_minimum_size = Vector2(260, 300)
+	# The two size sliders take one row each, so the window needs more height
+	# before the board is squeezed.
+	custom_minimum_size = Vector2(260, 390)
 	var column := VBoxContainer.new()
 	column.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
 	column.add_theme_constant_override("separation", 8)
@@ -48,9 +67,16 @@ func _ready() -> void:
 		button.button_pressed = tool_index == 0
 		toolbar.add_child(button)
 	toolbar.add_child(_make_button("撤销", _undo_last))
+	# One press empties the canvas, which is what drawing the next element in the
+	# same window needs. It goes through the undo stack like a stroke.
+	toolbar.add_child(_make_button("清空", _clear_canvas, "把整张画布擦成透明，可撤销"))
 	_status = Label.new()
 	_status.add_theme_font_size_override("font_size", 13)
+	# The line names the canvas size, so it has to be readable in a narrow
+	# window on a phone: wrapping keeps the numbers instead of cutting them off.
+	_status.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	column.add_child(_status)
+	column.add_child(_build_size_row())
 	_board = Board.new()
 	_board.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	_board.size_flags_vertical = Control.SIZE_EXPAND_FILL
@@ -94,20 +120,121 @@ func _ready() -> void:
 	hint.text = (
 		"只用白色绘制，橡皮擦掉透明度；完成后写回这个节点读取的图层。"
 		+ "窗口按画布比例打开，深色底是透明区域。"
+		+ "「清空」把整张画布擦成透明；「改尺寸」只改边框，"
+		+ "已经画好的像素留在原处、保持原来的大小，不会被拉伸，"
+		+ "所以小画布上画的元素放进大画布的散布里还是那么大。"
 	)
 	hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	hint.add_theme_font_size_override("font_size", 13)
 	column.add_child(hint)
 	column.add_child(_make_button("完成", func() -> void: finished.emit()))
+	if _pending_image != null:
+		var pending := _pending_image
+		_pending_image = null
+		_show_image(pending)
 
 
-## Fills the window with the image of the layer being painted.
+## Canvas width and height as sliders, plus the button that applies them. The
+## size is what the drawn element is worth in pixels, so it is set here and not
+## by the window. Nothing here has to be typed: the track is dragged and the
+## arrows move it by exactly one pixel, which works the same with a mouse and
+## with a finger.
+func _build_size_row() -> Control:
+	var block := VBoxContainer.new()
+	block.add_theme_constant_override("separation", 6)
+	var header := HBoxContainer.new()
+	header.add_theme_constant_override("separation", 6)
+	var label := Label.new()
+	label.text = "画布"
+	label.add_theme_font_size_override("font_size", 15)
+	header.add_child(label)
+	var spacer := Control.new()
+	spacer.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	header.add_child(spacer)
+	header.add_child(
+		_make_button(
+			"改尺寸",
+			_apply_resize,
+			"只改画布边框：已画的像素留在原处、保持原大小，不会被放大或拉伸",
+			Vector2(0, TOUCH_SIZE)
+		)
+	)
+	block.add_child(header)
+	_size_x = _make_size_slider()
+	_size_x_readout = _make_size_readout(_size_x)
+	block.add_child(_make_size_row("宽", _size_x, _size_x_readout))
+	_size_y = _make_size_slider()
+	_size_y_readout = _make_size_readout(_size_y)
+	block.add_child(_make_size_row("高", _size_y, _size_y_readout))
+	return block
+
+
+func _make_size_slider() -> HSlider:
+	var slider := HSlider.new()
+	slider.min_value = SIZE_MIN
+	slider.max_value = SIZE_MAX
+	slider.step = 1
+	slider.value = 64
+	slider.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	slider.custom_minimum_size = Vector2(SIZE_SLIDER_MIN_WIDTH, TOUCH_SIZE)
+	return slider
+
+
+## Title, one-pixel arrows and the track of a single dimension. The arrows are
+## there because the track alone cannot land on an exact number on a phone.
+func _make_size_row(title: String, slider: HSlider, readout: Label) -> HBoxContainer:
+	var row := HBoxContainer.new()
+	row.add_theme_constant_override("separation", 6)
+	var label := Label.new()
+	label.text = title
+	label.custom_minimum_size = Vector2(20, 0)
+	label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	label.add_theme_font_size_override("font_size", 15)
+	row.add_child(label)
+	row.add_child(
+		_make_button(
+			"−", func() -> void: _step_size(slider, -1.0), "减一像素", Vector2(34, TOUCH_SIZE)
+		)
+	)
+	row.add_child(slider)
+	row.add_child(
+		_make_button(
+			"+", func() -> void: _step_size(slider, 1.0), "加一像素", Vector2(34, TOUCH_SIZE)
+		)
+	)
+	row.add_child(readout)
+	return row
+
+
+## Number next to a size slider. It is a plain label instead of a field, so the
+## value can only come from the slider and the arrows, never from typing.
+func _make_size_readout(slider: HSlider) -> Label:
+	var readout := Label.new()
+	readout.custom_minimum_size = Vector2(34, 0)
+	readout.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
+	readout.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	readout.add_theme_font_size_override("font_size", 15)
+	readout.text = str(clampi(int(roundf(slider.value)), SIZE_MIN, SIZE_MAX))
+	slider.value_changed.connect(_on_size_slider_changed.bind(readout))
+	return readout
+
+
+## Fills the window with the image of the layer being painted. The window may be
+## handed the picture before its children are ready, so it is kept until then.
 func setup(image: Image) -> void:
-	if not is_instance_valid(_board):
-		return
 	_undo.clear()
 	_dirty = false
+	if not is_instance_valid(_board):
+		_pending_image = image
+		return
+	_show_image(image)
+
+
+## Puts a picture on the board and syncs everything that describes it: the size
+## sliders, their readouts and the status line.
+func _show_image(image: Image) -> void:
 	_board.set_image(image)
+	_sync_size_fields()
 	_update_status()
 
 
@@ -138,9 +265,93 @@ func _remember() -> void:
 func _undo_last() -> void:
 	if _undo.is_empty() or not is_instance_valid(_board):
 		return
+	var before := image_size()
 	var snapshot: Image = _undo.pop_back()
 	_board.set_image(snapshot)
 	_dirty = true
+	_sync_size_fields()
+	_update_status()
+	# Undoing a change of the canvas size has to resize the window as well.
+	if image_size() != before:
+		size_changed.emit()
+
+
+## Empties the whole canvas. The step is remembered, so 撤销 brings the picture
+## back, and a second element can be drawn on the same canvas afterwards.
+func _clear_canvas() -> void:
+	if not is_instance_valid(_board) or _board.image == null:
+		return
+	_remember()
+	_board.image.fill(Color(0.0, 0.0, 0.0, 0.0))
+	_dirty = true
+	_board.queue_redraw()
+	_update_status()
+
+
+## Changes the size of the canvas and keeps every pixel exactly where it is: the
+## old picture is copied into the top-left corner of the new one and is never
+## scaled, so a small element keeps its own number of pixels inside a larger
+## canvas. A smaller canvas simply crops the part that no longer fits. A window
+## that opened without a picture is filled with transparent pixels instead of
+## ignoring the button, so the status line can never stay on a size that was not
+## applied.
+func _apply_resize() -> void:
+	if not is_instance_valid(_board):
+		return
+	var old: Image = _board.image
+	var target := _canvas_target()
+	if old != null and target == Vector2i(old.get_width(), old.get_height()):
+		# Nothing to change, but the status still has to describe the canvas.
+		_update_status()
+		return
+	if old != null:
+		_remember()
+	var next := Image.create_empty(target.x, target.y, false, Image.FORMAT_RGBA8)
+	next.fill(Color(0.0, 0.0, 0.0, 0.0))
+	if old != null:
+		next.blit_rect(
+			old,
+			Rect2i(0, 0, mini(old.get_width(), target.x), mini(old.get_height(), target.y)),
+			Vector2i.ZERO
+		)
+	_board.set_image(next)
+	_dirty = true
+	_sync_size_fields()
+	_update_status()
+	size_changed.emit()
+
+
+## Size the two sliders ask for, always inside the limits and never empty.
+func _canvas_target() -> Vector2i:
+	var width := 1
+	var height := 1
+	if is_instance_valid(_size_x):
+		width = clampi(int(roundf(_size_x.value)), SIZE_MIN, SIZE_MAX)
+	if is_instance_valid(_size_y):
+		height = clampi(int(roundf(_size_y.value)), SIZE_MIN, SIZE_MAX)
+	return Vector2i(width, height)
+
+
+## Shows the real canvas size on the sliders, so they never disagree with the
+## board after setup, a resize or an undone resize. The readouts are updated by
+## hand because setting a slider without a signal skips the value_changed hook.
+func _sync_size_fields() -> void:
+	var size := image_size()
+	if size.x <= 0 or size.y <= 0:
+		return
+	if is_instance_valid(_size_x):
+		_size_x.set_value_no_signal(float(size.x))
+	if is_instance_valid(_size_y):
+		_size_y.set_value_no_signal(float(size.y))
+	_sync_size_readouts()
+
+
+## Numeric readout of both sliders, always the rounded integer they stand for.
+func _sync_size_readouts() -> void:
+	if is_instance_valid(_size_x) and is_instance_valid(_size_x_readout):
+		_size_x_readout.text = str(clampi(int(roundf(_size_x.value)), SIZE_MIN, SIZE_MAX))
+	if is_instance_valid(_size_y) and is_instance_valid(_size_y_readout):
+		_size_y_readout.text = str(clampi(int(roundf(_size_y.value)), SIZE_MIN, SIZE_MAX))
 
 
 func _make_button(
@@ -167,15 +378,29 @@ func _on_brush_size_changed(value: float) -> void:
 
 
 ## Shows the active tool, the brush and how many pixels are already painted, so
-## what is on screen can be compared with what is in the image.
+## what is on screen can be compared with what is in the image. The size shown is
+## the one the picture really has; when the sliders ask for another one, that
+## target is written next to it instead of being taken for the canvas.
 func _update_status() -> void:
 	if not is_instance_valid(_status) or not is_instance_valid(_board):
 		return
-	_status.text = "工具：%s · 笔刷 %d px · 画布 %d×%d · 已画 %d px" % [
+	var size := _board.image_size()
+	var pending := ""
+	if (
+		size.x > 0
+		and size.y > 0
+		and is_instance_valid(_size_x)
+		and is_instance_valid(_size_y)
+	):
+		var target := _canvas_target()
+		if target != size:
+			pending = "（待改 %d×%d）" % [target.x, target.y]
+	_status.text = "工具：%s · 笔刷 %d px · 画布 %d×%d%s · 已画 %d px" % [
 		TOOLS[clampi(_board.tool, 0, TOOLS.size() - 1)],
 		_board.brush_size,
-		_board.image_size().x,
-		_board.image_size().y,
+		size.x,
+		size.y,
+		pending,
 		_board.painted_count(),
 	]
 
@@ -187,6 +412,23 @@ func _step_brush(direction: float) -> void:
 	var step := maxf(_brush_slider.step, 0.0001)
 	var next := snappedf(_brush_slider.value + step * direction, step)
 	_brush_slider.value = clampf(next, _brush_slider.min_value, _brush_slider.max_value)
+
+
+## One arrow press moves a canvas size slider by exactly one pixel.
+func _step_size(slider: HSlider, direction: float) -> void:
+	if not is_instance_valid(slider):
+		return
+	var step := maxf(slider.step, 0.0001)
+	var next := snappedf(slider.value + step * direction, step)
+	slider.value = clampf(next, slider.min_value, slider.max_value)
+
+
+## Keeps the number next to a size slider in step with its track. The canvas
+## itself only changes when 改尺寸 is pressed, which the status line says as well.
+func _on_size_slider_changed(value: float, readout: Label) -> void:
+	if is_instance_valid(readout):
+		readout.text = str(clampi(int(roundf(value)), SIZE_MIN, SIZE_MAX))
+	_update_status()
 
 
 ## Drawing surface. It keeps the pixel image, scales it up with whole pixels so

@@ -4,4 +4,6 @@ disable:
   - max-returns
   - max-public-methods
   
-max-file-lines: 2000
+# The Tilemap and Game pages are single page scripts with their own UI, input
+# and rendering, so the cap is wider than the engine default.
+max-file-lines: 2400

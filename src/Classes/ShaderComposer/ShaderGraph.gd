@@ -3323,6 +3323,10 @@ func _scatter_image(
 	rng.seed = int(params.get("seed", 1))
 	# Keep the aspect of a layer brush, so a wide leaf stays wide.
 	var footprint := Vector2(shortest * stamp, shortest * stamp)
+	# A painted element keeps its own pixels: its size is asked for in pixels, and
+	# 0 means the size of the painting itself. A leaf drawn on a 16 px canvas is
+	# then 16 px here too, instead of a fraction of a much larger canvas.
+	var brush_pixels := clampi(int(params.get("brush_px", 0)), 0, 256)
 	var source_node := get_node_by_id(source_id)
 	if not source_node.is_empty() and str(source_node["type"]) == "pixel_art":
 		var brush_params := params_for(source_node)
@@ -3340,6 +3344,14 @@ func _scatter_image(
 			var region := source_crop(
 				brush_params, Vector2i(brush.get_width(), brush.get_height())
 			)
+			if brush_mode == 2:
+				# A painting is a sprite: the cropped part is the element, so the
+				# stamp is that many output pixels unless a size is asked for. The
+				# canvas behind the painting never stretches it.
+				var edge := maxi(maxi(region.size.x, region.size.y), 1)
+				if brush_pixels > 0:
+					edge = brush_pixels
+				footprint = Vector2(edge, edge)
 			var aspect := float(region.size.x) / float(maxi(region.size.y, 1))
 			if aspect >= 1.0:
 				footprint.y = footprint.x / aspect
@@ -3530,6 +3542,18 @@ func _canvas_image(
 		2:
 			return painting_image(node, params)
 	return _source_image(node, params)
+
+
+## Node behind the brush input of a scatter node, or an empty dictionary. The
+## parameter panel uses it to ask for a pixel size when the brush is a painting.
+func brush_node(node_id: String) -> Dictionary:
+	var node := get_node_by_id(node_id)
+	if node.is_empty():
+		return {}
+	var source_id := _input_id(node, 0)
+	if source_id.is_empty():
+		return {}
+	return get_node_by_id(source_id)
 
 
 ## Image a branch can hand out directly, or null when it has to be sampled. A

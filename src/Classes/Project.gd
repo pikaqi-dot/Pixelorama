@@ -5,6 +5,9 @@ extends RefCounted
 
 signal removed
 signal serialized(dict: Dictionary)
+## Emitted at the start of [method serialize], so feature pages can write their
+## own data into [member page_state] before the project is turned into a file.
+signal about_to_serialize
 signal about_to_deserialize(dict: Dictionary)
 signal resized
 signal selection_changed
@@ -121,6 +124,9 @@ var cameras_offset: PackedVector2Array = [Vector2.ZERO, Vector2.ZERO, Vector2.ZE
 
 var save_path := ""  ## Path the pxo gets saved to (or is loaded from)
 var was_exported := false
+## Extra data of the optional pages (shader composer graph, tilemap map, game
+## scene). Saved inside the pxo so reopening the project restores them.
+var page_state: Dictionary = {}
 var export_overwrite := false
 var backup_path := ""
 var export_profile := Export.ExportProfile.new()
@@ -269,6 +275,7 @@ func change_project() -> void:
 
 
 func serialize() -> Dictionary:
+	about_to_serialize.emit()
 	var layer_data := []
 	for layer in layers:
 		layer_data.append(layer.serialize())
@@ -350,7 +357,8 @@ func serialize() -> Dictionary:
 		"author_contact": author_contact,
 		"author_company": author_company,
 		"metadata": metadata,
-		"export_profile": export_profile.serialize()
+		"export_profile": export_profile.serialize(),
+		"page_state": page_state
 	}
 
 	serialized.emit(project_data)
@@ -359,6 +367,7 @@ func serialize() -> Dictionary:
 
 func deserialize(dict: Dictionary, zip_reader: ZIPReader = null, file: FileAccess = null) -> void:
 	about_to_deserialize.emit(dict)
+	page_state = dict.get("page_state", {})
 	var pxo_version = dict.get("pxo_version", 1)
 	if dict.has("size_x") and dict.has("size_y"):
 		size = Vector2i(dict.size_x, dict.size_y)
