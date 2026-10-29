@@ -11,6 +11,10 @@ const ToolDialScript := preload("res://src/UI/ToolDial.gd")
 ## recognised, so drawing stays as fast as it was.
 const DIAL_TAP_MSEC := 500
 const DIAL_TAP_DISTANCE := 28.0
+## Two taps closer than this are not a double tap: two or three fingers of one
+## gesture land within a few milliseconds of each other, while a person needs at
+## least a tenth of a second between deliberate taps.
+const DIAL_MIN_PAIR_MSEC := 80
 ## Most tools the dial may hold. Past eight the circles shrink below a fingertip
 ## and the ring stops reading as one dial.
 const DIAL_MAX_SLOTS := 8
@@ -192,8 +196,10 @@ func _opens_tool_dial(event: InputEvent) -> bool:
 	if not is_instance_valid(Global.control):
 		return false
 	var now := Time.get_ticks_msec()
+	var since_tap := now - _tap_at
 	var pair := (
-		now - _tap_at <= DIAL_TAP_MSEC
+		since_tap >= DIAL_MIN_PAIR_MSEC
+		and since_tap <= DIAL_TAP_MSEC
 		and mouse.position.distance_to(_tap_point) <= DIAL_TAP_DISTANCE
 	)
 	if not (pair or mouse.double_click):

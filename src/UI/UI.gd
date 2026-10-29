@@ -439,6 +439,11 @@ func _suppress_tool_input() -> void:
 	Tools.cancel_active_tool()
 	Tools.hold_to_pick_active = true
 	_gesture_suppressed = true
+	# The tool dial belongs to a single finger. If a second finger lands right
+	# after one that opened it, the gesture was a pinch or a multi finger tap, so
+	# the dial gives way instead of swallowing the fingers.
+	if is_instance_valid(Global.canvas):
+		Global.canvas.call("_close_tool_dial")
 
 
 func _release_tool_input() -> void:
