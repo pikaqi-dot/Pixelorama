@@ -75,6 +75,14 @@ var _tap_snapshots: Array[Dictionary] = []
 ## Canvases larger than this are not snapshotted; the undo step is used instead of
 ## copying megabytes on every tap, which would be felt on a phone.
 const TAP_SNAPSHOT_MAX_PIXELS := 2_000_000
+## The two tools the dial's default selection takes turns on, newest first. A
+## double tap plus one tap on the highlighted circle is therefore a full switch
+## between the two tools the drawing is using, which is the whole point of the
+## dial being two taps away.
+var _dial_pair: Array[String] = []
+## Which member of [member _dial_pair] the next opening highlights. It is moved on
+## every opening, so closing the dial without picking hands the other tool over.
+var _dial_pair_next := 0
 var sprite_changed_this_frame := false  ## For optimization purposes
 var update_all_layers := false
 ## For optimization purposes. A kind of override to force include a layer during canvas update.
@@ -111,6 +119,8 @@ func _ready() -> void:
 	Global.project_about_to_switch.connect(_on_project_about_to_switch)
 	Global.project_switched.connect(_on_project_switched)
 	Global.cel_switched.connect(queue_redraw_all_layers)
+	if not Tools.tool_changed.is_connected(_on_dial_tool_changed):
+		Tools.tool_changed.connect(_on_dial_tool_changed)
 	onion_past.type = onion_past.PAST
 	onion_past.blue_red_color = Global.onion_skinning_past_color
 	onion_future.type = onion_future.FUTURE
@@ -371,8 +381,65 @@ func _dial_entry(tool_name: String, button: Button) -> Dictionary:
 	}
 
 
-## Puts the dial around the current tool, which always sits on the right of the
-## ring so the thumb path to it never changes.
+## Name of the tool a stroke uses. The left slot is the one the canvas draws with
+## and the one the side panel lights up, so it is the name that can be trusted.
+func _left_tool_name() -> String:
+	var slot := Tools.get_tool(MOUSE_BUTTON_LEFT)
+	if slot != null and is_instance_valid(slot.tool_node):
+		return str(slot.tool_node.name)
+	return ""
+
+
+## Remembers [param tool_name] as the newest of the two tools the dial alternates
+## on, and points the next opening at the other one.
+func _remember_dial_tool(tool_name: String) -> void:
+	if tool_name.is_empty():
+		return
+	if not _dial_pair.is_empty() and _dial_pair[0] == tool_name:
+		return
+	var previous := ""
+	if not _dial_pair.is_empty():
+		previous = _dial_pair[0]
+	_dial_pair.clear()
+	_dial_pair.append(tool_name)
+	if not previous.is_empty():
+		_dial_pair.append(previous)
+	_dial_pair_next = 1
+
+
+## Every tool change is remembered, wherever it came from: the side panel, a
+## shortcut or the dial itself. Only the left slot is the tool a stroke uses.
+func _on_dial_tool_changed(tool_name: String, button: int) -> void:
+	if button != MOUSE_BUTTON_LEFT:
+		return
+	_remember_dial_tool(tool_name)
+
+
+## Tool the ring highlights on this opening, which is the one sitting on the right
+## so the thumb path to it never changes. It is one of the last two tools used and
+## the two take turns, so two openings in a row offer each of them once. A tool the
+## ring cannot show falls back to the one in use.
+func _next_dial_default(entries: Array) -> String:
+	var available := {}
+	for entry in entries:
+		available[str(entry.get("tool", ""))] = true
+	var usable: Array[String] = []
+	for tool_name in _dial_pair:
+		if available.has(tool_name):
+			usable.append(tool_name)
+	if usable.is_empty():
+		var in_use := _left_tool_name()
+		if available.has(in_use):
+			return in_use
+		return str(entries[0].get("tool", ""))
+	_dial_pair_next = posmod(_dial_pair_next, usable.size())
+	var choice := usable[_dial_pair_next]
+	_dial_pair_next = (_dial_pair_next + 1) % usable.size()
+	return choice
+
+
+## Puts the dial around the tool its next default is, which always sits on the
+## right of the ring so the thumb path to it never changes.
 func _open_tool_dial(screen_point: Vector2) -> void:
 	var entries := _dial_entries()
 	if entries.is_empty():
@@ -384,13 +451,7 @@ func _open_tool_dial(screen_point: Vector2) -> void:
 		Global.control.add_child(_tool_dial)
 		_tool_dial.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
 	var area: Vector2 = Global.control.size
-	# The left slot is the one a stroke uses and the one the panel lights up, so
-	# it is what the ring must show. A remembered name would lag a frame, because
-	# a tool assignment publishes its signal only after awaiting one.
-	var slot := Tools.get_tool(MOUSE_BUTTON_LEFT)
-	var active := ""
-	if slot != null and is_instance_valid(slot.tool_node):
-		active = str(slot.tool_node.name)
+	var active := _next_dial_default(entries)
 	_tool_dial.setup(
 		entries, screen_point - Global.control.global_position, area, active, DIAL_GUARD_MSEC
 	)
@@ -403,6 +464,9 @@ func _on_tool_dial_picked(tool_name: String) -> void:
 		# like a sidebar press: the old tool is freed, the choice is written to the
 		# config cache, and the slot that a stroke uses always ends up holding it.
 		Tools.assign_tool(tool_name, MOUSE_BUTTON_LEFT)
+		# Taken over right away, so a dial that is reopened before the tool change
+		# signal arrives already offers the other tool.
+		_remember_dial_tool(tool_name)
 		if Global.single_tool_mode:
 			Tools.assign_tool(tool_name, MOUSE_BUTTON_RIGHT)
 	_close_tool_dial()
