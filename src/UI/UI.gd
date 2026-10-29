@@ -301,6 +301,7 @@ func _on_screen_touch(touch: InputEventScreenTouch) -> void:
 			# finger started and ignore tool input until every finger is lifted.
 			_cancel_hold_to_pick()
 			_suppress_tool_input()
+			Global.last_multi_finger_msec = Time.get_ticks_msec()
 		return
 
 	# The last position of a lifted finger may be newer than its last drag event,

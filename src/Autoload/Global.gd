@@ -201,6 +201,9 @@ var loaded_fonts: Array[Font] = [
 ## [code]false[/code] when we are moving some gizmo and don't want the current tool to accidentally
 ## start drawing.[br](This does not depend on layer invisibility or lock/unlock status).
 var can_draw := true
+## Time of the last two or three finger gesture, so a gesture that just ended is
+## not mistaken for a single finger double tap by anything listening for one.
+var last_multi_finger_msec := -10000
 ## (Intended to be used as getter only) Tells if the user allowed to move the guide while on canvas.
 var move_guides_on_canvas := true
 

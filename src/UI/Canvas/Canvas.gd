@@ -60,6 +60,12 @@ var _tap_history := 0
 ## lifted outside the window) expires instead of blocking every later press.
 var _swallow_release := false
 var _swallow_at := 0
+## Where the dial asked to appear, and whether it still has to. Opening is put off
+## to the end of the frame because a second finger of a multi finger gesture can
+## arrive after the emulated mouse press that started this one, and that finger
+## must be able to cancel the dial before it is ever seen.
+var _pending_dial := false
+var _pending_dial_point := Vector2.ZERO
 ## Pictures of the cels of the frame the last tap landed on. A double tap puts
 ## them back verbatim, so no tool can leave a mark behind, whatever its own undo
 ## handling does. Each entry is {cel, image}.
@@ -190,8 +196,10 @@ func _opens_tool_dial(event: InputEvent) -> bool:
 			_tap_at = -10000
 		return false
 	# A two or three finger gesture owns the input: two fingers landing close
-	# together are not a double tap.
+	# together are not a double tap, and neither is a tap right after a gesture.
 	if Tools.hold_to_pick_active:
+		return false
+	if Time.get_ticks_msec() - Global.last_multi_finger_msec <= DIAL_TAP_MSEC:
 		return false
 	if not is_instance_valid(Global.control):
 		return false
@@ -221,11 +229,26 @@ func _opens_tool_dial(event: InputEvent) -> bool:
 	# Whatever the tool and its undo did, the cel goes back to the picture it had
 	# before the tap, so a fill or a stroke cannot be left behind.
 	_restore_tap_snapshot()
-	_open_tool_dial(_screen_point(mouse.position))
+	_pending_dial = true
+	_pending_dial_point = _screen_point(mouse.position)
+	call_deferred("_open_pending_dial")
 	_swallow_release = true
 	_swallow_at = now
 	get_viewport().set_input_as_handled()
 	return true
+
+
+## Opens the dial once the frame is over, unless a second finger turned the tap
+## into a pinch or a multi finger tap in the meantime.
+func _open_pending_dial() -> void:
+	if not _pending_dial:
+		return
+	_pending_dial = false
+	if Tools.hold_to_pick_active:
+		return
+	if Time.get_ticks_msec() - Global.last_multi_finger_msec <= DIAL_TAP_MSEC:
+		return
+	_open_tool_dial(_pending_dial_point)
 
 
 ## Remembers the picture of every cel of the current frame before a tap does
@@ -358,6 +381,8 @@ func _on_tool_dial_picked(tool_name: String) -> void:
 
 
 func _close_tool_dial() -> void:
+	# A call that is still on its way must not reopen what is being closed now.
+	_pending_dial = false
 	if is_instance_valid(_tool_dial) and _tool_dial.visible:
 		_tool_dial.visible = false
 
