@@ -45,9 +45,6 @@ const DIAL_TOOL_ORDER := [
 const DIAL_GUARD_MSEC := 180
 
 var current_pixel := Vector2.ZERO
-## Name of the tool chosen last, whatever slot it went to. The dial lights this
-## one up, so the highlight never depends on how a slot happens to be routed.
-var _recent_tool := ""
 ## Tool dial overlay. It lives in the main interface instead of this viewport, so
 ## the camera zoom and rotation never stretch or turn it.
 var _tool_dial: Control
@@ -108,7 +105,6 @@ var layer_metadata_texture := ImageTexture.new()
 
 
 func _ready() -> void:
-	Tools.tool_changed.connect(_on_tool_changed)
 	material.set_shader_parameter("layers", layer_texture_array)
 	material.set_shader_parameter("metadata", layer_metadata_texture)
 	Global.project_created.connect(camera_zoom)
@@ -366,17 +362,6 @@ func _dial_entries() -> Array:
 	return entries
 
 
-func _on_tool_changed(tool_name: String, _button: int) -> void:
-	_recent_tool = tool_name
-
-
-func _dial_has_entry(entries: Array, tool_name: String) -> bool:
-	for entry: Dictionary in entries:
-		if str(entry.get("tool", "")) == tool_name:
-			return true
-	return false
-
-
 func _dial_entry(tool_name: String, button: Button) -> Dictionary:
 	var icon := button.get_node_or_null("ToolIcon") as TextureRect
 	return {
@@ -399,18 +384,15 @@ func _open_tool_dial(screen_point: Vector2) -> void:
 		Global.control.add_child(_tool_dial)
 		_tool_dial.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
 	var area: Vector2 = Global.control.size
-	# The tool that was chosen last is the one to light up. Reading a slot would
-	# be fragile: in single tool mode the left button is routed to the right slot,
-	# so one slot keeps the tool of an earlier pick and the highlight would then
-	# jump between two tools.
-	var active := _recent_tool
-	if active.is_empty() or not _dial_has_entry(entries, active):
-		var slot := Tools.get_tool(
-			MOUSE_BUTTON_RIGHT if Global.single_tool_mode else MOUSE_BUTTON_LEFT
-		)
-		active = ""
-		if slot != null and is_instance_valid(slot.tool_node):
-			active = str(slot.tool_node.name)
+	# The slot is read, not a remembered name: a tool assignment publishes its
+	# signal only on the next frame, so a remembered name would still hold the
+	# previous tool when the dial is opened right after a pick. In single tool mode
+	# the left button is routed to the right slot, which is where the tool that
+	# really draws lives.
+	var slot := Tools.get_tool(MOUSE_BUTTON_RIGHT if Global.single_tool_mode else MOUSE_BUTTON_LEFT)
+	var active := ""
+	if slot != null and is_instance_valid(slot.tool_node):
+		active = str(slot.tool_node.name)
 	_tool_dial.setup(
 		entries, screen_point - Global.control.global_position, area, active, DIAL_GUARD_MSEC
 	)
