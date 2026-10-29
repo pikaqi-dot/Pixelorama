@@ -56,6 +56,13 @@ var _tap_history := 0
 ## lifted outside the window) expires instead of blocking every later press.
 var _swallow_release := false
 var _swallow_at := 0
+## Picture of the cel the last tap landed on. A double tap puts it back verbatim,
+## so no tool can leave a mark behind, whatever its own undo handling does.
+var _tap_snapshot: Image = null
+var _tap_snapshot_cel: BaseCel = null
+## Canvases larger than this are not snapshotted; the undo step is used instead of
+## copying tens of megabytes on every tap.
+const TAP_SNAPSHOT_MAX_PIXELS := 4_000_000
 var sprite_changed_this_frame := false  ## For optimization purposes
 var update_all_layers := false
 ## For optimization purposes. A kind of override to force include a layer during canvas update.
@@ -196,20 +203,63 @@ func _opens_tool_dial(event: InputEvent) -> bool:
 		# on motion, which is exactly how a finger behaves.
 		_tap_point = mouse.position
 		_tap_history = _history_count()
+		_take_tap_snapshot()
 		return false
 	_tap_at = -10000
 	# Take back what the first tap drew. A stroke that is still running is
 	# cancelled, and a step that was already committed is undone once.
 	Tools.cancel_active_tool()
-	if _history_count() > _tap_history:
-		var project := Global.current_project
-		if project != null:
-			project.commit_undo()
+	var project := Global.current_project
+	if project != null and _history_count() > _tap_history:
+		project.commit_undo()
+	# Whatever the tool and its undo did, the cel goes back to the picture it had
+	# before the tap, so a fill or a stroke cannot be left behind.
+	_restore_tap_snapshot()
 	_open_tool_dial(_screen_point(mouse.position))
 	_swallow_release = true
 	_swallow_at = now
 	get_viewport().set_input_as_handled()
 	return true
+
+
+## Remembers the cel picture before a tap does anything to it. Sizes above
+## [constant TAP_SNAPSHOT_MAX_PIXELS] are skipped, which keeps a very large canvas
+## from copying tens of megabytes on every tap.
+func _take_tap_snapshot() -> void:
+	_tap_snapshot = null
+	_tap_snapshot_cel = null
+	var project := Global.current_project
+	if project == null:
+		return
+	var cel := project.get_current_cel()
+	if not (cel is PixelCel):
+		return
+	var image := cel.get_image()
+	var pixels := image.get_width() * image.get_height()
+	if pixels <= 0 or pixels > TAP_SNAPSHOT_MAX_PIXELS:
+		return
+	_tap_snapshot = image.duplicate()
+	_tap_snapshot_cel = cel
+
+
+## Puts the cel back the way it was before the tap and redraws it.
+func _restore_tap_snapshot() -> void:
+	var snapshot := _tap_snapshot
+	var cel := _tap_snapshot_cel
+	_tap_snapshot = null
+	_tap_snapshot_cel = null
+	if snapshot == null or not is_instance_valid(cel):
+		return
+	var image := cel.get_image()
+	if image.get_size() != snapshot.get_size():
+		return
+	image.copy_from(snapshot)
+	var project := Global.current_project
+	if project == null:
+		return
+	Global.canvas.update_texture(project.current_layer)
+	sprite_changed_this_frame = true
+	queue_redraw()
 
 
 ## Number of undo steps the project has, which is how the gesture knows whether
