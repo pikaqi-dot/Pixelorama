@@ -384,12 +384,10 @@ func _open_tool_dial(screen_point: Vector2) -> void:
 		Global.control.add_child(_tool_dial)
 		_tool_dial.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
 	var area: Vector2 = Global.control.size
-	# The slot is read, not a remembered name: a tool assignment publishes its
-	# signal only on the next frame, so a remembered name would still hold the
-	# previous tool when the dial is opened right after a pick. In single tool mode
-	# the left button is routed to the right slot, which is where the tool that
-	# really draws lives.
-	var slot := Tools.get_tool(MOUSE_BUTTON_RIGHT if Global.single_tool_mode else MOUSE_BUTTON_LEFT)
+	# The left slot is the one a stroke uses and the one the panel lights up, so
+	# it is what the ring must show. A remembered name would lag a frame, because
+	# a tool assignment publishes its signal only after awaiting one.
+	var slot := Tools.get_tool(MOUSE_BUTTON_LEFT)
 	var active := ""
 	if slot != null and is_instance_valid(slot.tool_node):
 		active = str(slot.tool_node.name)
@@ -401,10 +399,10 @@ func _open_tool_dial(screen_point: Vector2) -> void:
 
 func _on_tool_dial_picked(tool_name: String) -> void:
 	if not tool_name.is_empty():
+		# The panel's own assignment path is used, so a pick is remembered exactly
+		# like a sidebar press: the old tool is freed, the choice is written to the
+		# config cache, and the slot that a stroke uses always ends up holding it.
 		Tools.assign_tool(tool_name, MOUSE_BUTTON_LEFT)
-		# In single tool mode the call above is routed to the right slot and the
-		# left one, the one a stroke uses, would keep the old tool. Both slots are
-		# set so the ring and the canvas can never disagree.
 		if Global.single_tool_mode:
 			Tools.assign_tool(tool_name, MOUSE_BUTTON_RIGHT)
 	_close_tool_dial()
