@@ -56,10 +56,10 @@ var _tap_history := 0
 ## lifted outside the window) expires instead of blocking every later press.
 var _swallow_release := false
 var _swallow_at := 0
-## Picture of the cel the last tap landed on. A double tap puts it back verbatim,
-## so no tool can leave a mark behind, whatever its own undo handling does.
-var _tap_snapshot: Image = null
-var _tap_snapshot_cel: BaseCel = null
+## Pictures of the cels of the frame the last tap landed on. A double tap puts
+## them back verbatim, so no tool can leave a mark behind, whatever its own undo
+## handling does. Each entry is {cel, image}.
+var _tap_snapshots: Array[Dictionary] = []
 ## Canvases larger than this are not snapshotted; the undo step is used instead of
 ## copying megabytes on every tap, which would be felt on a phone.
 const TAP_SNAPSHOT_MAX_PIXELS := 2_000_000
@@ -222,42 +222,50 @@ func _opens_tool_dial(event: InputEvent) -> bool:
 	return true
 
 
-## Remembers the cel picture before a tap does anything to it. Sizes above
-## [constant TAP_SNAPSHOT_MAX_PIXELS] are skipped, which keeps a very large canvas
-## from copying tens of megabytes on every tap.
+## Remembers the picture of every cel of the current frame before a tap does
+## anything to it. The bucket can fill more than one layer at once, so a single
+## cel is not enough. The budget is [constant TAP_SNAPSHOT_MAX_PIXELS] in total; a
+## canvas beyond it is skipped instead of copying megabytes on every tap.
 func _take_tap_snapshot() -> void:
-	_tap_snapshot = null
-	_tap_snapshot_cel = null
+	_tap_snapshots.clear()
 	var project := Global.current_project
-	if project == null:
+	if project == null or project.current_frame < 0:
 		return
-	var cel := project.get_current_cel()
-	if not (cel is PixelCel):
+	if project.current_frame >= project.frames.size():
 		return
-	var image := cel.get_image()
-	var pixels := image.get_width() * image.get_height()
-	if pixels <= 0 or pixels > TAP_SNAPSHOT_MAX_PIXELS:
-		return
-	_tap_snapshot = image.duplicate()
-	_tap_snapshot_cel = cel
+	var budget := TAP_SNAPSHOT_MAX_PIXELS
+	for cel in project.frames[project.current_frame].cels:
+		if not (cel is PixelCel):
+			continue
+		var image := cel.get_image()
+		if image == null:
+			continue
+		var pixels := image.get_width() * image.get_height()
+		if pixels <= 0 or pixels > budget:
+			continue
+		budget -= pixels
+		_tap_snapshots.append({"cel": cel, "image": image.duplicate()})
 
 
-## Puts the cel back the way it was before the tap and redraws it.
+## Puts every cel of the frame back the way it was before the tap and redraws
+## them, so whatever the tool changed the picture is exactly the old one again.
 func _restore_tap_snapshot() -> void:
-	var snapshot := _tap_snapshot
-	var cel := _tap_snapshot_cel
-	_tap_snapshot = null
-	_tap_snapshot_cel = null
-	if snapshot == null or not is_instance_valid(cel):
+	var entries := _tap_snapshots.duplicate()
+	_tap_snapshots.clear()
+	var restored := false
+	for entry: Dictionary in entries:
+		var cel: BaseCel = entry["cel"]
+		var snapshot: Image = entry["image"]
+		if not is_instance_valid(cel):
+			continue
+		var image := cel.get_image()
+		if image == null or image.get_size() != snapshot.get_size():
+			continue
+		image.copy_from(snapshot)
+		cel.update_texture()
+		restored = true
+	if not restored:
 		return
-	var image := cel.get_image()
-	if image.get_size() != snapshot.get_size():
-		return
-	image.copy_from(snapshot)
-	var project := Global.current_project
-	if project == null:
-		return
-	Global.canvas.update_texture(project.current_layer)
 	sprite_changed_this_frame = true
 	queue_redraw()
 
