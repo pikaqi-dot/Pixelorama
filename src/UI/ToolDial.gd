@@ -30,6 +30,9 @@ var ring_radius := 60.0
 
 var _entries: Array = []
 var _active := ""
+## Index of the tool in use. The ring is turned so that entry sits on the right,
+## which keeps the thumb path to the current tool the same every time it opens.
+var _active_index := 0
 var _area := Vector2.ZERO
 var _hover := -1
 var _pressed_slot := -1
@@ -57,6 +60,7 @@ func setup(
 ) -> void:
 	_entries = entries
 	_active = active
+	_sync_active_index()
 	_area = area
 	_hover = -1
 	_pressed_slot = -1
@@ -100,11 +104,21 @@ func _place(where: Vector2) -> void:
 	)
 
 
-## The first tool sits at the top, the rest run clockwise, so the ring is read the
-## way a clock is.
+## Finds the entry the ring is turned around.
+func _sync_active_index() -> void:
+	_active_index = 0
+	for index in _entries.size():
+		if str(_entries[index].get("tool", "")) == _active:
+			_active_index = index
+			return
+
+
+## The tool in use sits on the right, the rest run clockwise from it, so the ring
+## is read the way a clock is and the current tool is always where the thumb
+## expects it.
 func _slot_center(index: int) -> Vector2:
 	var count := maxi(_entries.size(), 1)
-	var angle := -PI * 0.5 + TAU * float(index) / float(count)
+	var angle := TAU * float(index - _active_index) / float(count)
 	return center + Vector2(cos(angle), sin(angle)) * ring_radius
 
 

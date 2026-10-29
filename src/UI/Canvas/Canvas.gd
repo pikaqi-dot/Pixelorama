@@ -371,6 +371,8 @@ func _dial_entry(tool_name: String, button: Button) -> Dictionary:
 	}
 
 
+## Puts the dial around the current tool, which always sits on the right of the
+## ring so the thumb path to it never changes.
 func _open_tool_dial(screen_point: Vector2) -> void:
 	var entries := _dial_entries()
 	if entries.is_empty():
@@ -382,7 +384,10 @@ func _open_tool_dial(screen_point: Vector2) -> void:
 		Global.control.add_child(_tool_dial)
 		_tool_dial.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
 	var area: Vector2 = Global.control.size
-	var slot := Tools.get_tool(MOUSE_BUTTON_LEFT)
+	# In single tool mode the left button is routed to the right slot, so the tool
+	# that is really in use lives there; reading the left slot would show the tool
+	# of one pick ago.
+	var slot := Tools.get_tool(MOUSE_BUTTON_RIGHT if Global.single_tool_mode else MOUSE_BUTTON_LEFT)
 	var active := ""
 	if slot != null and is_instance_valid(slot.tool_node):
 		active = str(slot.tool_node.name)
