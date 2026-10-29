@@ -402,6 +402,11 @@ func _open_tool_dial(screen_point: Vector2) -> void:
 func _on_tool_dial_picked(tool_name: String) -> void:
 	if not tool_name.is_empty():
 		Tools.assign_tool(tool_name, MOUSE_BUTTON_LEFT)
+		# In single tool mode the call above is routed to the right slot and the
+		# left one, the one a stroke uses, would keep the old tool. Both slots are
+		# set so the ring and the canvas can never disagree.
+		if Global.single_tool_mode:
+			Tools.assign_tool(tool_name, MOUSE_BUTTON_RIGHT)
 	_close_tool_dial()
 
 
