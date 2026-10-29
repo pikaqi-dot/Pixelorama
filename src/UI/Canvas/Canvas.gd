@@ -254,6 +254,9 @@ func _open_pending_dial() -> void:
 		# A gesture owns the input: its fingers must not have drawn either.
 		_restore_snapshots(snapshots)
 		return
+	# A press the tool has not started yet is dropped too, otherwise it would draw
+	# right after the picture was put back.
+	Tools.cancel_pending_press()
 	Tools.cancel_active_tool()
 	var project := Global.current_project
 	if project != null and _history_count() > history:
