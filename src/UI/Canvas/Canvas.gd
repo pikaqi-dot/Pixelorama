@@ -61,8 +61,8 @@ var _swallow_at := 0
 var _tap_snapshot: Image = null
 var _tap_snapshot_cel: BaseCel = null
 ## Canvases larger than this are not snapshotted; the undo step is used instead of
-## copying tens of megabytes on every tap.
-const TAP_SNAPSHOT_MAX_PIXELS := 4_000_000
+## copying megabytes on every tap, which would be felt on a phone.
+const TAP_SNAPSHOT_MAX_PIXELS := 2_000_000
 var sprite_changed_this_frame := false  ## For optimization purposes
 var update_all_layers := false
 ## For optimization purposes. A kind of override to force include a layer during canvas update.
