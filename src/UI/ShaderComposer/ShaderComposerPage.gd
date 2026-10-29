@@ -234,6 +234,10 @@ var _all_previews_dirty := true
 ## inside a time budget on slower devices.
 var _preview_side := 0
 var _preview_msec := 0.0
+## Hash of everything the preview picture is built from, so an edit that never
+## reaches the output chain can leave the picture on screen alone instead of
+## redrawing it at another size.
+var _preview_signature := 0
 ## A sliced preview is in flight; new requests are merged into it.
 var _preview_busy := false
 ## Time of the last change that asked for a preview, used to tell a slider being
@@ -2825,6 +2829,24 @@ func _show_params(id: String) -> void:
 			_add_slider("强度", 0.0, 1.0, 0.01, float(params["strength"]), params, "strength")
 		"pixelate":
 			_add_slider("块大小", 1.0, 32.0, 1.0, float(params["size"]), params, "size")
+		"erode":
+			var erode_hint := Label.new()
+			erode_hint.text = (
+				"沿轮廓吃掉一层像素（侵蚀），或者反过来向外长出（扩张）。"
+				+ "改的是边缘形状；整体移动、缩放、旋转请用「变换」。"
+				+ "像素画半径 1–2 px 最稳妥；半径越大越慢，输入 2 可接遮罩限制范围。"
+			)
+			erode_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+			erode_hint.add_theme_font_size_override("font_size", 13)
+			_params_box.add_child(erode_hint)
+			_add_option(
+				"模式", ShaderGraphScript.ERODE_MODES, int(params.get("mode", 0)), params, "mode"
+			)
+			_add_slider("半径", 0.5, 6.0, 0.5, float(params.get("radius", 1.0)), params, "radius")
+			_add_option(
+				"形状", ShaderGraphScript.ERODE_SHAPES, int(params.get("shape", 0)), params, "shape"
+			)
+			_add_slider("混合", 0.0, 1.0, 0.01, float(params.get("mix", 1.0)), params, "mix")
 		"warp":
 			var warp_hint := Label.new()
 			warp_hint.text = "输入 1 是扰动场，输入 2 是被扭曲的图案。"
@@ -4143,6 +4165,27 @@ func _wait_for_preview() -> void:
 		await get_tree().process_frame
 
 
+## One number for everything the preview picture is built from: the clock, the
+## canvas and the parameters and wires of the nodes the output reads. A node
+## parked beside the chain is not part of it, which is what lets an edit there
+## leave the picture alone.
+func _preview_source_signature() -> int:
+	var parts := PackedStringArray()
+	parts.append("%.5f" % graph.time)
+	var project := Global.current_project
+	if project != null:
+		parts.append("canvas=%d,%d" % [project.size.x, project.size.y])
+	for node_id in graph.output_chain_ids():
+		var node: Dictionary = graph.get_node_by_id(node_id)
+		if node.is_empty():
+			continue
+		parts.append(
+			"%s|%s|%s|%s"
+			% [node_id, node["type"], var_to_str(node["inputs"]), var_to_str(node["params"])]
+		)
+	return hash("\n".join(parts))
+
+
 func _refresh_preview() -> void:
 	if not is_instance_valid(_preview) or not visible:
 		return
@@ -4163,6 +4206,25 @@ func _refresh_preview() -> void:
 		return
 	_preview_busy = true
 	var playing := _is_playing()
+	# A change that never reaches the output chain changes no pixel of the
+	# picture. Redrawing it anyway is what made the preview flash: the cheap pass
+	# under the finger and the full size pass after it are two different
+	# resolutions of the same image. With nothing to redraw the picture stays.
+	var signature := 0
+	if not playing and is_instance_valid(_preview) and _preview.texture != null:
+		graph.time = _phase.value if is_instance_valid(_phase) else 0.0
+		if is_instance_valid(_path_editor):
+			_path_editor.set_phase(graph.time)
+		signature = _preview_source_signature()
+		# A graph that reads the artwork can change under any edit, so it always
+		# gets a fresh pass.
+		if signature == _preview_signature and not graph.uses_source():
+			_preview_pending = false
+			_preview_busy = false
+			_refresh_node_previews()
+			_refresh_selected_preview()
+			_update_status()
+			return
 	# The size follows the measured cost, so a slow device renders a smaller
 	# preview instead of freezing on a big one. Fast ones keep the full size.
 	var cap := PREVIEW_LIMIT_HEAVY if graph.is_expensive() else PREVIEW_LIMIT
@@ -4199,6 +4261,11 @@ func _refresh_preview() -> void:
 		return
 	_preview_image = image
 	_preview.texture = ImageTexture.create_from_image(image)
+	# Remember what this picture was made from, so the next edit can tell whether
+	# it reached the output chain at all. Playback never compares, so it stores
+	# nothing and the first settled pass after it always redraws.
+	if signature != 0:
+		_preview_signature = signature
 	# A clock or a live source changes every thumbnail; without them only the
 	# branches touched by the edit need a new picture.
 	if graph.uses_time() or graph.uses_source():

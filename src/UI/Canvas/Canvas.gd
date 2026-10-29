@@ -2,8 +2,58 @@ class_name Canvas
 extends Node2D
 
 const CURSOR_SPEED_RATE := 6.0
+const ToolDialScript := preload("res://src/UI/ToolDial.gd")
+## Two taps on the drawing view open the tool dial when they land this close in
+## time and space. A finger is less precise than a mouse, so the window is
+## generous; a mouse also gets the engine's own double click flag, which follows
+## the double click speed set in the system. Nothing is delayed: the first tap is
+## drawn like any other and its mark is taken back when the gesture is
+## recognised, so drawing stays as fast as it was.
+const DIAL_TAP_MSEC := 500
+const DIAL_TAP_DISTANCE := 28.0
+## Most tools the dial may hold. Past eight the circles shrink below a fingertip
+## and the ring stops reading as one dial.
+const DIAL_MAX_SLOTS := 8
+## Order the ring fills up in: the tools a drawing needs first, because that is
+## what a finger on the canvas reaches for. Tools the side panel hides are left
+## out, so hiding them there is also how the ring is trimmed.
+const DIAL_TOOL_ORDER := [
+	"Pencil",
+	"Eraser",
+	"Bucket",
+	"Shading",
+	"LineTool",
+	"RectangleTool",
+	"EllipseTool",
+	"ColorPicker",
+	"Gradient",
+	"CurveTool",
+	"RectSelect",
+	"EllipseSelect",
+	"Lasso",
+	"MagicWand",
+	"Move",
+	"Zoom",
+	"Pan",
+]
+## Presses this soon after the dial opens are ignored: the finger that opened it
+## is still on its way up, and it must not pick whatever lies under it.
+const DIAL_GUARD_MSEC := 180
 
 var current_pixel := Vector2.ZERO
+## Tool dial overlay. It lives in the main interface instead of this viewport, so
+## the camera zoom and rotation never stretch or turn it.
+var _tool_dial: Control
+## Time and place of the last tap, so a second one right after it is read as the
+## dial gesture.
+var _tap_at := -10000
+var _tap_point := Vector2.ZERO
+## Undo steps that existed when that tap landed. A step added since then is the
+## mark the tap left behind, and the gesture takes exactly that one back.
+var _tap_history := 0
+## Swallows the rest of the gesture that opened the dial, so the emulated mouse
+## release cannot reach a tool either.
+var _swallow_release := false
 var sprite_changed_this_frame := false  ## For optimization purposes
 var update_all_layers := false
 ## For optimization purposes. A kind of override to force include a layer during canvas update.
@@ -93,11 +143,151 @@ func _input(event: InputEvent) -> void:
 	current_pixel = get_local_mouse_position()
 
 	sprite_changed_this_frame = false
+	# A double tap asks for the tool dial and never reaches the tools, so the
+	# selected tool is not used for the gesture itself.
+	if _opens_tool_dial(event):
+		return
 	Tools.handle_draw(Vector2i(current_pixel.floor()), event)
 
 	if sprite_changed_this_frame:
 		queue_redraw()
 		update_selected_cels_textures()
+
+
+## True when this press is the second half of a double tap on the drawing view.
+## The dial opens and the press is kept away from the tools, so the selected tool
+## never draws on the gesture itself. The mark the first tap made is taken back
+## instead of delaying every tap, because a delayed input makes drawing feel slow.
+func _opens_tool_dial(event: InputEvent) -> bool:
+	if not (event is InputEventMouseButton):
+		return false
+	var mouse := event as InputEventMouseButton
+	if mouse.button_index != MOUSE_BUTTON_LEFT:
+		return false
+	if _swallow_release:
+		if not mouse.pressed:
+			_swallow_release = false
+		get_viewport().set_input_as_handled()
+		return true
+	if not mouse.pressed:
+		# A stroke that moved is not the first half of a double tap, so a click
+		# that follows it cannot cancel a real stroke by mistake.
+		if _screen_point().distance_to(_tap_point) > 4.0:
+			_tap_at = -10000
+		return false
+	# A two or three finger gesture owns the input: two fingers landing close
+	# together are not a double tap.
+	if Tools.hold_to_pick_active:
+		return false
+	if not is_instance_valid(Global.control):
+		return false
+	var point := _screen_point()
+	var now := Time.get_ticks_msec()
+	var pair := (
+		now - _tap_at <= DIAL_TAP_MSEC and point.distance_to(_tap_point) <= DIAL_TAP_DISTANCE
+	)
+	if not (pair or mouse.double_click):
+		_tap_at = now
+		_tap_point = point
+		_tap_history = _history_count()
+		return false
+	_tap_at = -10000
+	# Take back what the first tap drew. A stroke that is still running is
+	# cancelled, and a step that was already committed is undone once.
+	Tools.cancel_active_tool()
+	if _history_count() > _tap_history:
+		var project := Global.current_project
+		if project != null:
+			project.commit_undo()
+	_open_tool_dial(point)
+	_swallow_release = true
+	get_viewport().set_input_as_handled()
+	return true
+
+
+## Number of undo steps the project has, which is how the gesture knows whether
+## the tap it just cancelled left a committed mark behind.
+func _history_count() -> int:
+	var project := Global.current_project
+	if project == null:
+		return 0
+	return project.undo_redo.get_history_count()
+
+
+## Screen position of the pointer, for placing the dial in the interface.
+func _screen_point() -> Vector2:
+	var container := get_viewport().get_parent() as SubViewportContainer
+	if container == null:
+		return Vector2.ZERO
+	return container.get_global_mouse_position()
+
+
+## Builds the ring from the side toolbar's own buttons, so the icons are exactly
+## the ones the panel shows. A tool the panel hides never reaches the ring, and
+## [constant DIAL_TOOL_ORDER] decides which ones get a slot first.
+func _dial_entries() -> Array:
+	var entries: Array = []
+	var buttons: Node = Tools._tool_buttons
+	if not is_instance_valid(buttons):
+		return entries
+	var by_name := {}
+	for child in buttons.get_children():
+		if child is Button and child.visible:
+			by_name[String(child.name)] = child
+	for tool_name in DIAL_TOOL_ORDER:
+		if entries.size() >= DIAL_MAX_SLOTS:
+			break
+		if not by_name.has(tool_name):
+			continue
+		entries.append(_dial_entry(tool_name, by_name[tool_name]))
+		by_name.erase(tool_name)
+	# Anything else the panel shows still gets a slot when there is room left.
+	for tool_name in by_name:
+		if entries.size() >= DIAL_MAX_SLOTS:
+			break
+		entries.append(_dial_entry(tool_name, by_name[tool_name]))
+	return entries
+
+
+func _dial_entry(tool_name: String, button: Button) -> Dictionary:
+	var icon := button.get_node_or_null("ToolIcon") as TextureRect
+	return {
+		"tool": tool_name,
+		"texture": icon.texture if icon != null else null,
+		"label": str(button.tooltip_text).get_slice("\n", 0),
+	}
+
+
+func _open_tool_dial(screen_point: Vector2) -> void:
+	var entries := _dial_entries()
+	if entries.is_empty():
+		return
+	if not is_instance_valid(_tool_dial):
+		_tool_dial = ToolDialScript.new()
+		_tool_dial.picked.connect(_on_tool_dial_picked)
+		_tool_dial.dismissed.connect(_close_tool_dial)
+		Global.control.add_child(_tool_dial)
+		_tool_dial.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	var area: Vector2 = Global.control.size
+	var slot := Tools.get_tool(MOUSE_BUTTON_LEFT)
+	var active := ""
+	if slot != null and is_instance_valid(slot.tool_node):
+		active = str(slot.tool_node.name)
+	_tool_dial.setup(
+		entries, screen_point - Global.control.global_position, area, active, DIAL_GUARD_MSEC
+	)
+	_tool_dial.grab_focus()
+
+
+func _on_tool_dial_picked(tool_name: String) -> void:
+	if not tool_name.is_empty():
+		Tools.assign_tool(tool_name, MOUSE_BUTTON_LEFT)
+	_close_tool_dial()
+
+
+func _close_tool_dial() -> void:
+	if is_instance_valid(_tool_dial) and _tool_dial.visible:
+		_tool_dial.visible = false
 
 
 func queue_redraw_all_layers() -> void:

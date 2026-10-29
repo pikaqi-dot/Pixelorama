@@ -69,6 +69,9 @@ const NODE_TYPES := {
 	"edge": {"label": "边缘检测", "inputs": 1},
 	"dither": {"label": "抖动", "inputs": 1},
 	"pixelate": {"label": "像素化", "inputs": 1},
+	# Morphology: eats the silhouette inwards or grows it outwards, which a
+	# transform cannot do because it only moves what is already there.
+	"erode": {"label": "侵蚀", "inputs": 2},
 	"math": {"label": "运算", "inputs": 1},
 	"blend": {"label": "混合", "inputs": 2},
 	"output": {"label": "输出", "inputs": 1},
@@ -81,6 +84,7 @@ const SECOND_INPUT_LABELS := {
 	"follow_path": "相位",
 	"area_warp": "外部",
 	"outline": "遮罩",
+	"erode": "遮罩",
 	"glow": "遮罩",
 	"bloom": "遮罩",
 	"scatter": "密度",
@@ -102,6 +106,10 @@ const BLEND_OPS := ["Mix", "Add", "Multiply", "Screen", "Difference"]
 const ANIM_MODES := ["一次", "循环", "往返"]
 const POLAR_MODES := ["矩形 → 极坐标", "极坐标 → 矩形"]
 const ECHO_MODES := ["最大值（拖影）", "平均值（残影）"]
+## Morphology of the erode node: shrink the bright shape or grow it.
+const ERODE_MODES := ["侵蚀（向内收）", "扩张（向外长）"]
+## Kernel used by the erode node.
+const ERODE_SHAPES := ["方形", "圆形", "菱形"]
 const PATH_SHAPES := ["圆形", "水平", "垂直", "正弦", "方形", "8 字", "自定义"]
 ## Primitives of the shape node.
 const SHAPE_KINDS := ["圆形", "方形", "三角形", "菱形", "星形", "圆环"]
@@ -191,6 +199,7 @@ const NODE_GROUPS := [
 			"edge",
 			"dither",
 			"pixelate",
+			"erode",
 		],
 	},
 	{"label": "合成", "types": ["math", "blend", "output"]},
@@ -255,6 +264,9 @@ var _live_params: Dictionary = {}
 ## Node lookup used by the evaluator, rebuilt once per frame. Without it every
 ## sample would scan the whole node list.
 var _eval_nodes: Dictionary = {}
+## Whole canvas value fields of a branch, built once per generation and size so
+## neighbour reading nodes do not walk the graph again for every sample.
+var _field_cache: Dictionary = {}
 ## Noise nodes already prepared this frame, so their signature string is built
 ## once instead of once per pixel.
 var _noise_checked: Dictionary = {}
@@ -724,6 +736,32 @@ func output_node_id() -> String:
 	return ""
 
 
+## Ids of the nodes the output actually reads: the output plus everything
+## upstream of it. A node parked beside the chain must not change how the picture
+## is generated, however heavy or animated it is.
+func output_chain_ids() -> Array[String]:
+	var output := output_node_id()
+	if output.is_empty():
+		return []
+	# The lookup table is built once so walking the chain stays linear, which
+	# matters because the preview asks for it on every generated frame.
+	var by_id := {}
+	for node: Dictionary in nodes:
+		by_id[str(node["id"])] = node
+	var chain: Array[String] = [output]
+	var stack: Array[String] = [output]
+	while not stack.is_empty():
+		var current: String = stack.pop_back()
+		var node: Dictionary = by_id.get(current, {})
+		if node.is_empty():
+			continue
+		for upstream: String in node["inputs"].values():
+			if not chain.has(upstream):
+				chain.append(upstream)
+				stack.append(upstream)
+	return chain
+
+
 ## Label of the second input port of [param type], shown inside the graph node.
 static func second_input_label(type: String) -> String:
 	return str(SECOND_INPUT_LABELS.get(type, "输入 2"))
@@ -1079,6 +1117,8 @@ static func default_params(type: String) -> Dictionary:
 			return {"matrix": 1, "strength": 0.5}
 		"pixelate":
 			return {"size": 4.0}
+		"erode":
+			return {"mode": 0, "radius": 1.0, "shape": 0, "mix": 1.0}
 		"warp":
 			return {"amount": 0.15}
 		"math":
@@ -1219,8 +1259,12 @@ func _paint_threads() -> int:
 ## once; with it the paint loop only reads.
 func _warm_caches(size: Vector2i) -> void:
 	var probe := Vector2(0.5, 0.5)
-	for node: Dictionary in nodes:
-		var node_id := str(node["id"])
+	# Only the chain the output reads is painted, so only those caches have to be
+	# filled before the workers start. A node beside the chain is not visited.
+	for node_id in output_chain_ids():
+		var node := get_node_by_id(node_id)
+		if node.is_empty():
+			continue
 		# A noise field is sampled for the whole picture at once, and this is the
 		# main thread: building it here is what keeps the workers off that cache.
 		if str(node["type"]) == "noise":
@@ -1402,6 +1446,7 @@ static func _ramp_color(a: Color, mid: Color, b: Color, mid_position: float, t: 
 func _resolve_animations() -> void:
 	_live_params.clear()
 	_eval_nodes.clear()
+	_field_cache.clear()
 	_noise_checked.clear()
 	# The keys and the signatures are rebuilt for every frame, the rasters they
 	# point at are not: a stroke whose node, inputs and time did not change keeps
@@ -1410,13 +1455,23 @@ func _resolve_animations() -> void:
 	_raster_keys.clear()
 	_raster_sigs.clear()
 	_parallel_safe = true
+	# An echo that walks the clock back moves [member time] while it samples, so a
+	# graph whose picture holds one is painted on the main thread only. Only the
+	# chain the output reads counts: an animated echo parked beside it does not
+	# reach the picture, so it must not slow the picture down either.
+	for chain_id in output_chain_ids():
+		var chain_node := get_node_by_id(chain_id)
+		if chain_node.is_empty():
+			continue
+		if (
+			str(chain_node["type"]) == "echo"
+			and bool(chain_node["params"].get("animated", false))
+		):
+			_parallel_safe = false
+			break
 	for node: Dictionary in nodes:
 		var node_id := str(node["id"])
 		var params: Dictionary = node["params"]
-		# An echo that walks the clock back moves [member time] while it samples,
-		# so a graph holding one is painted on the main thread only.
-		if str(node["type"]) == "echo" and bool(params.get("animated", false)):
-			_parallel_safe = false
 		var anim: Variant = params.get("anim", null)
 		if anim is Dictionary:
 			var setting: Dictionary = anim
@@ -1970,6 +2025,64 @@ func _eval(node_id: String, uv: Vector2, size: Vector2i, depth: int) -> float:
 				)
 		var blurred := clampf(blur_total / 9.0, 0.0, 1.0)
 		return lerpf(blur_source, blurred, clampf(float(params.get("mix", 1.0)), 0.0, 1.0))
+	elif node_type == "erode":
+		# Morphology: the darkest sample in the kernel wins, so a bright shape
+		# loses a ring of pixels and keeps the same art inside. This changes the
+		# silhouette itself; a transform would only move it. Dilate takes the
+		# brightest sample and grows the shape back. The branch is read into a
+		# field once per generation, so the kernel costs array reads instead of
+		# walking the whole graph again for every neighbour.
+		var erode_radius := clampf(float(params.get("radius", 1.0)), 0.0, 8.0)
+		var erode_mix := clampf(float(params.get("mix", 1.0)), 0.0, 1.0)
+		var erode_field := _field_of(node, 0, size, depth)
+		if erode_field.is_empty():
+			return 0.0
+		var erode_px := clampi(int(uv.x), 0, size.x - 1)
+		var erode_py := clampi(int(uv.y), 0, size.y - 1)
+		var erode_center := erode_field[erode_py * size.x + erode_px]
+		if erode_radius < 0.01 or erode_mix < 0.001:
+			return erode_center * _mask_at(node, uv, size, depth)
+		var erode_dilate := int(params.get("mode", 0)) == 1
+		var erode_shape := int(params.get("shape", 0))
+		var erode_extent := int(ceil(erode_radius))
+		var erode_result := erode_center
+		var erode_done := false
+		for offset_y in range(-erode_extent, erode_extent + 1):
+			var sample_y := erode_py + offset_y
+			for offset_x in range(-erode_extent, erode_extent + 1):
+				if offset_x == 0 and offset_y == 0:
+					continue
+				if erode_shape == 1 and Vector2(offset_x, offset_y).length() > erode_radius:
+					continue
+				if erode_shape == 2 and float(absi(offset_x) + absi(offset_y)) > erode_radius:
+					continue
+				var sample_x := erode_px + offset_x
+				# Outside the canvas counts as empty, which is what makes a shape
+				# touching the border erode from that side too.
+				var erode_sample := 0.0
+				if (
+					sample_x >= 0
+					and sample_y >= 0
+					and sample_x < size.x
+					and sample_y < size.y
+				):
+					erode_sample = erode_field[sample_y * size.x + sample_x]
+				if erode_dilate:
+					erode_result = maxf(erode_result, erode_sample)
+					# A single full sample already fills this pixel.
+					if erode_result >= 1.0:
+						erode_done = true
+						break
+				else:
+					erode_result = minf(erode_result, erode_sample)
+					# A single empty sample already clears this pixel.
+					if erode_result <= 0.0:
+						erode_done = true
+						break
+			if erode_done:
+				break
+		var erode_value := lerpf(erode_center, erode_result, erode_mix)
+		return clampf(erode_value * _mask_at(node, uv, size, depth), 0.0, 1.0)
 	elif node_type == "outline":
 		# Builds a ring from the silhouette: anything above the threshold counts
 		# as shape. The ring sits on the empty side of the border (outer), on the
@@ -3727,6 +3840,47 @@ static func _fill_polygon(image: Image, flat: PackedVector2Array) -> void:
 			pair += 2
 
 
+## Values of the branch feeding input [param slot] of [param node], one float per
+## pixel. Built once per generation and size, so a node that reads its neighbours
+## pays for the branch once instead of once per sample. Outside the canvas the
+## field is read as empty by the callers.
+func _field_of(
+	node: Dictionary, slot: int, size: Vector2i, depth: int
+) -> PackedFloat32Array:
+	var source_id := _input_id(node, slot)
+	if source_id.is_empty() or size.x <= 0 or size.y <= 0:
+		return PackedFloat32Array()
+	var key := "%s|%d|%d" % [source_id, size.x, size.y]
+	var cached: Variant = _field_cache.get(key, null)
+	if cached != null:
+		var field_value: PackedFloat32Array = cached
+		return field_value
+	var field := PackedFloat32Array()
+	field.resize(size.x * size.y)
+	var index := 0
+	for y in size.y:
+		for x in size.x:
+			field[index] = clampf(
+				_eval(source_id, Vector2(float(x), float(y)), size, depth + 1), 0.0, 1.0
+			)
+			index += 1
+	_field_cache[key] = field
+	return field
+
+
+## Mask of [param node] at [param uv], read from the cached field of the second
+## input. 1 when nothing is connected, so an unmasked node changes nothing.
+func _mask_at(node: Dictionary, uv: Vector2, size: Vector2i, depth: int) -> float:
+	if _input_id(node, 1).is_empty():
+		return 1.0
+	var mask := _field_of(node, 1, size, depth)
+	if mask.is_empty():
+		return 1.0
+	var px := clampi(int(uv.x), 0, size.x - 1)
+	var py := clampi(int(uv.y), 0, size.y - 1)
+	return mask[py * size.x + px]
+
+
 ## Value of the optional mask on the second input, 1 when nothing is connected.
 func _mask_value(node: Dictionary, uv: Vector2, size: Vector2i, depth: int) -> float:
 	var mask_id := _input_id(node, 1)
@@ -4080,10 +4234,18 @@ static func sample_source(
 
 
 ## True when the graph reads the project, so the preview has to be refreshed when
-## the artwork changes underneath it.
+## the artwork changes underneath it. Only the output chain is asked: a canvas
+## node parked beside it never reaches the picture, so it must not make the whole
+## preview follow the artwork.
 func uses_source() -> bool:
-	for node: Dictionary in nodes:
-		if node["type"] == "pixel_art" and int(node["params"].get("source", 0)) == 0:
+	for node_id in output_chain_ids():
+		var chain_node := get_node_by_id(node_id)
+		if chain_node.is_empty():
+			continue
+		if (
+			str(chain_node["type"]) == "pixel_art"
+			and int(chain_node["params"].get("source", 0)) == 0
+		):
 			return true
 	return false
 
@@ -4388,6 +4550,12 @@ static func describe(node: Dictionary) -> String:
 			return DITHER_SIZES_TEXT[clampi(int(params["matrix"]), 0, 2)]
 		"pixelate":
 			return "%d px" % int(params["size"])
+		"erode":
+			return "%s · %.1f px · %s" % [
+				ERODE_MODES[clampi(int(params.get("mode", 0)), 0, ERODE_MODES.size() - 1)],
+				float(params.get("radius", 1.0)),
+				ERODE_SHAPES[clampi(int(params.get("shape", 0)), 0, ERODE_SHAPES.size() - 1)],
+			]
 		"warp":
 			return "%.2f" % float(params.get("amount", 0.15))
 		"math":
@@ -4407,6 +4575,7 @@ func is_expensive() -> bool:
 		"tree",
 		"scatter",
 		"blur",
+		"erode",
 		"outline",
 		"glow",
 		"bloom",
@@ -4415,8 +4584,9 @@ func is_expensive() -> bool:
 		"mesh_warp",
 		"crop_content",
 	]
-	for node: Dictionary in nodes:
-		if HEAVY.has(str(node["type"])):
+	for node_id in output_chain_ids():
+		var node := get_node_by_id(node_id)
+		if not node.is_empty() and HEAVY.has(str(node["type"])):
 			return true
 	return false
 
@@ -4424,25 +4594,29 @@ func is_expensive() -> bool:
 ## True when the graph changes over time, so generating a layer has to produce
 ## one image per frame.
 func uses_time() -> bool:
-	for node: Dictionary in nodes:
+	for node_id in output_chain_ids():
+		var chain_node := get_node_by_id(node_id)
+		if chain_node.is_empty():
+			continue
+		var chain_params: Dictionary = chain_node["params"]
 		# Any animated parameter is a clock of its own, whatever the node does.
-		var anim: Variant = node["params"].get("anim", null)
+		var anim: Variant = chain_params.get("anim", null)
 		if anim is Dictionary and not (anim as Dictionary).is_empty():
 			return true
-		if node["type"] == "time":
+		if chain_node["type"] == "time":
 			return true
-		if node["type"] == "echo" and bool(node["params"].get("animated", false)):
+		if chain_node["type"] == "echo" and bool(chain_params.get("animated", false)):
 			return true
-		if node["type"] == "tree":
-			var tree_params: Dictionary = node["params"]
+		if chain_node["type"] == "tree":
+			var tree_params: Dictionary = chain_params
 			# Sway alone already needs one image per frame, even without growth.
 			if bool(tree_params.get("animate", false)):
 				return true
 			if float(tree_params.get("sway", 0.0)) > 0.0:
 				return true
-		if node["type"] == "particles" and particles_animate(node["params"]):
+		if chain_node["type"] == "particles" and particles_animate(chain_params):
 			return true
-		if node["type"] == "pixel_art" and int(node["params"].get("frame_mode", 0)) == 2:
+		if chain_node["type"] == "pixel_art" and int(chain_params.get("frame_mode", 0)) == 2:
 			return true
 	return false
 
