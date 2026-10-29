@@ -52,8 +52,10 @@ var _tap_point := Vector2.ZERO
 ## mark the tap left behind, and the gesture takes exactly that one back.
 var _tap_history := 0
 ## Swallows the rest of the gesture that opened the dial, so the emulated mouse
-## release cannot reach a tool either.
+## release cannot reach a tool either. A release that never arrives (a finger
+## lifted outside the window) expires instead of blocking every later press.
 var _swallow_release := false
+var _swallow_at := 0
 var sprite_changed_this_frame := false  ## For optimization purposes
 var update_all_layers := false
 ## For optimization purposes. A kind of override to force include a layer during canvas update.
@@ -165,14 +167,15 @@ func _opens_tool_dial(event: InputEvent) -> bool:
 	if mouse.button_index != MOUSE_BUTTON_LEFT:
 		return false
 	if _swallow_release:
-		if not mouse.pressed:
+		if not mouse.pressed or Time.get_ticks_msec() - _swallow_at > 600:
 			_swallow_release = false
-		get_viewport().set_input_as_handled()
-		return true
+		else:
+			get_viewport().set_input_as_handled()
+			return true
 	if not mouse.pressed:
 		# A stroke that moved is not the first half of a double tap, so a click
 		# that follows it cannot cancel a real stroke by mistake.
-		if _screen_point().distance_to(_tap_point) > 4.0:
+		if mouse.position.distance_to(_tap_point) > 4.0:
 			_tap_at = -10000
 		return false
 	# A two or three finger gesture owns the input: two fingers landing close
@@ -181,14 +184,17 @@ func _opens_tool_dial(event: InputEvent) -> bool:
 		return false
 	if not is_instance_valid(Global.control):
 		return false
-	var point := _screen_point()
 	var now := Time.get_ticks_msec()
 	var pair := (
-		now - _tap_at <= DIAL_TAP_MSEC and point.distance_to(_tap_point) <= DIAL_TAP_DISTANCE
+		now - _tap_at <= DIAL_TAP_MSEC
+		and mouse.position.distance_to(_tap_point) <= DIAL_TAP_DISTANCE
 	)
 	if not (pair or mouse.double_click):
 		_tap_at = now
-		_tap_point = point
+		# The position is kept in this viewport's own coordinates. Reading the
+		# mouse instead would fail on a device where the pointer is only updated
+		# on motion, which is exactly how a finger behaves.
+		_tap_point = mouse.position
 		_tap_history = _history_count()
 		return false
 	_tap_at = -10000
@@ -199,8 +205,9 @@ func _opens_tool_dial(event: InputEvent) -> bool:
 		var project := Global.current_project
 		if project != null:
 			project.commit_undo()
-	_open_tool_dial(point)
+	_open_tool_dial(_screen_point(mouse.position))
 	_swallow_release = true
+	_swallow_at = now
 	get_viewport().set_input_as_handled()
 	return true
 
@@ -214,12 +221,13 @@ func _history_count() -> int:
 	return project.undo_redo.get_history_count()
 
 
-## Screen position of the pointer, for placing the dial in the interface.
-func _screen_point() -> Vector2:
+## Window position of a point of this viewport, for placing the dial in the
+## interface above the canvas.
+func _screen_point(local_point: Vector2) -> Vector2:
 	var container := get_viewport().get_parent() as SubViewportContainer
 	if container == null:
-		return Vector2.ZERO
-	return container.get_global_mouse_position()
+		return local_point
+	return container.global_position + local_point
 
 
 ## Builds the ring from the side toolbar's own buttons, so the icons are exactly
