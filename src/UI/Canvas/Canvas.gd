@@ -66,6 +66,8 @@ var _swallow_at := 0
 ## must be able to cancel the dial before it is ever seen.
 var _pending_dial := false
 var _pending_dial_point := Vector2.ZERO
+var _pending_dial_history := 0
+var _pending_dial_snapshots: Array = []
 ## Pictures of the cels of the frame the last tap landed on. A double tap puts
 ## them back verbatim, so no tool can leave a mark behind, whatever its own undo
 ## handling does. Each entry is {cel, image}.
@@ -220,17 +222,14 @@ func _opens_tool_dial(event: InputEvent) -> bool:
 		_take_tap_snapshot()
 		return false
 	_tap_at = -10000
-	# Take back what the first tap drew. A stroke that is still running is
-	# cancelled, and a step that was already committed is undone once.
-	Tools.cancel_active_tool()
-	var project := Global.current_project
-	if project != null and _history_count() > _tap_history:
-		project.commit_undo()
-	# Whatever the tool and its undo did, the cel goes back to the picture it had
-	# before the tap, so a fill or a stroke cannot be left behind.
-	_restore_tap_snapshot()
+	# Taking the mark back waits a moment: a touch tool holds its press for about
+	# 60ms before it starts drawing, and reverting before that lands would miss
+	# exactly the mark this is meant to remove.
 	_pending_dial = true
 	_pending_dial_point = _screen_point(mouse.position)
+	_pending_dial_history = _tap_history
+	_pending_dial_snapshots = _tap_snapshots.duplicate()
+	_tap_snapshots.clear()
 	call_deferred("_open_pending_dial")
 	_swallow_release = true
 	_swallow_at = now
@@ -239,16 +238,32 @@ func _opens_tool_dial(event: InputEvent) -> bool:
 
 
 ## Opens the dial once the frame is over, unless a second finger turned the tap
-## into a pinch or a multi finger tap in the meantime.
+## into a pinch or a multi finger tap in the meantime. The mark of the first tap
+## is taken back here too, after its own deferred press had time to land.
 func _open_pending_dial() -> void:
 	if not _pending_dial:
 		return
 	_pending_dial = false
+	var point := _pending_dial_point
+	var history := _pending_dial_history
+	var snapshots := _pending_dial_snapshots
+	_pending_dial_snapshots = []
+	# Let the tap's deferred press finish first, so its mark exists to be undone.
+	await get_tree().create_timer(0.09).timeout
 	if Tools.hold_to_pick_active:
+		# A gesture owns the input: its fingers must not have drawn either.
+		_restore_snapshots(snapshots)
 		return
+	Tools.cancel_active_tool()
+	var project := Global.current_project
+	if project != null and _history_count() > history:
+		project.commit_undo()
+	# Whatever the tool and its undo did, the cels go back to the picture they had
+	# before the tap, so a fill or a stroke cannot be left behind.
+	_restore_snapshots(snapshots)
 	if Time.get_ticks_msec() - Global.last_multi_finger_msec <= DIAL_TAP_MSEC:
 		return
-	_open_tool_dial(_pending_dial_point)
+	_open_tool_dial(point)
 
 
 ## Remembers the picture of every cel of the current frame before a tap does
@@ -278,9 +293,9 @@ func _take_tap_snapshot() -> void:
 
 ## Puts every cel of the frame back the way it was before the tap and redraws
 ## them, so whatever the tool changed the picture is exactly the old one again.
-func _restore_tap_snapshot() -> void:
-	var entries := _tap_snapshots.duplicate()
-	_tap_snapshots.clear()
+## The entries are handed in, because the gesture takes them when it is recognised
+## and restores them a moment later.
+func _restore_snapshots(entries: Array) -> void:
 	var restored := false
 	for entry: Dictionary in entries:
 		var cel: BaseCel = entry["cel"]
