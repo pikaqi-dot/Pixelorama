@@ -34,6 +34,30 @@
 
 `user://` 在 Android 上位于应用私有目录，用文件管理器不易直接看到；需要拿到系统相册/下载目录的话，在「名称 + 绝对路径」里填一个可写路径再「添加」。
 
+## 手填地址
+
+两侧面板上都有「本机地址（填到对方）」一行，**点「开始」之前就在**（此时只有地址、没有端口，因为还没开始监听），点开始后补上 `:45990` 这样的端口。点「复制」就能把这一串原样填到对方的「按地址连接」里。
+
+- 网卡多的机器（Hyper-V、WSL、ZeroTier、Tailscale）会有一堆地址。这一行给的是网卡名像 `WLAN`、`以太网`、`wlan0` 的那一条；其余地址收在鼠标悬停提示里，日志里也会打印 `本机网卡：WLAN 10.52.20.82 …`。
+- 手机上「本机地址」在 Wi-Fi 重新连接后会自动刷新（每 2 秒一次），不用退出页面。
+
+## Windows 防火墙
+
+两边都在同一网段却怎么都连不上时，先看入站是否被拦：
+
+```
+netsh advfirewall show currentprofile
+```
+
+若「公用配置文件」是「启用」且策略为 `BlockInbound`，手机发来的 TCP 握手会被直接丢掉（广播包也一样）。最省事的是把当前 Wi-Fi 改成「专用网络」（设置 → 网络和 Internet → WLAN → 属性 → 网络配置文件：专用），专用配置文件的防火墙通常是关的；要用命令放行则需要管理员权限：
+
+```
+netsh advfirewall firewall add rule name="Pixelorama LAN Sync" dir=in action=allow protocol=TCP localport=45990-45997
+netsh advfirewall firewall add rule name="Pixelorama LAN Sync UDP" dir=in action=allow protocol=UDP localport=45999
+```
+
+如果上面命令里 `LocalFirewallRules` 显示 `N/A (仅 GPO 存储)`，说明规则由组策略下发，本机加的规则可能被覆盖——那就只能改网络配置文件或让管理员改组策略。
+
 ## 限制与注意
 
 - 单文件上限 1.5 MB，单次每个文件夹最多 4000 个文件；超过的会被跳过并写进日志。

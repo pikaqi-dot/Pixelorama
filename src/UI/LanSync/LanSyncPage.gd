@@ -19,6 +19,7 @@ var _folders: ItemList
 var _peers: ItemList
 var _log: RichTextLabel
 var _status: Label
+var _endpoint_edit: LineEdit
 var _name_edit: LineEdit
 var _path_edit: LineEdit
 var _address_edit: LineEdit
@@ -43,6 +44,14 @@ func _ready() -> void:
 	_refresh_folders()
 	_refresh_peers()
 	_refresh_status()
+	# The Wi-Fi address changes when the phone reconnects, and the whole point of
+	# the line is that it can be read out at the moment it is needed.
+	var refresh := Timer.new()
+	refresh.wait_time = 2.0
+	refresh.autostart = true
+	refresh.timeout.connect(_refresh_status)
+	add_child(refresh)
+	_on_log("本机网卡：%s" % str(_core.local_details()))
 	_on_log("文件夹名两侧要一致；默认都是 %s" % DEFAULT_NAME)
 
 
@@ -52,6 +61,7 @@ func is_open() -> bool:
 
 func open_page() -> void:
 	visible = true
+	_refresh_status()
 
 
 func pause_page() -> void:
@@ -83,6 +93,19 @@ func _build() -> void:
 	_status.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	_status.add_theme_font_size_override("font_size", 13)
 	column.add_child(_status)
+
+	# Its own row, not a line inside the status text: this is the one thing that
+	# has to be read off a phone screen and typed into another machine, so it has
+	# to be selectable and it has to be there before anything is started.
+	column.add_child(_heading("本机地址（填到对方）"))
+	var endpoint_row := HBoxContainer.new()
+	column.add_child(endpoint_row)
+	_endpoint_edit = LineEdit.new()
+	_endpoint_edit.editable = false
+	_endpoint_edit.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_endpoint_edit.custom_minimum_size = Vector2(0, ROW_HEIGHT)
+	endpoint_row.add_child(_endpoint_edit)
+	endpoint_row.add_child(_button("复制", _on_copy_endpoint))
 
 	column.add_child(_heading("同步文件夹"))
 	_folders = ItemList.new()
@@ -171,12 +194,22 @@ func _refresh_peers() -> void:
 func _refresh_status() -> void:
 	if _core == null:
 		return
-	if not _core.running:
+	if _core.running:
+		_status.text = "运行中 · 文件夹 %d 个" % _core.folders.size()
+	else:
 		_status.text = "未开始 · 点「开始」让同一局域网里的编辑器找到这台设备"
+	# Updated even while stopped: the address is what gets typed in by hand when
+	# nothing else works, so it must not wait on a successful start.
+	_endpoint_edit.text = str(_core.primary_endpoint())
+	_endpoint_edit.tooltip_text = "全部地址：%s" % str(_core.local_endpoints())
+
+
+func _on_copy_endpoint() -> void:
+	var text := _endpoint_edit.text.strip_edges()
+	if text.is_empty():
 		return
-	_status.text = "运行中 · 文件夹 %d 个\n本机地址（可直接填到对方）%s" % [
-		_core.folders.size(), str(_core.local_endpoints())
-	]
+	DisplayServer.clipboard_set(text)
+	_on_log("已复制本机地址 %s" % text)
 
 
 func _on_start_pressed() -> void:

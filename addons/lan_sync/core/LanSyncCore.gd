@@ -177,47 +177,113 @@ func scan() -> void:
 ## The IPv4 addresses this device answers on, for the status line. Somebody has to
 ## read one of these out loud when the two sides cannot find each other.
 func local_addresses() -> String:
-	return ", ".join(_local_ipv4())
+	var list: Array[String] = []
+	for entry: Dictionary in local_ipv4_entries():
+		list.append(str(entry["address"]))
+	return ", ".join(list)
 
 
 ## The same addresses with the port attached. "10.52.20.82:45990" is the exact text
 ## to type on the other device, so it is handed over ready-made instead of being
 ## assembled from two separate lines by eye.
 func local_endpoints() -> String:
-	var port_text := "?"
-	if sync_port > 0:
-		port_text = str(sync_port)
 	var list: Array[String] = []
-	for address: String in _local_ipv4():
-		list.append("%s:%s" % [address, port_text])
+	for entry: Dictionary in local_ipv4_entries():
+		var text := str(entry["address"])
+		if sync_port > 0:
+			text += ":%d" % sync_port
+		list.append(text)
 	return ", ".join(list)
 
 
-## The usable addresses, best first. A desktop easily carries half a dozen from
-## virtual adapters and VPNs, and the ones nobody can reach from the phone are
-## exactly the ones that crowd a status line, so they are pushed to the end.
-func _local_ipv4() -> Array[String]:
-	var direct: Array[String] = []
-	var host_only: Array[String] = []
-	for address: String in IP.get_local_addresses():
-		if address.contains(":") or address.begins_with("127."):
-			continue
-		if address.begins_with("169.254."):
-			continue
-		var parts := address.split(".")
-		if parts.size() != 4:
-			continue
-		# Carrier grade NAT, which is what a tunnel hands out, is never the LAN.
-		if int(parts[0]) == 100 and int(parts[1]) >= 64 and int(parts[1]) <= 127:
-			continue
-		# Hyper-V, WSL and VPN switches hold the ".1" end of their own network:
-		# nothing but this machine answers there, so they go last.
-		if address.ends_with(".1"):
-			host_only.append(address)
+## The one to read out loud: the first address, which is the Wi-Fi whenever the
+## system reports one, with the port once the listener is up.
+func primary_endpoint() -> String:
+	var entries := local_ipv4_entries()
+	if entries.is_empty():
+		return ""
+	var text := str(entries[0]["address"])
+	if sync_port > 0:
+		text += ":%d" % sync_port
+	return text
+
+
+## Interface by interface, for the log. On a phone the Wi-Fi is "wlan0" and the
+## cellular link is "rmnet_data0"; which one is the Wi-Fi is the whole question
+## when nothing connects, so the name is kept next to the address.
+func local_details() -> String:
+	var list: Array[String] = []
+	for entry: Dictionary in local_ipv4_entries():
+		var nic_name := str(entry["interface"])
+		if nic_name.is_empty():
+			list.append(str(entry["address"]))
 		else:
-			direct.append(address)
-	direct.append_array(host_only)
-	return direct
+			list.append("%s %s" % [nic_name, str(entry["address"])])
+	return ", ".join(list)
+
+
+## Every usable IPv4 with the adapter that owns it, most reachable first. This
+## asks the interfaces rather than the flat address list because only the
+## interface knows which address is the Wi-Fi: a desktop carries a dozen from
+## Hyper-V, WSL and tunnels, and those are the ones a phone can never reach.
+func local_ipv4_entries() -> Array[Dictionary]:
+	var lan: Array[Dictionary] = []
+	var other: Array[Dictionary] = []
+	var host_only: Array[Dictionary] = []
+	var seen: Dictionary = {}
+	for nic: Dictionary in IP.get_local_interfaces():
+		# Windows puts a GUID in "name" and the readable one in "friendly"; Linux
+		# and Android already hand over "wlan0" in "name". The readable name is
+		# what says which adapter is the Wi-Fi, so it wins when it is there.
+		var nic_name := str(nic.get("friendly", ""))
+		if nic_name.is_empty():
+			nic_name = str(nic.get("name", ""))
+		var nic_key := nic_name.to_lower()
+		var addresses: PackedStringArray = nic.get("addresses", PackedStringArray())
+		for address: String in addresses:
+			var usable := _usable_ipv4(address)
+			if usable.is_empty() or seen.has(usable):
+				continue
+			seen[usable] = true
+			var entry := {"address": usable, "interface": nic_name}
+			if usable.ends_with(".1"):
+				host_only.append(entry)
+			elif nic_key.begins_with("wl") or nic_key.begins_with("wifi") \
+					or nic_key.begins_with("eth") or nic_key.begins_with("en") \
+					or nic_key.begins_with("ap") or nic_key.begins_with("以太"):
+				lan.append(entry)
+			else:
+				other.append(entry)
+	# An empty enumeration happens on platforms where the interface list is not
+	# wired up; the flat list still answers, it just cannot name the adapter.
+	if seen.is_empty():
+		for address: String in IP.get_local_addresses():
+			var fallback := _usable_ipv4(address)
+			if fallback.is_empty() or seen.has(fallback):
+				continue
+			seen[fallback] = true
+			other.append({"address": fallback, "interface": ""})
+	var result: Array[Dictionary] = []
+	result.append_array(lan)
+	result.append_array(other)
+	result.append_array(host_only)
+	return result
+
+
+## The address when the LAN could reach it, and an empty string when it could not:
+## IPv6, loopback, link local, and the carrier grade NAT a tunnel hands out all
+## look like an answer and are none.
+func _usable_ipv4(address: String) -> String:
+	if address.is_empty() or address.contains(":"):
+		return ""
+	if address.begins_with("127.") or address.begins_with("169.254."):
+		return ""
+	var parts := address.split(".")
+	if parts.size() != 4:
+		return ""
+	if int(parts[0]) == 100 and int(parts[1]) >= 64 and int(parts[1]) <= 127:
+		return ""
+	return address
 
 
 ## Answers the device that asked to sync. Nothing moves until this is called, on

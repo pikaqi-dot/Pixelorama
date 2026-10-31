@@ -17,6 +17,7 @@ var _folders: ItemList
 var _peers: ItemList
 var _log: RichTextLabel
 var _status: Label
+var _endpoint_edit: LineEdit
 var _name_edit: LineEdit
 var _path_edit: LineEdit
 var _address_edit: LineEdit
@@ -39,6 +40,7 @@ func _ready() -> void:
 	_refresh_folders()
 	_refresh_peers()
 	_refresh_status()
+	_on_log("本机网卡：%s" % str(_core.local_details()))
 	_on_log("文件夹名两侧要一致；默认都是 %s" % DEFAULT_NAME)
 
 
@@ -62,6 +64,21 @@ func _build() -> void:
 	_status = Label.new()
 	_status.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	add_child(_status)
+
+	# The address this machine answers on, on its own row: it is the one string
+	# somebody types into the other device, so it must be copyable and present
+	# before anything is started.
+	add_child(_heading("本机地址（填到对方）"))
+	var endpoint_row := HBoxContainer.new()
+	_endpoint_edit = LineEdit.new()
+	_endpoint_edit.editable = false
+	_endpoint_edit.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	endpoint_row.add_child(_endpoint_edit)
+	var copy_button := Button.new()
+	copy_button.text = "复制"
+	copy_button.pressed.connect(_on_copy_endpoint)
+	endpoint_row.add_child(copy_button)
+	add_child(endpoint_row)
 
 	add_child(_heading("同步文件夹"))
 	_folders = ItemList.new()
@@ -154,12 +171,22 @@ func _refresh_peers() -> void:
 func _refresh_status() -> void:
 	if _core == null:
 		return
-	if not _core.running:
-		_status.text = "未开始"
+	if _core.running:
+		_status.text = "运行中 · %s" % str(_core.label)
+	else:
+		_status.text = "未开始 · 点「开始」才会监听"
+	# Updated even while stopped: the address is what gets typed in by hand when
+	# nothing else works, so it must not wait on a successful start.
+	_endpoint_edit.text = str(_core.primary_endpoint())
+	_endpoint_edit.tooltip_text = "全部地址：%s" % str(_core.local_endpoints())
+
+
+func _on_copy_endpoint() -> void:
+	var text := _endpoint_edit.text.strip_edges()
+	if text.is_empty():
 		return
-	_status.text = "运行中 · %s\n本机地址（可直接填到对方）%s" % [
-		str(_core.label), str(_core.local_endpoints())
-	]
+	DisplayServer.clipboard_set(text)
+	_on_log("已复制本机地址 %s" % text)
 
 
 func _on_start_pressed() -> void:
