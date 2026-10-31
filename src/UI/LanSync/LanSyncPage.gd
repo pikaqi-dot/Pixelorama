@@ -66,11 +66,18 @@ func open_page() -> void:
 
 
 func pause_page() -> void:
+	# Hidden, not merely idle. A page left visible while another tab is in front
+	# sits on top of the canvas and takes its clicks, which is exactly how it
+	# looked on the phone: the drawing tab seemed broken under a panel that was
+	# supposed to be gone. The sync engine is a child node and keeps running.
+	visible = false
 	set_process(false)
 
 
 func resume_page() -> void:
+	visible = true
 	set_process(true)
+	_refresh_status()
 
 
 func _build() -> void:
@@ -194,7 +201,7 @@ func _refresh_peers() -> void:
 
 
 func _refresh_status() -> void:
-	if _core == null:
+	if _core == null or not visible:
 		return
 	if _core.running:
 		_status.text = "运行中 · 文件夹 %d 个" % _core.folders.size()
