@@ -142,6 +142,8 @@ var _shader_composer: Control
 var _tilemap_page: Control
 ## Game playground that tries a tilemap with a controllable hero.
 var _game_page: Control
+## File sync page, which talks to the editor dock over the local network.
+var _lan_sync_page: Control
 ## Project whose page data the pages currently hold, so switching tabs does not
 ## reload the pages (and their unsaved work) over and over.
 var _state_project: Project
@@ -1081,6 +1083,7 @@ func _ensure_view_tabs() -> void:
 	_view_tabs.add_tab("节点图层")
 	_view_tabs.add_tab("Tilemap")
 	_view_tabs.add_tab("游戏")
+	_view_tabs.add_tab("同步")
 	_view_tabs.tab_changed.connect(_on_view_tab_changed)
 	bar.add_child(_view_tabs)
 	# Both views start right below the strip, so nothing jumps when switching.
@@ -1133,6 +1136,20 @@ func _ensure_game_page() -> void:
 	_apply_page_state(_game_page, "game")
 
 
+## Creates the sync page on first use. It keeps its own engine running while the
+## drawing tab is in front, so a file can arrive at any time.
+func _ensure_lan_sync_page() -> void:
+	if is_instance_valid(_lan_sync_page):
+		return
+	_lan_sync_page = load("res://src/UI/LanSync/LanSyncPage.gd").new()
+	add_child(_lan_sync_page)
+	_lan_sync_page.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	_lan_sync_page.offset_top = VIEW_TABS_HEIGHT
+	_lan_sync_page.visible = false
+	if _lan_sync_page.has_signal("page_closed"):
+		_lan_sync_page.connect("page_closed", _on_lan_sync_closed)
+
+
 func _on_view_tab_changed(tab: int) -> void:
 	if tab == 1 and not is_instance_valid(_shader_composer):
 		_ensure_shader_composer()
@@ -1145,6 +1162,10 @@ func _on_view_tab_changed(tab: int) -> void:
 		_ensure_game_page()
 		if not _game_page.call("is_open"):
 			_game_page.call("open_page")
+	if tab == 4:
+		_ensure_lan_sync_page()
+		if not _lan_sync_page.call("is_open"):
+			_lan_sync_page.call("open_page")
 	_show_view(tab)
 
 
@@ -1162,12 +1183,16 @@ func _show_view(tab: int) -> void:
 		_tilemap_page.call("pause_page")
 	if tab != 3 and is_instance_valid(_game_page):
 		_game_page.call("pause_page")
+	if tab != 4 and is_instance_valid(_lan_sync_page):
+		_lan_sync_page.call("pause_page")
 	if tab == 1 and is_instance_valid(_shader_composer):
 		_shader_composer.call("resume_page")
 	if tab == 2 and is_instance_valid(_tilemap_page):
 		_tilemap_page.call("resume_page")
 	if tab == 3 and is_instance_valid(_game_page):
 		_game_page.call("resume_page")
+	if tab == 4 and is_instance_valid(_lan_sync_page):
+		_lan_sync_page.call("resume_page")
 	Global.can_draw = show_drawing
 
 
@@ -1187,6 +1212,14 @@ func _on_tilemap_closed() -> void:
 
 ## The close button of the game page brings the drawing tab back.
 func _on_game_closed() -> void:
+	if is_instance_valid(_view_tabs):
+		_view_tabs.current_tab = 0
+	_show_view(0)
+
+
+## The close button of the sync page brings the drawing tab back. The sync itself
+## keeps running, so a file sent from the editor still lands.
+func _on_lan_sync_closed() -> void:
 	if is_instance_valid(_view_tabs):
 		_view_tabs.current_tab = 0
 	_show_view(0)
