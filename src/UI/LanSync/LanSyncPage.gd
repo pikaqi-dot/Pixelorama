@@ -11,6 +11,8 @@ const CoreScript := preload("res://addons/lan_sync/core/LanSyncCore.gd")
 ## own, so a fresh build and a fresh dock line up with no setup at all.
 const DEFAULT_NAME := "shared"
 const DEFAULT_FOLDER := "user://lan_shared"
+## Sub-folder of the system Downloads directory used on a phone.
+const DOWNLOADS_SUBDIR := "Pixelorama"
 const ROW_HEIGHT := 44
 const MARGIN := 14
 
@@ -39,9 +41,12 @@ func _ready() -> void:
 	_core.consent_requested.connect(_on_consent_requested)
 	add_child(_core)
 	if _core.folders.is_empty():
-		var absolute := ProjectSettings.globalize_path(DEFAULT_FOLDER)
+		var absolute := ProjectSettings.globalize_path(default_shared_root())
+		absolute = absolute.path_join(DEFAULT_NAME)
 		DirAccess.make_dir_recursive_absolute(absolute)
 		_core.set_folder(DEFAULT_NAME, absolute)
+	else:
+		_migrate_private_folders()
 	_refresh_folders()
 	_refresh_peers()
 	_refresh_status()
@@ -54,6 +59,90 @@ func _ready() -> void:
 	add_child(refresh)
 	_on_log("本机网卡：%s" % str(_core.local_details()))
 	_on_log("文件夹名两侧要一致；默认都是 %s" % DEFAULT_NAME)
+
+
+## Where a new folder is created by default.
+##
+## On a phone the whole point is usually to get files out of the application, and
+## its private directory is invisible to every file manager and gallery, so the
+## system Downloads folder is used there — but only when it can really be written
+## to, because storage scoping refuses it on some devices and a shared folder
+## nobody can write to would be worse than a private one that works. The two
+## arguments exist so the phone branch can be exercised from a desktop.
+func default_shared_root(platform: String = "", downloads_dir: String = "") -> String:
+	var system := platform if not platform.is_empty() else OS.get_name()
+	if system != "Android":
+		return DEFAULT_FOLDER
+	var downloads := downloads_dir
+	if downloads.is_empty():
+		downloads = OS.get_system_dir(OS.SYSTEM_DIR_DOWNLOADS)
+	if downloads.is_empty():
+		return DEFAULT_FOLDER
+	var candidate := downloads.path_join(DOWNLOADS_SUBDIR)
+	if _writable(candidate):
+		return candidate
+	return DEFAULT_FOLDER
+
+
+## Whether a directory can be created and a file dropped in it. Asked rather than
+## assumed: on Android the answer depends on the storage scope, not on the path
+## looking right.
+func _writable(dir: String) -> bool:
+	DirAccess.make_dir_recursive_absolute(dir)
+	if not DirAccess.dir_exists_absolute(dir):
+		return false
+	var probe := dir.path_join(".lan_sync_write_probe")
+	var file := FileAccess.open(probe, FileAccess.WRITE)
+	if file == null:
+		return false
+	file.store_string("ok")
+	file.close()
+	DirAccess.remove_absolute(probe)
+	return true
+
+
+## A phone built before the Downloads default keeps its folder inside the app's
+## private directory, where nothing can see the files that arrive. Those entries
+## are moved once, files and all, so an update does not quietly change where
+## things live without saying so.
+func _migrate_private_folders(platform: String = "", downloads_dir: String = "") -> void:
+	var system := platform if not platform.is_empty() else OS.get_name()
+	if system != "Android":
+		return
+	var private_root := ProjectSettings.globalize_path(DEFAULT_FOLDER)
+	var root := ProjectSettings.globalize_path(default_shared_root(platform, downloads_dir))
+	if root == private_root:
+		return
+	for folder_name: String in _core.folders.keys():
+		var current := str(_core.folders[folder_name])
+		if not current.begins_with(private_root):
+			continue
+		var target := root.path_join(folder_name)
+		DirAccess.make_dir_recursive_absolute(target)
+		_copy_tree(current, target)
+		_core.set_folder(folder_name, target)
+		_on_log("%s 已移到 %s" % [folder_name, target])
+
+
+## Copies what the old folder held, without overwriting anything already there:
+## which copy is newer is the sync's decision, not a migration's.
+func _copy_tree(from_dir: String, to_dir: String) -> void:
+	var directory := DirAccess.open(from_dir)
+	if directory == null:
+		return
+	directory.list_dir_begin()
+	var entry := directory.get_next()
+	while not entry.is_empty():
+		if not entry.begins_with("."):
+			var source := from_dir.path_join(entry)
+			var target := to_dir.path_join(entry)
+			if directory.current_is_dir():
+				DirAccess.make_dir_recursive_absolute(target)
+				_copy_tree(source, target)
+			elif not FileAccess.file_exists(target):
+				DirAccess.copy_absolute(source, target)
+		entry = directory.get_next()
+	directory.list_dir_end()
 
 
 func is_open() -> bool:
@@ -129,6 +218,7 @@ func _build() -> void:
 	var folder_row := HBoxContainer.new()
 	folder_row.add_child(_button("浏览", _on_browse_folder))
 	folder_row.add_child(_button("添加", _on_add_folder))
+	folder_row.add_child(_button("移到下载目录", _on_use_downloads))
 	folder_row.add_child(_button("移除选中", _on_remove_folder))
 	column.add_child(folder_row)
 
@@ -244,7 +334,7 @@ func _on_add_folder() -> void:
 		_on_log("先点「浏览」选一个目录，或在「名称」里起个名字")
 		return
 	if path.is_empty():
-		path = ProjectSettings.globalize_path(DEFAULT_FOLDER.path_join(folder_name))
+		path = ProjectSettings.globalize_path(default_shared_root()).path_join(folder_name)
 	DirAccess.make_dir_recursive_absolute(path)
 	_core.set_folder(folder_name, path)
 	_name_edit.clear()
@@ -265,7 +355,7 @@ func _on_browse_folder() -> void:
 	# picker only reaches the folders the system grants, while this one can at
 	# least always show the app's own directory where the default shared folder
 	# lives.
-	_browse_dialog.current_dir = ProjectSettings.globalize_path("user://")
+	_browse_dialog.current_dir = ProjectSettings.globalize_path(default_shared_root())
 	_browse_dialog.dir_selected.connect(_on_folder_picked)
 	add_child(_browse_dialog)
 	_browse_dialog.popup_centered(Vector2i(int(size.x * 0.92), int(size.y * 0.85)))
@@ -280,6 +370,30 @@ func _on_folder_picked(path: String) -> void:
 ## The last segment of a path, which is the folder name on both sides.
 func _name_from_path(path: String) -> String:
 	return path.replace("\\", "/").trim_suffix("/").get_file()
+
+
+## The folder operation a phone makes people want: move a shared folder somewhere
+## a file manager and a gallery can actually see, without typing a path.
+func _on_use_downloads() -> void:
+	var selected := _folders.get_selected_items()
+	var names: Array = _core.folders.keys()
+	if selected.is_empty() or int(selected[0]) >= names.size():
+		_on_log("先在列表里选中一个文件夹")
+		return
+	var folder_name := str(names[int(selected[0])])
+	var root := ProjectSettings.globalize_path(default_shared_root())
+	if root == ProjectSettings.globalize_path(DEFAULT_FOLDER):
+		_on_log("这台设备没有可写的下载目录，文件留在 %s" % root)
+		return
+	var target := root.path_join(folder_name)
+	if str(_core.folders[folder_name]) == target:
+		_on_log("%s 已经在下载目录里了" % folder_name)
+		return
+	DirAccess.make_dir_recursive_absolute(target)
+	_copy_tree(str(_core.folders[folder_name]), target)
+	_core.set_folder(folder_name, target)
+	_refresh_folders()
+	_on_log("%s → %s" % [folder_name, target])
 
 
 func _on_remove_folder() -> void:
