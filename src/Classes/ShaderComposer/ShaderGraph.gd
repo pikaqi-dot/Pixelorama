@@ -3760,6 +3760,13 @@ func _scatter_image(
 			func(a: Dictionary, b: Dictionary) -> bool:
 				return float((a["position"] as Vector2).y) < float((b["position"] as Vector2).y)
 		)
+	# A brush that is not a canvas is drawn once for the whole field. A canvas is
+	# left alone: it resolves its own crop and channel per stamp, which is a
+	# different job from reading a value field.
+	var brush: Image = null
+	var brush_node := get_node_by_id(source_id)
+	if not brush_node.is_empty() and str(brush_node["type"]) != "pixel_art":
+		brush = _brush_field(source_id, size, depth)
 	for place: Dictionary in placements:
 		_stamp_source(
 			image,
@@ -3772,7 +3779,8 @@ func _scatter_image(
 			depth,
 			float(place["level"]),
 			tile,
-			sort_y
+			sort_y,
+			brush
 		)
 	_path_cache[key] = image
 	return image
@@ -3839,6 +3847,33 @@ func _branch_image(node_id: String, size: Vector2i, depth: int) -> Image:
 		"path":
 			return _path_image(owner, params, size)
 	return null
+
+
+## Whole picture of a brush branch, drawn once and cached across frames. A brush
+## that is a chain of transform nodes over a raster has no image of its own, so
+## the scatter used to sample the whole branch again for every pixel of every
+## stamp; with a hundred blades in the field that was most of a frame.
+func _brush_field(source_id: String, size: Vector2i, depth: int) -> Image:
+	if source_id.is_empty():
+		return null
+	if get_node_by_id(source_id).is_empty():
+		return null
+	# A branch that already owns a picture hands it over without a copy.
+	var direct := _branch_image(source_id, size, depth)
+	if direct != null:
+		return direct
+	var key := _raster_key(source_id, size)
+	if _path_cache.has(key):
+		return _path_cache[key]
+	var image := Image.create_empty(size.x, size.y, false, Image.FORMAT_RGBA8)
+	image.fill(Color(0.0, 0.0, 0.0, 0.0))
+	for y in size.y:
+		for x in size.x:
+			var value := clampf(_eval(source_id, Vector2(x, y), size, depth + 1), 0.0, 1.0)
+			if value > 0.0:
+				image.set_pixel(x, y, Color(value, value, value, 1.0))
+	_path_cache[key] = image
+	return image
 	
 	
 ## Points of the drawn part of a branch, in 0..1 canvas coordinates, in the order
@@ -3893,7 +3928,8 @@ func _stamp_source(
 	depth: int,
 	level := 1.0,
 	tile := false,
-	overwrite := false
+	overwrite := false,
+	prebuilt: Image = null
 ) -> void:
 	var scaled := footprint * maxf(scale, 0.01)
 	var reach := int(ceil(scaled.length() * 0.5)) + 1
@@ -3938,11 +3974,18 @@ func _stamp_source(
 			if absf(brush_local.x) > 0.5 or absf(brush_local.y) > 0.5:
 				continue
 			var uv := (brush_local + Vector2(0.5, 0.5)) * size_vec
-			var mask := (
-				sample_source(mask_image, 1, false, uv, size, mask_crop)
-				if mask_image != null
-				else _eval(source_id, uv, size, depth + 1)
-			)
+			var mask := 0.0
+			if mask_image != null:
+				mask = sample_source(mask_image, 1, false, uv, size, mask_crop)
+			elif prebuilt != null:
+				# The brush was drawn once for the whole field, so a stamp is a read
+				# instead of an evaluation of the branch for every one of its pixels.
+				mask = prebuilt.get_pixel(
+					clampi(int(uv.x), 0, prebuilt.get_width() - 1),
+					clampi(int(uv.y), 0, prebuilt.get_height() - 1)
+				).r
+			else:
+				mask = _eval(source_id, uv, size, depth + 1)
 			var value := clampf(mask * level, 0.0, 1.0)
 			if value <= 0.0:
 				continue
@@ -5293,29 +5336,27 @@ func build_model3d_preset() -> void:
 
 
 ## Replaces the graph with a patch of pixel grass, the way the demo builds one: a
-## single toon shaded blade is the stamp and the scatter node lays a field of them
-## down at random angles and sizes, with the brightness of each one wandering so
-## the patch is not painted with one brush.
+## single blade is the stamp, the scatter lays down a field of them, and a vertical
+## gradient thins the field out towards the top. The gradient is the part that
+## makes it read as ground cover instead of a sprinkle of blades over the whole
+## picture, and the brightness of every stamp wandering is what gives it depth.
 func build_grass_preset() -> void:
 	nodes.clear()
 	groups.clear()
 	_noise_cache.clear()
 	_noise_signature.clear()
 	var blade := add_node("model3d", Vector2(20, 40))
-	var squash := add_node("scale", Vector2(220, 40))
-	var field := add_node("scatter", Vector2(400, 40))
-	var pusher := add_node("radial", Vector2(220, 260))
-	var out := add_node("output", Vector2(640, 40))
+	var squash := add_node("scale", Vector2(200, 40))
+	var field := add_node("scatter", Vector2(380, 40))
+	var cover := add_node("gradient", Vector2(200, 280))
+	var out := add_node("output", Vector2(620, 40))
 	connect_nodes(blade, squash, 0)
 	connect_nodes(squash, field, 0)
-	connect_nodes(pusher, field, 1)
+	connect_nodes(cover, field, 1)
 	connect_nodes(field, out, 0)
-	# Something standing in the patch: a soft disc whose bright middle shoves the
-	# blades away, the way the demo lets a character part its grass.
-	get_node_by_id(pusher)["params"].merge(
-		{"center_x": 0.5, "center_y": 0.62, "radius": 0.2, "falloff": 1.4, "invert": false},
-		true
-	)
+	# Dense at the bottom, thin at the top: a gradient this steep leaves the lower
+	# half almost solid and lets the blades stand on their own higher up.
+	get_node_by_id(cover)["params"].merge({"angle": 90.0, "offset": 0.35}, true)
 	# The blade is a prism seen from the front and squeezed through a scale node:
 	# the factors are what the sampler divides by, so below one narrows that axis
 	# and above one stretches it. A tapered upright blade is what comes out.
@@ -5332,24 +5373,25 @@ func build_grass_preset() -> void:
 		true
 	)
 	get_node_by_id(squash)["params"].merge(
-		{"mode": 0, "scale_x": 0.4, "scale_y": 2.4, "tile": false}, true
+		{"mode": 0, "scale_x": 0.34, "scale_y": 2.6, "tile": false}, true
 	)
 	# The scatter only takes the shape of the blade, so the brightness of a stamp
-	# is what gives the patch its depth: every tuft lands in a different band.
+	# is what gives the patch its depth: every blade lands in a different band.
 	get_node_by_id(field)["params"].merge(
 		{
-			"amount": 88,
+			# Enough blades to fill the bottom of the picture: at this size the
+			# lower third has to be nearly solid or the patch reads as specks.
+			"amount": 130,
 			"mode": 0,
-			"spread": 0.95,
-			# A blade has to stay small: the stamp is a share of the canvas, so a
-			# third of it would put one tuft over the whole patch.
-			"stamp": 0.1,
-			"level": 0.75,
-			"level_random": 0.6,
+			"spread": 1.0,
+			"stamp": 0.13,
+			"level": 0.9,
+			"level_random": 0.45,
 			"angle": 0.0,
-			"angle_random": 180.0,
-			"scale_min": 0.55,
-			"scale_max": 1.35,
+			# Grass stands up, so the random angle only tips it a little.
+			"angle_random": 9.0,
+			"scale_min": 0.7,
+			"scale_max": 1.5,
 			"seed": 4,
 			"distribution": 0,
 			"distance": 0.12,
@@ -5357,13 +5399,11 @@ func build_grass_preset() -> void:
 			"tint": false,
 			# The patch moves like the demo's grass: a wave rolls across it and the
 			# blades lean with it, so pressing play shows the field breathing.
-			"sway": 14.0,
+			"sway": 6.0,
 			"sway_speed": 1.0,
 			"sway_scale": 1.2,
 			"sway_angle": 90.0,
 			"sway_jitter": 0.35,
-			"push": 1.0,
-			"push_radius": 0.3,
 		},
 		true
 	)
