@@ -157,7 +157,9 @@ func _refresh_status() -> void:
 	if not _core.running:
 		_status.text = "未开始"
 		return
-	_status.text = "运行中 · %s · 端口 %d" % [str(_core.label), int(_core.sync_port)]
+	_status.text = "运行中 · %s · 端口 %d\n本机 %s" % [
+		str(_core.label), int(_core.sync_port), str(_core.local_addresses())
+	]
 
 
 func _on_start_pressed() -> void:

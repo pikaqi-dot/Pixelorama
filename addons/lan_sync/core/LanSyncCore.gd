@@ -46,7 +46,7 @@ const IGNORED_NAMES := [".godot", ".import", ".git", ".DS_Store", "Thumbs.db"]
 const SCAN_BATCH := 24
 ## Networks swept in one scan. A phone has one, a desktop with virtual adapters
 ## may have six, and probing all of them would only cost time.
-const SCAN_MAX_PREFIXES := 3
+const SCAN_MAX_PREFIXES := 4
 ## How long a scan keeps a peer marked as "answered" before the list settles.
 const CONSENT_TIMEOUT := 30.0
 
@@ -76,6 +76,7 @@ var _received := 0
 var _phase := ""
 ## Addresses still to probe, and the label of a hello waiting for an answer.
 var _scan_pending: Array[String] = []
+var _scan_base_peers := 0
 var _consent_at := 0
 var _consent_label := ""
 var _consent_address := ""
@@ -166,10 +167,24 @@ func scan() -> void:
 		log_line.emit("先点开始，再扫描")
 		return
 	_scan_pending.clear()
+	_scan_base_peers = peers.size()
 	for prefix: String in _local_prefixes():
 		for host in range(1, 255):
 			_scan_pending.append("%s%d" % [prefix, host])
 	log_line.emit("正在扫描局域网（%d 个地址）…" % _scan_pending.size())
+
+
+## The IPv4 addresses this device answers on, for the status line. Somebody has to
+## read one of these out loud when the two sides cannot find each other.
+func local_addresses() -> String:
+	var list: Array[String] = []
+	for address: String in IP.get_local_addresses():
+		if address.contains(":") or address.begins_with("127."):
+			continue
+		if address.begins_with("169.254."):
+			continue
+		list.append(address)
+	return ", ".join(list)
 
 
 ## Answers the device that asked to sync. Nothing moves until this is called, on
@@ -320,9 +335,11 @@ func _reply_beacon(to_address: String) -> void:
 ## mean thousands of probes for one real network, so the home ranges come first
 ## and the list is cut short.
 func _local_prefixes() -> Array[String]:
-	var home: Array[String] = []
-	var other_private: Array[String] = []
-	var rest: Array[String] = []
+	var result: Array[String] = []
+	# The order the system hands out is the interface order, which puts the real
+	# adapter before the virtual ones, so it is kept rather than re-sorted: on this
+	# kind of machine 192.168.x is just as likely to be a Hyper-V switch as a home
+	# network.
 	for address: String in IP.get_local_addresses():
 		if address.begins_with("127.") or address.begins_with("169.254."):
 			continue
@@ -334,18 +351,8 @@ func _local_prefixes() -> Array[String]:
 		if int(parts[0]) == 100 and second >= 64 and second <= 127:
 			continue
 		var prefix := "%s.%s.%s." % [parts[0], parts[1], parts[2]]
-		if prefix.begins_with("192.168."):
-			if not home.has(prefix):
-				home.append(prefix)
-		elif prefix.begins_with("10."):
-			if not other_private.has(prefix):
-				other_private.append(prefix)
-		elif not rest.has(prefix):
-			rest.append(prefix)
-	var result: Array[String] = []
-	result.append_array(home)
-	result.append_array(other_private)
-	result.append_array(rest)
+		if not result.has(prefix):
+			result.append(prefix)
 	if result.size() > SCAN_MAX_PREFIXES:
 		result.resize(SCAN_MAX_PREFIXES)
 	return result
@@ -368,8 +375,17 @@ func _poll_scan() -> void:
 		_udp.put_packet(packet.to_utf8_buffer())
 		sent += 1
 	if _scan_pending.is_empty():
-		log_line.emit("扫描请求已全部发出，回应的设备会出现在列表里")
 		scan_finished.emit()
+		if peers.size() > _scan_base_peers:
+			log_line.emit("扫描完成，找到 %d 台设备" % (peers.size() - _scan_base_peers))
+			return
+		# Silence has one usual cause on a desktop, and saying it here saves the
+		# person a long hunt: the system firewall answering for the other side.
+		log_line.emit("扫描完成，没有设备回应")
+		log_line.emit(
+			"若对方是 Windows：检查防火墙是否允许入站 UDP %d 与 TCP %d（本机地址 %s）"
+			% [DISCOVERY_PORT, SYNC_PORT, local_addresses()]
+		)
 
 
 ## A request nobody answers must not hold a connection open forever.
