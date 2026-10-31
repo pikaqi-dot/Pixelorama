@@ -2275,6 +2275,15 @@ func _show_params(id: String) -> void:
 				params,
 				"sway_angle"
 			)
+			_add_slider(
+				"相位抖动",
+				0.0,
+				1.0,
+				0.01,
+				float(params.get("sway_jitter", 0.0)),
+				params,
+				"sway_jitter"
+			)
 			_end_section()
 			_add_slider(
 				"亮度", 0.0, 1.0, 0.01, float(params.get("level", 1.0)), params, "level"

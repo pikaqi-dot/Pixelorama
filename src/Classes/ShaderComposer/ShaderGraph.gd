@@ -928,6 +928,9 @@ static func default_params(type: String) -> Dictionary:
 				"sway_speed": 1.0,
 				"sway_scale": 1.5,
 				"sway_angle": 90.0,
+				# Phase of its own per stamp, hashed from where it stands, so the
+				# field ripples like the demo's grass instead of leaning in one piece.
+				"sway_jitter": 0.0,
 				# Stamp the lower stamps last, so they cover the higher ones.
 				"sort_y": false,
 				# Wrap the stamps around the edges, for a pattern that tiles.
@@ -3521,6 +3524,7 @@ func _scatter_image(
 	var sway_scale := clampf(float(params.get("sway_scale", 1.5)), 0.0, 8.0)
 	var wind := Vector2.from_angle(deg_to_rad(float(params.get("sway_angle", 90.0))))
 	var sway_wave := clampf(float(params.get("sway_speed", 1.0)), -8.0, 8.0) * time
+	var sway_jitter := clampf(float(params.get("sway_jitter", 0.0)), 0.0, 1.0)
 	# Keep the aspect of a layer brush, so a wide leaf stays wide.
 	var footprint := Vector2(shortest * stamp, shortest * stamp)
 	# A painted element keeps its own pixels: its size is asked for in pixels, and
@@ -3682,9 +3686,14 @@ func _scatter_image(
 			)
 		if sway_degrees > 0.0:
 			# One wave over the field, advancing with the clock. The position is in
-			# pixels, so it is measured against the short edge to stay square.
+			# pixels, so it is measured against the short edge to stay square. The
+			# jitter gives each stamp a phase of its own, which is what turns a field
+			# leaning in one piece into grass rippling.
 			var crossing := position.dot(wind) / maxf(shortest, 1.0)
-			rotation += sway_radians * sin(TAU * (crossing * sway_scale + sway_wave))
+			var phase := crossing * sway_scale + sway_wave
+			if sway_jitter > 0.0:
+				phase += sway_jitter * _position_seed(position)
+			rotation += sway_radians * sin(TAU * phase)
 		if distribution == 1 and not _scatter_has_room(placements, position, min_gap):
 			continue
 		placements.append(
@@ -3731,6 +3740,13 @@ static func _scatter_has_room(placements: Array, position: Vector2, min_gap: flo
 		if (place["position"] as Vector2).distance_squared_to(position) < limit:
 			return false
 	return true
+
+
+## Deterministic value between 0 and 1 from a position, so a field can give every
+## stamp a phase of its own without keeping a list of them. The constants are the
+## ones the pixel grass demo uses for its location seeds.
+static func _position_seed(point: Vector2) -> float:
+	return fposmod(sin(point.x * 12.9898 + point.y * 78.233) * 43758.5453, 1.0)
 	
 	
 ## Picture a canvas node stands for: the layer of its drawing area, the painting
@@ -5288,6 +5304,7 @@ func build_grass_preset() -> void:
 			"sway_speed": 1.0,
 			"sway_scale": 1.2,
 			"sway_angle": 90.0,
+			"sway_jitter": 0.35,
 		},
 		true
 	)
