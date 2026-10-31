@@ -17,6 +17,9 @@ const NODE_TYPES := {
 	"constant": {"label": "常量", "inputs": 0},
 	# A single primitive, sized and rotated. Useful as a mask for the filters.
 	"shape": {"label": "图形", "inputs": 0},
+	# A 3d mesh seen through a camera: its silhouette and the light falling on
+	# it, so a render becomes a mask or a shaded plate for the rest of the graph.
+	"model3d": {"label": "3D 模型", "inputs": 0},
 	# A recursive tree, rasterised once per frame. Growth reveals it level by
 	# level, which is what makes the growing animation possible.
 	"tree": {"label": "树木", "inputs": 0},
@@ -113,6 +116,27 @@ const ERODE_SHAPES := ["方形", "圆形", "菱形"]
 const PATH_SHAPES := ["圆形", "水平", "垂直", "正弦", "方形", "8 字", "自定义"]
 ## Primitives of the shape node.
 const SHAPE_KINDS := ["圆形", "方形", "三角形", "菱形", "星形", "圆环"]
+## Geometry of the 3d model node. Every one of them is a triangle soup, so the
+## same projection and the same lighting work for all of them.
+const MODEL_SHAPES := ["立方体", "球", "圆柱", "圆环", "棱柱", "平面"]
+## Tessellation of the 3d meshes. A silhouette needs far fewer segments than a
+## smooth render, and this is rasterised on the main thread of a phone.
+const MODEL_SPHERE_SIDES := 24
+const MODEL_SPHERE_RINGS := 14
+const MODEL_TUBE_SIDES := 22
+const MODEL_TORUS_RINGS := 28
+const MODEL_TORUS_TUBES := 12
+const MODEL_PRISM_SIDES := 3
+## Above this many pixels the 3d node gives up its second sample per pixel. Every
+## preview of the composer sits under it, so they stay smooth, while a canvas
+## sized render stays one sample deep and finishes in a fraction of the time.
+const MODEL_SAMPLES_LIMIT := 16384
+## Area below which a projected triangle touches no pixel centre. Such a face
+## would only cost the rasteriser its bounding box.
+const MODEL_MIN_FACE := 0.000001
+## Smallest distance kept in front of the camera, so a vertex sitting on it
+## cannot blow the projection up.
+const MODEL_MIN_DISTANCE := 0.05
 ## Where the pixel particles are born.
 const PARTICLE_SPAWN := ["底部升起", "顶部下落", "中心爆发", "全画布"]
 const PARTICLE_SHAPES := ["方形", "圆形", "菱形", "十字"]
@@ -144,6 +168,7 @@ const NODE_GROUPS := [
 			"checker",
 			"constant",
 			"shape",
+			"model3d",
 			"tree",
 			"particles",
 			"scatter",
@@ -807,6 +832,16 @@ static func default_params(type: String) -> Dictionary:
 			}
 		"constant":
 			return {"value": 0.5}
+		"model3d":
+			return {
+				"shape": 0,
+				"yaw": 35.0,
+				"pitch": 22.0,
+				"zoom": 0.8,
+				"perspective": 0.35,
+				"light": 135.0,
+				"shade": 1.0,
+			}
 		"tree":
 			return {
 				"seed": 3,
@@ -1606,6 +1641,11 @@ func _eval(node_id: String, uv: Vector2, size: Vector2i, depth: int) -> float:
 		if uv.x < 0.0 or uv.y < 0.0 or uv.x >= float(size.x) or uv.y >= float(size.y):
 			return 0.0
 		return _scatter_image(node, params, size, depth).get_pixel(int(uv.x), int(uv.y)).r
+	elif node_type == "model3d":
+		# Rasterised once per generated image, so this is a lookup like a path.
+		if uv.x < 0.0 or uv.y < 0.0 or uv.x >= float(size.x) or uv.y >= float(size.y):
+			return 0.0
+		return _model_image(node, params, size).get_pixel(int(uv.x), int(uv.y)).r
 	elif node_type == "constant":
 		return clampf(float(params.get("value", 0.5)), 0.0, 1.0)
 	elif node_type == "shape":
@@ -2893,6 +2933,8 @@ func _raster_field(node_id: String, size: Vector2i) -> Image:
 			return _particles_image(node, params, size)
 		"scatter":
 			return _scatter_image(node, params, size, 0)
+		"model3d":
+			return _model_image(node, params, size)
 	return null
 
 
@@ -4346,6 +4388,352 @@ func _noise_field(
 	return field
 
 
+## Triangles of the 3d node's mesh, rotated and ready to project. Three entries of
+## the array are one triangle, so the rasteriser walks one flat list instead of
+## building a face for every triangle.
+func model_triangles(params: Dictionary) -> PackedVector3Array:
+	var soup := _model_mesh(int(params.get("shape", 0)))
+	if soup.is_empty():
+		return soup
+	var rotation := Basis.from_euler(
+		Vector3(
+			deg_to_rad(float(params.get("pitch", 22.0))),
+			deg_to_rad(float(params.get("yaw", 35.0))),
+			0.0
+		)
+	)
+	var result := PackedVector3Array()
+	result.resize(soup.size())
+	for index in soup.size():
+		result[index] = rotation * soup[index]
+	return result
+
+
+## Mesh of a shape index, in object space. Every primitive fits in a sphere of
+## radius one half, so zoom means the same thing whichever one is picked.
+static func _model_mesh(shape: int) -> PackedVector3Array:
+	match shape:
+		1:
+			return _model_sphere()
+		2:
+			return _model_cylinder()
+		3:
+			return _model_torus()
+		4:
+			return _model_prism()
+		5:
+			return _model_plane()
+	return _model_box()
+
+
+## Axis aligned box. The faces are wound the same way round, which is what keeps
+## the lighting of two neighbouring faces apart.
+static func _model_box() -> PackedVector3Array:
+	var half := 0.42
+	var corners: Array[Vector3] = [
+		Vector3(-half, -half, -half),
+		Vector3(half, -half, -half),
+		Vector3(half, half, -half),
+		Vector3(-half, half, -half),
+		Vector3(-half, -half, half),
+		Vector3(half, -half, half),
+		Vector3(half, half, half),
+		Vector3(-half, half, half),
+	]
+	var faces: Array[PackedInt32Array] = [
+		PackedInt32Array([0, 3, 2, 1]),
+		PackedInt32Array([4, 5, 6, 7]),
+		PackedInt32Array([0, 1, 5, 4]),
+		PackedInt32Array([1, 2, 6, 5]),
+		PackedInt32Array([2, 3, 7, 6]),
+		PackedInt32Array([3, 0, 4, 7]),
+	]
+	var soup := PackedVector3Array()
+	for face: PackedInt32Array in faces:
+		var near_a := corners[face[0]]
+		var near_b := corners[face[1]]
+		var near_c := corners[face[2]]
+		var near_d := corners[face[3]]
+		soup.append_array(PackedVector3Array([near_a, near_b, near_c, near_a, near_c, near_d]))
+	return soup
+
+
+static func _model_sphere() -> PackedVector3Array:
+	var soup := PackedVector3Array()
+	var sides := MODEL_SPHERE_SIDES
+	var rings := MODEL_SPHERE_RINGS
+	for ring in rings:
+		var top := PI * float(ring) / float(rings)
+		var bottom := PI * float(ring + 1) / float(rings)
+		for side in sides:
+			var left := TAU * float(side) / float(sides)
+			var right := TAU * float(side + 1) / float(sides)
+			var top_left := _model_sphere_point(top, left)
+			var top_right := _model_sphere_point(top, right)
+			var bottom_left := _model_sphere_point(bottom, left)
+			var bottom_right := _model_sphere_point(bottom, right)
+			soup.append_array(
+				PackedVector3Array(
+					[top_left, bottom_left, bottom_right, top_left, bottom_right, top_right]
+				)
+			)
+	return soup
+
+
+static func _model_sphere_point(polar: float, azimuth: float) -> Vector3:
+	var radius := 0.5
+	return Vector3(sin(polar) * cos(azimuth), cos(polar), sin(polar) * sin(azimuth)) * radius
+
+
+static func _model_cylinder() -> PackedVector3Array:
+	var soup := PackedVector3Array()
+	var sides := MODEL_TUBE_SIDES
+	var radius := 0.32
+	var cap_top := Vector3(0.0, 0.5, 0.0)
+	var cap_bottom := Vector3(0.0, -0.5, 0.0)
+	for side in sides:
+		var left := TAU * float(side) / float(sides)
+		var right := TAU * float(side + 1) / float(sides)
+		var rim_left := Vector3(cos(left), 0.0, sin(left)) * radius
+		var rim_right := Vector3(cos(right), 0.0, sin(right)) * radius
+		var top_left := rim_left + cap_top
+		var top_right := rim_right + cap_top
+		var bottom_left := rim_left + cap_bottom
+		var bottom_right := rim_right + cap_bottom
+		soup.append_array(
+			PackedVector3Array(
+				[bottom_left, top_left, top_right, bottom_left, top_right, bottom_right]
+			)
+		)
+		# Caps, so the ends read as solid instead of showing the inside.
+		soup.append_array(PackedVector3Array([cap_top, top_right, top_left]))
+		soup.append_array(PackedVector3Array([cap_bottom, bottom_left, bottom_right]))
+	return soup
+
+
+static func _model_torus() -> PackedVector3Array:
+	var soup := PackedVector3Array()
+	var rings := MODEL_TORUS_RINGS
+	var tubes := MODEL_TORUS_TUBES
+	for ring in rings:
+		var left := TAU * float(ring) / float(rings)
+		var right := TAU * float(ring + 1) / float(rings)
+		for tube in tubes:
+			var round_left := TAU * float(tube) / float(tubes)
+			var round_right := TAU * float(tube + 1) / float(tubes)
+			var near_a := _model_torus_point(left, round_left)
+			var near_b := _model_torus_point(left, round_right)
+			var far_a := _model_torus_point(right, round_left)
+			var far_b := _model_torus_point(right, round_right)
+			soup.append_array(PackedVector3Array([near_a, far_a, far_b, near_a, far_b, near_b]))
+	return soup
+
+
+## Lies in the XY plane, so the hole faces the camera and the tilt of the node
+## turns the ring instead of hiding it behind itself.
+static func _model_torus_point(around: float, through: float) -> Vector3:
+	var major := 0.34
+	var minor := 0.16
+	var outward := Vector3(cos(around), sin(around), 0.0)
+	return outward * (major + cos(through) * minor) + Vector3(0.0, 0.0, sin(through) * minor)
+
+
+static func _model_prism() -> PackedVector3Array:
+	var soup := PackedVector3Array()
+	var sides := MODEL_PRISM_SIDES
+	var radius := 0.45
+	var cap_top := Vector3(0.0, 0.45, 0.0)
+	var cap_bottom := Vector3(0.0, -0.45, 0.0)
+	var top: Array[Vector3] = []
+	var bottom: Array[Vector3] = []
+	for side in sides:
+		var around := TAU * float(side) / float(sides) - PI * 0.5
+		top.append(Vector3(cos(around) * radius, cap_top.y, sin(around) * radius))
+		bottom.append(Vector3(cos(around) * radius, cap_bottom.y, sin(around) * radius))
+	for side in sides:
+		var next := (side + 1) % sides
+		soup.append_array(
+			PackedVector3Array(
+				[
+					bottom[side],
+					top[side],
+					top[next],
+					bottom[side],
+					top[next],
+					bottom[next],
+				]
+			)
+		)
+		soup.append_array(PackedVector3Array([top[next], top[side], cap_top]))
+		soup.append_array(PackedVector3Array([bottom[side], bottom[next], cap_bottom]))
+	return soup
+
+
+static func _model_plane() -> PackedVector3Array:
+	return PackedVector3Array(
+		[
+			Vector3(-0.5, -0.5, 0.0),
+			Vector3(0.5, -0.5, 0.0),
+			Vector3(0.5, 0.5, 0.0),
+			Vector3(-0.5, -0.5, 0.0),
+			Vector3(0.5, 0.5, 0.0),
+			Vector3(-0.5, 0.5, 0.0),
+		]
+	)
+
+
+## Screen position of a view space vertex plus its inverse distance, which is what
+## the depth test interpolates. A zero z means the vertex is behind the camera.
+static func _model_project(
+	point: Vector3, camera_z: float, center: Vector2, reach: float
+) -> Vector3:
+	var distance := camera_z - point.z
+	if distance <= MODEL_MIN_DISTANCE:
+		return Vector3.ZERO
+	var near_scale := camera_z / distance
+	return Vector3(
+		center.x + point.x * near_scale * reach,
+		center.y - point.y * near_scale * reach,
+		1.0 / distance
+	)
+
+
+## Rasterises the 3d node once per generated image and size, so the per pixel
+## evaluation is a lookup like a path or a tree.
+func _model_image(node: Dictionary, params: Dictionary, size: Vector2i) -> Image:
+	var key := _raster_key(str(node["id"]), size)
+	if _path_cache.has(key):
+		return _path_cache[key]
+	var image := rasterise_model(params, size)
+	_path_cache[key] = image
+	return image
+
+
+## Renders the mesh of a 3d node without touching the cache, which is what the
+## node thumbnail asks for. The value written is the light falling on the nearest
+## triangle: with shade at zero the whole shape is one flat value, which is the
+## silhouette a mask downstream wants.
+func rasterise_model(params: Dictionary, size: Vector2i) -> Image:
+	var image := Image.create_empty(size.x, size.y, false, Image.FORMAT_RGBA8)
+	image.fill(Color(0.0, 0.0, 0.0, 0.0))
+	var model := model_triangles(params)
+	if model.is_empty():
+		return image
+	# Two samples per pixel where the buffer stays small: the silhouette is what
+	# usually feeds a mask, and a stepped edge shows up there.
+	var samples := 2 if size.x * size.y <= MODEL_SAMPLES_LIMIT else 1
+	var wide := Vector2i(size.x * samples, size.y * samples)
+	var count := wide.x * wide.y
+	var nearest := PackedFloat32Array()
+	nearest.resize(count)
+	nearest.fill(INF)
+	var light_buffer := PackedFloat32Array()
+	light_buffer.resize(count)
+	var center := Vector2(float(wide.x) * 0.5, float(wide.y) * 0.5)
+	var reach := float(mini(wide.x, wide.y)) * clampf(float(params.get("zoom", 0.8)), 0.05, 3.0)
+	var perspective := clampf(float(params.get("perspective", 0.35)), 0.0, 1.0)
+	# Perspective is the camera walking closer: an orthographic view is the same
+	# camera standing very far away, so only this distance decides.
+	var camera_z := lerpf(400.0, 1.5, perspective)
+	var light_angle := deg_to_rad(float(params.get("light", 135.0)))
+	var light := Vector3(cos(light_angle), sin(light_angle), 0.8).normalized()
+	var shade_amount := clampf(float(params.get("shade", 1.0)), 0.0, 1.0)
+	for index in range(0, model.size(), 3):
+		var corner_a := model[index]
+		var corner_b := model[index + 1]
+		var corner_c := model[index + 2]
+		var face := (corner_b - corner_a).cross(corner_c - corner_a)
+		if face.length_squared() < MODEL_MIN_FACE:
+			continue
+		# The absolute value lights an open surface from whichever side faces the
+		# camera, so a plane is never stuck at the ambient floor of its own back.
+		var lambert := clampf(absf(face.normalized().dot(light)), 0.0, 1.0)
+		# A face turned away from the light keeps a floor of its own, so a shape
+		# stays one readable silhouette instead of being eaten by its dark side.
+		var brightness := lerpf(1.0, 0.3 + 0.7 * lambert, shade_amount)
+		var point_a := _model_project(corner_a, camera_z, center, reach)
+		var point_b := _model_project(corner_b, camera_z, center, reach)
+		var point_c := _model_project(corner_c, camera_z, center, reach)
+		if point_a.z <= 0.0 or point_b.z <= 0.0 or point_c.z <= 0.0:
+			continue
+		var left := clampi(
+			int(floor(minf(point_a.x, minf(point_b.x, point_c.x)))), 0, wide.x - 1
+		)
+		var right := clampi(
+			int(ceil(maxf(point_a.x, maxf(point_b.x, point_c.x)))), 0, wide.x - 1
+		)
+		var top := clampi(
+			int(floor(minf(point_a.y, minf(point_b.y, point_c.y)))), 0, wide.y - 1
+		)
+		var bottom := clampi(
+			int(ceil(maxf(point_a.y, maxf(point_b.y, point_c.y)))), 0, wide.y - 1
+		)
+		if left > right or top > bottom:
+			continue
+		var denom := (
+			(point_b.y - point_c.y) * (point_a.x - point_c.x)
+			+ (point_c.x - point_b.x) * (point_a.y - point_c.y)
+		)
+		if absf(denom) < MODEL_MIN_FACE:
+			continue
+		var inv_denom := 1.0 / denom
+		# The barycentrics are affine in the sample position, so their counts are
+		# folded into three constants per edge and squared away from the loop. This
+		# runs for every sample of every triangle, which is the whole cost of the
+		# node, and the multiplications were most of it.
+		var edge_a_x := (point_b.y - point_c.y) * inv_denom
+		var edge_a_y := (point_c.x - point_b.x) * inv_denom
+		var edge_a_const := -edge_a_x * point_c.x - edge_a_y * point_c.y
+		var edge_b_x := (point_c.y - point_a.y) * inv_denom
+		var edge_b_y := (point_a.x - point_c.x) * inv_denom
+		var edge_b_const := -edge_b_x * point_c.x - edge_b_y * point_c.y
+		for row in range(top, bottom + 1):
+			var across_y := float(row) + 0.5
+			var row_start: int = row * wide.x
+			var start_a := edge_a_y * across_y + edge_a_const
+			var start_b := edge_b_y * across_y + edge_b_const
+			for column in range(left, right + 1):
+				var across_x := float(column) + 0.5
+				var bary_a := edge_a_x * across_x + start_a
+				var bary_b := edge_b_x * across_x + start_b
+				var bary_c := 1.0 - bary_a - bary_b
+				if bary_a < 0.0 or bary_b < 0.0 or bary_c < 0.0:
+					continue
+				var inv_depth := (
+					point_a.z * bary_a + point_b.z * bary_b + point_c.z * bary_c
+				)
+				if inv_depth <= 0.0:
+					continue
+				var depth := 1.0 / inv_depth
+				var at: int = row_start + column
+				if depth >= nearest[at]:
+					continue
+				nearest[at] = depth
+				light_buffer[at] = brightness
+	if samples == 1:
+		for y in size.y:
+			for x in size.x:
+				var lit: int = y * wide.x + x
+				if nearest[lit] < INF:
+					var shade := light_buffer[lit]
+					image.set_pixel(x, y, Color(shade, shade, shade, 1.0))
+	else:
+		var block := float(samples * samples)
+		for y in size.y:
+			for x in size.x:
+				var total := 0.0
+				for down in samples:
+					var row_start: int = (y * samples + down) * wide.x + x * samples
+					for across in samples:
+						var at: int = row_start + across
+						if nearest[at] < INF:
+							total += light_buffer[at]
+				if total > 0.0:
+					var average := total / block
+					image.set_pixel(x, y, Color(average, average, average, 1.0))
+	return image
+
+
 ## Small description of a node, used by the interface.
 static func describe(node: Dictionary) -> String:
 	var params: Dictionary = node["params"]
@@ -4412,6 +4800,14 @@ static func describe(node: Dictionary) -> String:
 			return particles_text
 		"constant":
 			return "%.2f" % float(params.get("value", 0.5))
+		"model3d":
+			return "%s · %.0f° · 明暗 %.0f%%" % [
+				MODEL_SHAPES[
+					clampi(int(params.get("shape", 0)), 0, MODEL_SHAPES.size() - 1)
+				],
+				float(params.get("yaw", 35.0)),
+				float(params.get("shade", 1.0)) * 100.0,
+			]
 		"path":
 			var path_text := "%d 点" % (params.get("points", []) as Array).size()
 			if bool(params.get("closed", false)):
@@ -4573,6 +4969,7 @@ func is_expensive() -> bool:
 	const HEAVY := [
 		"echo",
 		"tree",
+		"model3d",
 		"scatter",
 		"blur",
 		"erode",

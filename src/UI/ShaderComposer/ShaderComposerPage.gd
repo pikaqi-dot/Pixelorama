@@ -2847,6 +2847,44 @@ func _show_params(id: String) -> void:
 				"形状", ShaderGraphScript.ERODE_SHAPES, int(params.get("shape", 0)), params, "shape"
 			)
 			_add_slider("混合", 0.0, 1.0, 0.01, float(params.get("mix", 1.0)), params, "mix")
+		"model3d":
+			var model_hint := Label.new()
+			model_hint.text = (
+				"把一个内置几何体当模型来拍：旋转、倾角、缩放和透视决定它怎么摆，"
+				+ "光照决定明暗。结果是灰度的轮廓与受光面，"
+				+ "接「阈值」就是干净剪影，接「侵蚀」能长边，接「混合」可以直接叠在图案上。"
+				+ "「明暗」拉到 0 就只剩纯轮廓，适合当遮罩。"
+			)
+			model_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+			model_hint.add_theme_font_size_override("font_size", 13)
+			_params_box.add_child(model_hint)
+			_add_option(
+				"几何体",
+				ShaderGraphScript.MODEL_SHAPES,
+				int(params.get("shape", 0)),
+				params,
+				"shape"
+			)
+			_add_slider("旋转", 0.0, 360.0, 1.0, float(params.get("yaw", 35.0)), params, "yaw")
+			_add_slider(
+				"倾角", -90.0, 90.0, 1.0, float(params.get("pitch", 22.0)), params, "pitch"
+			)
+			_add_slider("缩放", 0.2, 2.0, 0.01, float(params.get("zoom", 0.8)), params, "zoom")
+			_add_slider(
+				"透视",
+				0.0,
+				1.0,
+				0.01,
+				float(params.get("perspective", 0.35)),
+				params,
+				"perspective"
+			)
+			_begin_section("光照", false)
+			_add_slider(
+				"光源角度", 0.0, 360.0, 1.0, float(params.get("light", 135.0)), params, "light"
+			)
+			_add_slider("明暗", 0.0, 1.0, 0.01, float(params.get("shade", 1.0)), params, "shade")
+			_end_section()
 		"warp":
 			var warp_hint := Label.new()
 			warp_hint.text = "输入 1 是扰动场，输入 2 是被扭曲的图案。"
