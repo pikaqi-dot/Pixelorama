@@ -720,6 +720,9 @@ func time_dependent_ids() -> Array[String]:
 			"tree":
 				if bool(params.get("animate", false)):
 					seeds.append(node_id)
+			"scatter":
+				if float(params.get("sway", 0.0)) > 0.0:
+					seeds.append(node_id)
 			"pixel_art":
 				# A canvas that follows the animation shows another cel per frame.
 				if int(params.get("frame_mode", 0)) == 2:
@@ -918,6 +921,13 @@ static func default_params(type: String) -> Dictionary:
 				# How far the brightness of a single stamp may wander, which keeps a
 				# patch of leaves from looking painted with one brush.
 				"level_random": 0.0,
+				# Wind, taken from the pixel grass demo: the stamps lean with a wave
+				# that travels along "sway_angle", so neighbours move together the way
+				# grass does instead of every stamp twitching on its own.
+				"sway": 0.0,
+				"sway_speed": 1.0,
+				"sway_scale": 1.5,
+				"sway_angle": 90.0,
 				# Stamp the lower stamps last, so they cover the higher ones.
 				"sort_y": false,
 				# Wrap the stamps around the edges, for a pattern that tiles.
@@ -2923,7 +2933,12 @@ func _raster_signature(node_id: String) -> int:
 		# Only a tree and a particle field read the clock while they are drawn;
 		# everything else is drawn from its parameters, so it keeps its raster from
 		# one frame to the next even while the animation plays.
-		var clock := time if node_type == "tree" or node_type == "particles" else 0.0
+		# A tree, a particle field and a scatter that sways all read the clock while
+		# they are drawn, so their raster belongs to this frame only.
+		var moves := node_type == "tree" or node_type == "particles"
+		if node_type == "scatter":
+			moves = float(params.get("sway", 0.0)) > 0.0
+		var clock := time if moves else 0.0
 		signature = hash([params, clock, _source_generation, node.get("bypass", false)])
 		for slot in 2:
 			var upstream := _input_id(node, slot)
@@ -3499,6 +3514,13 @@ func _scatter_image(
 	)
 	var rng := RandomNumberGenerator.new()
 	rng.seed = int(params.get("seed", 1))
+	# Wind. A zero amount keeps the whole calculation out of the stamp loop, so a
+	# still scatter costs exactly what it did before this existed.
+	var sway_degrees := clampf(float(params.get("sway", 0.0)), 0.0, 90.0)
+	var sway_radians := deg_to_rad(sway_degrees)
+	var sway_scale := clampf(float(params.get("sway_scale", 1.5)), 0.0, 8.0)
+	var wind := Vector2.from_angle(deg_to_rad(float(params.get("sway_angle", 90.0))))
+	var sway_wave := clampf(float(params.get("sway_speed", 1.0)), -8.0, 8.0) * time
 	# Keep the aspect of a layer brush, so a wide leaf stays wide.
 	var footprint := Vector2(shortest * stamp, shortest * stamp)
 	# A painted element keeps its own pixels: its size is asked for in pixels, and
@@ -3658,6 +3680,11 @@ func _scatter_image(
 			stamp_scale *= maxf(
 				1.0 + scale_per_radius * (radius / maxf(shortest * 0.5, 1.0)), 0.05
 			)
+		if sway_degrees > 0.0:
+			# One wave over the field, advancing with the clock. The position is in
+			# pixels, so it is measured against the short edge to stay square.
+			var crossing := position.dot(wind) / maxf(shortest, 1.0)
+			rotation += sway_radians * sin(TAU * (crossing * sway_scale + sway_wave))
 		if distribution == 1 and not _scatter_has_room(placements, position, min_gap):
 			continue
 		placements.append(
@@ -4861,6 +4888,8 @@ static func describe(node: Dictionary) -> String:
 				scatter_text += " · 平铺"
 			if bool(params.get("tint", false)):
 				scatter_text += " · 上色"
+			if float(params.get("sway", 0.0)) > 0.0:
+				scatter_text += " · 摆动 %.0f°" % float(params.get("sway", 0.0))
 			return scatter_text
 		"particles":
 			var particles_text := "%d 颗 · %.1fpx" % [
@@ -5098,6 +5127,8 @@ func uses_time() -> bool:
 				return true
 		if chain_node["type"] == "particles" and particles_animate(chain_params):
 			return true
+		if chain_node["type"] == "scatter" and float(chain_params.get("sway", 0.0)) > 0.0:
+			return true
 		if chain_node["type"] == "pixel_art" and int(chain_params.get("frame_mode", 0)) == 2:
 			return true
 	return false
@@ -5251,6 +5282,12 @@ func build_grass_preset() -> void:
 			"distance": 0.12,
 			"sort_y": true,
 			"tint": false,
+			# The patch moves like the demo's grass: a wave rolls across it and the
+			# blades lean with it, so pressing play shows the field breathing.
+			"sway": 14.0,
+			"sway_speed": 1.0,
+			"sway_scale": 1.2,
+			"sway_angle": 90.0,
 		},
 		true
 	)

@@ -2252,6 +2252,30 @@ func _show_params(id: String) -> void:
 				_add_slider(
 					"笔刷大小", 0.02, 0.6, 0.01, float(params.get("stamp", 0.3)), params, "stamp"
 				)
+			_begin_section("风动", false)
+			_add_slider("摆动", 0.0, 45.0, 1.0, float(params.get("sway", 0.0)), params, "sway")
+			_add_slider(
+				"摆动速度",
+				-4.0,
+				4.0,
+				0.05,
+				float(params.get("sway_speed", 1.0)),
+				params,
+				"sway_speed"
+			)
+			_add_slider(
+				"波数", 0.0, 6.0, 0.1, float(params.get("sway_scale", 1.5)), params, "sway_scale"
+			)
+			_add_slider(
+				"风向",
+				0.0,
+				360.0,
+				1.0,
+				float(params.get("sway_angle", 90.0)),
+				params,
+				"sway_angle"
+			)
+			_end_section()
 			_add_slider(
 				"亮度", 0.0, 1.0, 0.01, float(params.get("level", 1.0)), params, "level"
 			)
