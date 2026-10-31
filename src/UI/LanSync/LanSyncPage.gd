@@ -25,6 +25,7 @@ var _path_edit: LineEdit
 var _address_edit: LineEdit
 var _start_button: Button
 var _consent_dialog: ConfirmationDialog
+var _browse_dialog: FileDialog
 
 
 func _ready() -> void:
@@ -112,13 +113,14 @@ func _build() -> void:
 	_folders.custom_minimum_size = Vector2(0, 70)
 	column.add_child(_folders)
 	var add_row := HBoxContainer.new()
-	_name_edit = _line_edit("名称")
-	_name_edit.custom_minimum_size = Vector2(80, ROW_HEIGHT)
+	_name_edit = _line_edit("名称（留空取目录名）")
+	_name_edit.custom_minimum_size = Vector2(110, ROW_HEIGHT)
 	add_row.add_child(_name_edit)
-	_path_edit = _line_edit("绝对路径（可留空，用默认目录）")
+	_path_edit = _line_edit("留空则用默认目录")
 	add_row.add_child(_path_edit)
 	column.add_child(add_row)
 	var folder_row := HBoxContainer.new()
+	folder_row.add_child(_button("浏览", _on_browse_folder))
 	folder_row.add_child(_button("添加", _on_add_folder))
 	folder_row.add_child(_button("移除选中", _on_remove_folder))
 	column.add_child(folder_row)
@@ -222,12 +224,18 @@ func _on_start_pressed() -> void:
 	_refresh_status()
 
 
+## Adding a folder should be one action. The name falls back to the directory's own
+## name and the path to the shared area, so picking a directory and pressing 添加
+## is enough — typing an absolute path on a phone keyboard is not a setup step
+## anybody should have to perform.
 func _on_add_folder() -> void:
 	var folder_name := _name_edit.text.strip_edges()
-	if folder_name.is_empty():
-		_on_log("先给文件夹起个名字，两侧名字要一样")
-		return
 	var path := _path_edit.text.strip_edges()
+	if folder_name.is_empty():
+		folder_name = _name_from_path(path)
+	if folder_name.is_empty():
+		_on_log("先点「浏览」选一个目录，或在「名称」里起个名字")
+		return
 	if path.is_empty():
 		path = ProjectSettings.globalize_path(DEFAULT_FOLDER.path_join(folder_name))
 	DirAccess.make_dir_recursive_absolute(path)
@@ -236,6 +244,35 @@ func _on_add_folder() -> void:
 	_path_edit.clear()
 	_refresh_folders()
 	_refresh_status()
+	_on_log("已添加 %s → %s" % [folder_name, path])
+
+
+func _on_browse_folder() -> void:
+	if is_instance_valid(_browse_dialog):
+		_browse_dialog.queue_free()
+	_browse_dialog = FileDialog.new()
+	_browse_dialog.file_mode = FileDialog.FILE_MODE_OPEN_DIR
+	_browse_dialog.access = FileDialog.ACCESS_FILESYSTEM
+	_browse_dialog.title = "选择要同步的目录"
+	# The built-in dialog rather than the platform one: on Android the native
+	# picker only reaches the folders the system grants, while this one can at
+	# least always show the app's own directory where the default shared folder
+	# lives.
+	_browse_dialog.current_dir = ProjectSettings.globalize_path("user://")
+	_browse_dialog.dir_selected.connect(_on_folder_picked)
+	add_child(_browse_dialog)
+	_browse_dialog.popup_centered(Vector2i(int(size.x * 0.92), int(size.y * 0.85)))
+
+
+func _on_folder_picked(path: String) -> void:
+	_path_edit.text = path
+	if _name_edit.text.strip_edges().is_empty():
+		_name_edit.text = _name_from_path(path)
+
+
+## The last segment of a path, which is the folder name on both sides.
+func _name_from_path(path: String) -> String:
+	return path.replace("\\", "/").trim_suffix("/").get_file()
 
 
 func _on_remove_folder() -> void:

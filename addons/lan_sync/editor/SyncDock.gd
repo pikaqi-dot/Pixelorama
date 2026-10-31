@@ -23,6 +23,7 @@ var _path_edit: LineEdit
 var _address_edit: LineEdit
 var _start_button: Button
 var _consent_dialog: ConfirmationDialog
+var _browse_dialog: EditorFileDialog
 var _rescan_left := 0.0
 
 
@@ -86,13 +87,17 @@ func _build() -> void:
 	add_child(_folders)
 	var add_row := HBoxContainer.new()
 	_name_edit = LineEdit.new()
-	_name_edit.placeholder_text = "名称"
-	_name_edit.custom_minimum_size = Vector2(70, 0)
+	_name_edit.placeholder_text = "名称（留空取目录名）"
+	_name_edit.custom_minimum_size = Vector2(110, 0)
 	add_row.add_child(_name_edit)
 	_path_edit = LineEdit.new()
-	_path_edit.placeholder_text = "res:// 或绝对路径"
+	_path_edit.placeholder_text = "留空则用 res://lan_shared/<名称>"
 	_path_edit.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	add_row.add_child(_path_edit)
+	var browse_button := Button.new()
+	browse_button.text = "浏览"
+	browse_button.pressed.connect(_on_browse_folder)
+	add_row.add_child(browse_button)
 	var add_button := Button.new()
 	add_button.text = "添加"
 	add_button.pressed.connect(_on_add_folder)
@@ -199,12 +204,20 @@ func _on_start_pressed() -> void:
 	_refresh_status()
 
 
+## Adding a folder should be one action, not a form. The name defaults to the
+## directory's own name and the path defaults to the shared area, so selecting a
+## directory and pressing 添加 is enough, and pressing it with nothing typed adds
+## nothing.
 func _on_add_folder() -> void:
 	var folder_name := _name_edit.text.strip_edges()
 	var path := _path_edit.text.strip_edges()
-	if folder_name.is_empty() or path.is_empty():
-		_on_log("名称和路径都要填")
+	if folder_name.is_empty():
+		folder_name = _name_from_path(path)
+	if folder_name.is_empty():
+		_on_log("先选一个目录，或在「名称」里起个名字")
 		return
+	if path.is_empty():
+		path = DEFAULT_DIR.path_join(folder_name)
 	var absolute := path
 	if path.begins_with("res://"):
 		absolute = ProjectSettings.globalize_path(path)
@@ -213,6 +226,38 @@ func _on_add_folder() -> void:
 	_name_edit.clear()
 	_path_edit.clear()
 	_refresh_folders()
+	_refresh_status()
+	_on_log("已添加 %s → %s" % [folder_name, absolute])
+
+
+func _on_browse_folder() -> void:
+	if is_instance_valid(_browse_dialog):
+		_browse_dialog.queue_free()
+	_browse_dialog = EditorFileDialog.new()
+	_browse_dialog.file_mode = EditorFileDialog.FILE_MODE_OPEN_DIR
+	_browse_dialog.access = EditorFileDialog.ACCESS_FILESYSTEM
+	_browse_dialog.title = "选择要同步的目录"
+	_browse_dialog.dir_selected.connect(_on_folder_picked)
+	add_child(_browse_dialog)
+	_browse_dialog.popup_centered_ratio(0.5)
+
+
+func _on_folder_picked(path: String) -> void:
+	var picked := path.replace("\\", "/")
+	# A directory inside the project reads better as res://, and both forms are
+	# accepted by the core.
+	var project_root := ProjectSettings.globalize_path("res://").replace("\\", "/")
+	if picked.begins_with(project_root):
+		picked = "res://" + picked.trim_prefix(project_root)
+	_path_edit.text = picked
+	if _name_edit.text.strip_edges().is_empty():
+		_name_edit.text = _name_from_path(picked)
+
+
+## The last segment of a path, which is the folder name in every layout worth
+## naming: "…/MyArt" is the folder "MyArt" on both sides.
+func _name_from_path(path: String) -> String:
+	return path.replace("\\", "/").trim_suffix("/").get_file()
 
 
 func _on_remove_folder() -> void:
