@@ -47,8 +47,16 @@ const SCAN_BATCH := 24
 ## Networks swept in one scan. A phone has one, a desktop with virtual adapters
 ## may have six, and probing all of them would only cost time.
 const SCAN_MAX_PREFIXES := 4
-## How long a scan keeps a peer marked as "answered" before the list settles.
+## A request nobody answers must not hold a connection open forever.
 const CONSENT_TIMEOUT := 30.0
+## Dial attempts a sweep keeps open at once. Every address of a /24 is tried, but
+## only this many sockets exist at a time, so a phone never holds 254 of them.
+const SWEEP_WINDOW := 48
+## How long one sweep dial may stay unresolved before it is given up on.
+const SWEEP_TIMEOUT := 3.0
+## How long a single handshake dial may hang before it is called dead. A refused
+## connection reports itself; a firewall that drops the packet says nothing at all.
+const DIAL_TIMEOUT := 5.0
 
 ## Folder name to absolute path. The name is what the two peers match on.
 var folders: Dictionary = {}
@@ -80,6 +88,13 @@ var _scan_base_peers := 0
 var _consent_at := 0
 var _consent_label := ""
 var _consent_address := ""
+## Addresses a sweep still has to dial, and the dials it is waiting on.
+var _sweep_queue: Array[String] = []
+var _sweep_sockets: Array[Dictionary] = []
+var _scan_active := false
+## Where the current link came from, for the peer list: a hello does not carry it.
+var _peer_address := ""
+var _peer_since := 0
 
 
 func _init() -> void:
@@ -99,6 +114,8 @@ func _process(delta: float) -> void:
 		_beacon_left = BEACON_INTERVAL
 		_broadcast()
 	_poll_scan()
+	_poll_sweep()
+	_report_scan()
 	_poll_discovery()
 	_poll_consent()
 	_poll_server()
@@ -141,6 +158,12 @@ func stop() -> void:
 	_server.stop()
 	_drop_peer("")
 	_scan_pending.clear()
+	_sweep_queue.clear()
+	for attempt: Dictionary in _sweep_sockets:
+		var socket: StreamPeerTCP = attempt["socket"]
+		socket.disconnect_from_host()
+	_sweep_sockets.clear()
+	_scan_active = false
 	_consent_at = 0
 	running = false
 	set_process(false)
@@ -162,16 +185,33 @@ func connect_to(address: String, port: int) -> void:
 ## That is what turns "wait for a beacon" into "go and look": nothing is connected
 ## to, nothing is left in TIME_WAIT, and whoever answers tells us its TCP port, so
 ## no port is ever guessed at.
+## Sweeps the networks this device is on, two ways at once. The UDP probe finds
+## anybody whose replies can reach us; the TCP dial finds anybody we can reach,
+## which is the direction a Windows firewall with inbound blocked still allows.
+## Only the dial half can find a machine that cannot answer, so both are sent.
 func scan() -> void:
 	if not running:
 		log_line.emit("先点开始，再扫描")
 		return
 	_scan_pending.clear()
+	_sweep_queue.clear()
+	_scan_active = true
 	_scan_base_peers = peers.size()
+	var own := {}
+	for entry: Dictionary in local_ipv4_entries():
+		own[str(entry["address"])] = true
 	for prefix: String in _local_prefixes():
 		for host in range(1, 255):
-			_scan_pending.append("%s%d" % [prefix, host])
-	log_line.emit("正在扫描局域网（%d 个地址）…" % _scan_pending.size())
+			var address := "%s%d" % [prefix, host]
+			# Dialling this very machine would pair it with itself.
+			if own.has(address):
+				continue
+			_scan_pending.append(address)
+			_sweep_queue.append(address)
+	log_line.emit(
+		"正在扫描局域网（%d 个地址：UDP 探测 + TCP %d 直连）…"
+		% [_scan_pending.size(), SYNC_PORT]
+	)
 
 
 ## The IPv4 addresses this device answers on, for the status line. Somebody has to
@@ -341,8 +381,23 @@ func _broadcast() -> void:
 	var packet := "LANSYNC|%d|%s|%s|%d" % [
 		PROTOCOL, device_id, label.replace("|", " "), sync_port
 	]
-	_udp.set_dest_address("255.255.255.255", DISCOVERY_PORT)
-	_udp.put_packet(packet.to_utf8_buffer())
+	var bytes := packet.to_utf8_buffer()
+	# The limited broadcast address leaves by whichever interface the routing
+	# table happens to prefer, and on a machine carrying Hyper-V, WSL and a VPN
+	# that is often not the Wi-Fi. Each network's own broadcast address is sent
+	# as well, so the beacon is on every wire this device is plugged into.
+	for target: String in _broadcast_targets():
+		_udp.set_dest_address(target, DISCOVERY_PORT)
+		_udp.put_packet(bytes)
+
+
+func _broadcast_targets() -> Array[String]:
+	var targets: Array[String] = ["255.255.255.255"]
+	for prefix: String in _local_prefixes():
+		var directed := "%s255" % prefix
+		if not targets.has(directed):
+			targets.append(directed)
+	return targets
 
 
 func _poll_discovery() -> void:
@@ -415,6 +470,11 @@ func _poll_server() -> void:
 		_peer = incoming
 		_peer_id = ""
 		_peer_label = ""
+		# The socket knows where it came from, and a hello does not: without this
+		# the peer list would show a device with no address, which is exactly the
+		# thing somebody needs when the connection keeps failing.
+		_peer_address = str(incoming.get_connected_host())
+		_peer_since = Time.get_ticks_msec()
 		_initiator = false
 		_buffer = PackedByteArray()
 		_phase = "accepted"
@@ -473,18 +533,66 @@ func _poll_scan() -> void:
 		_udp.set_dest_address(host, DISCOVERY_PORT)
 		_udp.put_packet(packet.to_utf8_buffer())
 		sent += 1
-	if _scan_pending.is_empty():
-		scan_finished.emit()
-		if peers.size() > _scan_base_peers:
-			log_line.emit("扫描完成，找到 %d 台设备" % (peers.size() - _scan_base_peers))
-			return
-		# Silence has one usual cause on a desktop, and saying it here saves the
-		# person a long hunt: the system firewall answering for the other side.
-		log_line.emit("扫描完成，没有设备回应")
-		log_line.emit(
-			"若对方是 Windows：检查防火墙是否允许入站 UDP %d 与 TCP %d（本机地址 %s）"
-			% [DISCOVERY_PORT, SYNC_PORT, local_addresses()]
-		)
+
+
+## Says how a scan ended, once both halves of it are done: the probes and the
+## dials finish at different times, and reporting after the first one would
+## announce silence while connections are still being attempted.
+func _report_scan() -> void:
+	if not _scan_active:
+		return
+	if not _scan_pending.is_empty() or not _sweep_queue.is_empty():
+		return
+	if not _sweep_sockets.is_empty():
+		return
+	_scan_active = false
+	scan_finished.emit()
+	if peers.size() > _scan_base_peers:
+		log_line.emit("扫描完成，找到 %d 台设备" % (peers.size() - _scan_base_peers))
+		return
+	# Silence has one usual cause on a desktop, and saying it here saves the
+	# person a long hunt: the system firewall answering for the other side.
+	log_line.emit("扫描完成，没有设备回应")
+	log_line.emit(
+		"若对方是 Windows：它的防火墙要放行入站 UDP %d 与 TCP %d（本机地址 %s）"
+		% [DISCOVERY_PORT, SYNC_PORT, local_addresses()]
+	)
+
+
+## One batch of dials per frame, then the dials already open are checked. A dial
+## that connects is not thrown away and re-dialed: it becomes the link, so the
+## sweep and the handshake are the same connection.
+func _poll_sweep() -> void:
+	if _sweep_queue.is_empty() and _sweep_sockets.is_empty():
+		return
+	var now := Time.get_ticks_msec()
+	var sent := 0
+	while not _sweep_queue.is_empty() \
+			and sent < SWEEP_WINDOW - _sweep_sockets.size():
+		var address: String = _sweep_queue.pop_back()
+		var socket := StreamPeerTCP.new()
+		if socket.connect_to_host(address, SYNC_PORT) != OK:
+			continue
+		_sweep_sockets.append({"socket": socket, "address": address, "started": now})
+		sent += 1
+	var keep: Array[Dictionary] = []
+	for attempt: Dictionary in _sweep_sockets:
+		var socket: StreamPeerTCP = attempt["socket"]
+		socket.poll()
+		var state := socket.get_status()
+		if state == StreamPeerTCP.STATUS_CONNECTED:
+			if _peer == null:
+				_adopt_peer(socket, str(attempt["address"]))
+			else:
+				socket.disconnect_from_host()
+			continue
+		if state == StreamPeerTCP.STATUS_ERROR or state == StreamPeerTCP.STATUS_NONE:
+			continue
+		if now - int(attempt["started"]) > int(SWEEP_TIMEOUT * 1000.0):
+			socket.disconnect_from_host()
+			continue
+		keep.append(attempt)
+	_sweep_sockets = keep
 
 
 ## A request nobody answers must not hold a connection open forever.
@@ -506,10 +614,27 @@ func _open_peer(address: String, port: int, id: String, peer_label: String) -> v
 	_peer = socket
 	_peer_id = id
 	_peer_label = peer_label
+	_peer_address = address
+	_peer_since = Time.get_ticks_msec()
 	_initiator = true
 	_buffer = PackedByteArray()
 	_phase = "connecting"
 	log_line.emit("正在连接 %s:%d" % [address, port])
+
+
+## Takes over a socket a sweep already dialed, so a connection that worked is not
+## hung up and tried again through the beacon path.
+func _adopt_peer(socket: StreamPeerTCP, address: String) -> void:
+	_drop_peer("")
+	_peer = socket
+	_peer_id = ""
+	_peer_label = ""
+	_peer_address = address
+	_peer_since = Time.get_ticks_msec()
+	_initiator = true
+	_buffer = PackedByteArray()
+	_phase = "connecting"
+	log_line.emit("已连上 %s:%d，等待对方确认" % [address, SYNC_PORT])
 
 
 func _drop_peer(reason: String) -> void:
@@ -518,6 +643,8 @@ func _drop_peer(reason: String) -> void:
 		_peer = null
 	_peer_id = ""
 	_peer_label = ""
+	_peer_address = ""
+	_peer_since = 0
 	_initiator = false
 	_phase = ""
 	_consent_at = 0
@@ -539,6 +666,14 @@ func _poll_peer() -> void:
 		_drop_peer("连接已断开")
 		return
 	if state != StreamPeerTCP.STATUS_CONNECTED:
+		# A refused connection reports itself at once; one a firewall drops reports
+		# nothing at all, so the wait has to end here or the link looks alive for
+		# the rest of the session while nothing will ever arrive.
+		if Time.get_ticks_msec() - _peer_since > int(DIAL_TIMEOUT * 1000.0):
+			_drop_peer(
+				"连接 %s 超时：对方没有应答，多半是它的防火墙拦了 TCP %d"
+				% [_peer_address, SYNC_PORT]
+			)
 		return
 	if _phase == "connecting" or _phase == "accepted":
 		_phase = "hello"
@@ -636,7 +771,7 @@ func _handle_hello(message: Dictionary) -> void:
 	if _peer_id.is_empty():
 		_peer_id = str(message.get("id", ""))
 	_peer_label = str(message.get("label", "?"))
-	_remember_peer(_peer_id, _peer_label, "", 0)
+	_remember_peer(_peer_id, _peer_label, _peer_address, 0)
 	_note_peer("已连接")
 	var shared := _shared_folders(message.get("folders", []))
 	if shared.is_empty():
