@@ -121,8 +121,8 @@ const SHAPE_KINDS := ["圆形", "方形", "三角形", "菱形", "星形", "圆�
 const MODEL_SHAPES := ["立方体", "球", "圆柱", "圆环", "棱柱", "平面"]
 ## Tessellation of the 3d meshes. A silhouette needs far fewer segments than a
 ## smooth render, and this is rasterised on the main thread of a phone.
-const MODEL_SPHERE_SIDES := 24
-const MODEL_SPHERE_RINGS := 14
+const MODEL_SPHERE_SIDES := 28
+const MODEL_SPHERE_RINGS := 16
 const MODEL_TUBE_SIDES := 22
 const MODEL_TORUS_RINGS := 28
 const MODEL_TORUS_TUBES := 12
@@ -841,6 +841,20 @@ static func default_params(type: String) -> Dictionary:
 				"perspective": 0.35,
 				"light": 135.0,
 				"shade": 1.0,
+				# Toon lighting, ported from the pixel grass demo: the light is cut
+				# into bands, the terminator can be pushed by "wrap" and sharpened
+				# by "steepness", and "soft" blends the bands back towards a plain
+				# gradient, which is what the demo calls hybrid toon shading.
+				"cuts": 3,
+				"wrap": 0.0,
+				"steepness": 1.2,
+				# Zero keeps the hard steps the demo actually draws; raising it
+				# pulls the bands back towards a plain gradient.
+				"soft": 0.0,
+				# Pixel border around the silhouette, in pixels. It is drawn at a
+				# value below the darkest band, so the colour ramp of the output
+				# paints it with its darkest stop.
+				"outline": 1,
 			}
 		"tree":
 			return {
@@ -4638,6 +4652,13 @@ func rasterise_model(params: Dictionary, size: Vector2i) -> Image:
 	var light_angle := deg_to_rad(float(params.get("light", 135.0)))
 	var light := Vector3(cos(light_angle), sin(light_angle), 0.8).normalized()
 	var shade_amount := clampf(float(params.get("shade", 1.0)), 0.0, 1.0)
+	var cuts := clampi(int(params.get("cuts", 3)), 1, 8)
+	var wrap_amount := clampf(float(params.get("wrap", 0.0)), -2.0, 2.0)
+	var steepness := clampf(float(params.get("steepness", 1.2)), 0.1, 8.0)
+	var soft_amount := clampf(float(params.get("soft", 0.0)), 0.0, 1.0)
+	# The darkest band sits one step above empty, so a face turned away from the
+	# light stays part of the silhouette instead of punching a hole in it.
+	var darkest := 1.0 / float(cuts)
 	for index in range(0, model.size(), 3):
 		var corner_a := model[index]
 		var corner_b := model[index + 1]
@@ -4647,10 +4668,13 @@ func rasterise_model(params: Dictionary, size: Vector2i) -> Image:
 			continue
 		# The absolute value lights an open surface from whichever side faces the
 		# camera, so a plane is never stuck at the ambient floor of its own back.
-		var lambert := clampf(absf(face.normalized().dot(light)), 0.0, 1.0)
-		# A face turned away from the light keeps a floor of its own, so a shape
-		# stays one readable silhouette instead of being eaten by its dark side.
-		var brightness := lerpf(1.0, 0.3 + 0.7 * lambert, shade_amount)
+		var lambert := absf(face.normalized().dot(light))
+		# Banded light. ceil() puts every face into one of "cuts" steps, which is
+		# what gives the flat pixel-art shading instead of a soft gradient.
+		var amount := clampf((lambert + wrap_amount) * steepness, 0.0, 1.0)
+		var banded := ceilf(amount * float(cuts)) / float(cuts)
+		var lit := maxf(lerpf(banded, amount, soft_amount), darkest)
+		var brightness := lerpf(1.0, lit, shade_amount)
 		var point_a := _model_project(corner_a, camera_z, center, reach)
 		var point_b := _model_project(corner_b, camera_z, center, reach)
 		var point_c := _model_project(corner_c, camera_z, center, reach)
@@ -4731,7 +4755,51 @@ func rasterise_model(params: Dictionary, size: Vector2i) -> Image:
 				if total > 0.0:
 					var average := total / block
 					image.set_pixel(x, y, Color(average, average, average, 1.0))
+	var outline := clampi(int(params.get("outline", 1)), 0, 2)
+	if outline > 0:
+		# Border below every lit band, so the darkest stop of a colour ramp lands
+		# on it and the shape reads as drawn instead of as a cut out picture.
+		_draw_model_outline(image, outline, darkest * 0.5)
 	return image
+
+
+## Draws the pixel-art border around a rendered shape, the way the grass demo
+## detects a depth edge in screen space: the silhouette is grown by
+## [param width] pixels and whatever the growing added is painted at
+## [param level]. Working at the final size keeps the border one exact pixel
+## wide, which is what a pixel artwork wants.
+func _draw_model_outline(image: Image, width: int, level: float) -> void:
+	var size := Vector2i(image.get_width(), image.get_height())
+	if size.x <= 0 or size.y <= 0:
+		return
+	var bytes := image.get_data()
+	var count := size.x * size.y
+	var filled := PackedByteArray()
+	filled.resize(count)
+	for index in count:
+		if bytes[index * 4 + 3] > 127:
+			filled[index] = 1
+	var grown := filled.duplicate()
+	for _step in width:
+		var previous := grown.duplicate()
+		for y in size.y:
+			for x in size.x:
+				var at: int = y * size.x + x
+				if previous[at] == 1:
+					continue
+				if x > 0 and previous[at - 1] == 1:
+					grown[at] = 1
+				elif x < size.x - 1 and previous[at + 1] == 1:
+					grown[at] = 1
+				elif y > 0 and previous[at - size.x] == 1:
+					grown[at] = 1
+				elif y < size.y - 1 and previous[at + size.x] == 1:
+					grown[at] = 1
+	for y in size.y:
+		for x in size.x:
+			var at: int = y * size.x + x
+			if grown[at] == 1 and filled[at] == 0:
+				image.set_pixel(x, y, Color(level, level, level, 1.0))
 
 
 ## Small description of a node, used by the interface.
@@ -4801,13 +4869,18 @@ static func describe(node: Dictionary) -> String:
 		"constant":
 			return "%.2f" % float(params.get("value", 0.5))
 		"model3d":
-			return "%s · %.0f° · 明暗 %.0f%%" % [
+			var model_text := "%s · %.0f° · %d 阶" % [
 				MODEL_SHAPES[
 					clampi(int(params.get("shape", 0)), 0, MODEL_SHAPES.size() - 1)
 				],
 				float(params.get("yaw", 35.0)),
-				float(params.get("shade", 1.0)) * 100.0,
+				clampi(int(params.get("cuts", 3)), 1, 8),
 			]
+			if clampi(int(params.get("outline", 1)), 0, 2) > 0:
+				model_text += " · 描边"
+			if float(params.get("shade", 1.0)) < 0.999:
+				model_text += " · 明暗 %.0f%%" % (float(params.get("shade", 1.0)) * 100.0)
+			return model_text
 		"path":
 			var path_text := "%d 点" % (params.get("points", []) as Array).size()
 			if bool(params.get("closed", false)):
@@ -5063,6 +5136,51 @@ func build_ocean_preset() -> void:
 	# there. The blend in between mixes it with the waves and never owns a colour.
 	get_node_by_id(depth)["params"].merge(
 		{"tint": true, "color": Color(0.13, 0.38, 0.6, 1.0)}, true
+	)
+
+
+## Replaces the graph with a toon shaded 3d shape in the palette of the Dylearn
+## pixel grass demo: the light is cut into three bands, the silhouette gets a one
+## pixel border, and the picture is painted with the greens its shaders use. A
+## sphere stands in for a bush, which is what the grass clumps read as there.
+func build_model3d_preset() -> void:
+	nodes.clear()
+	groups.clear()
+	_noise_cache.clear()
+	_noise_signature.clear()
+	var model := add_node("model3d", Vector2(40, 60))
+	var out := add_node("output", Vector2(420, 60))
+	connect_nodes(model, out, 0)
+	get_node_by_id(model)["params"].merge(
+		{
+			"shape": 1,
+			"yaw": 0.0,
+			"pitch": 16.0,
+			"zoom": 0.86,
+			"perspective": 0.2,
+			"light": 135.0,
+			"shade": 1.0,
+			"cuts": 3,
+			"wrap": 0.12,
+			"steepness": 1.5,
+			"soft": 0.0,
+			"outline": 1,
+		},
+		true
+	)
+	# A ramp on the output is how a grey value graph gets a palette: the border
+	# lands in the darkest stop and the three lit bands fill the rest of it.
+	get_node_by_id(out)["params"].merge(
+		{
+			"color_a": Color(0.16, 0.27, 0.05),
+			"color_mid": Color(0.443, 0.635, 0.0),
+			"color_b": Color(0.604, 0.718, 0.0),
+			"mid_position": 0.5,
+			"steps": 4,
+			"transparent": true,
+			"alpha_cut": 0.04,
+		},
+		true
 	)
 
 

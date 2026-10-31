@@ -1575,6 +1575,7 @@ func _build_preset_menu() -> void:
 	root.add_item("灌木丛", 6)
 	root.add_item("灌木丛（程序化）", 7)
 	root.add_item("藤蔓叶片（沿路径）", 8)
+	root.add_item("3D 卡通造型（草地色）", 9)
 	root.add_separator()
 	root.add_item("保存当前图…", 2)
 	var saved := _list_presets()
@@ -1629,6 +1630,9 @@ func _on_preset_pressed(id: int) -> void:
 		return
 	if id == 8:
 		_on_vine_preset_pressed()
+		return
+	if id == 9:
+		_on_model3d_preset_pressed()
 		return
 	if id == 2:
 		_show_preset_dialog()
@@ -2850,10 +2854,12 @@ func _show_params(id: String) -> void:
 		"model3d":
 			var model_hint := Label.new()
 			model_hint.text = (
-				"把一个内置几何体当模型来拍：旋转、倾角、缩放和透视决定它怎么摆，"
-				+ "光照决定明暗。结果是灰度的轮廓与受光面，"
-				+ "接「阈值」就是干净剪影，接「侵蚀」能长边，接「混合」可以直接叠在图案上。"
-				+ "「明暗」拉到 0 就只剩纯轮廓，适合当遮罩。"
+				"把一个内置几何体当模型来拍：旋转、倾角、缩放和透视决定它怎么摆。"
+				+ "光照做成卡通分段（移植自 Dylearn 的像素草地演示）："
+				+ "「色阶」是分几段，「包裹光」推移明暗交界，「对比」让交界更陡，"
+				+ "「过渡」把分段拉回渐变。"
+				+ "「描边」给轮廓一圈像素边框，配输出节点的三色色阶就是描边角色的样子。"
+				+ "「明暗」拉到 0 只剩纯轮廓，适合当遮罩。"
 			)
 			model_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 			model_hint.add_theme_font_size_override("font_size", 13)
@@ -2879,11 +2885,18 @@ func _show_params(id: String) -> void:
 				params,
 				"perspective"
 			)
+			_add_number("描边", 0, 2, 1, int(params.get("outline", 1)), params, "outline")
 			_begin_section("光照", false)
 			_add_slider(
 				"光源角度", 0.0, 360.0, 1.0, float(params.get("light", 135.0)), params, "light"
 			)
 			_add_slider("明暗", 0.0, 1.0, 0.01, float(params.get("shade", 1.0)), params, "shade")
+			_add_number("色阶", 1, 8, 1, int(params.get("cuts", 3)), params, "cuts")
+			_add_slider(
+				"对比", 1.0, 8.0, 0.1, float(params.get("steepness", 1.2)), params, "steepness"
+			)
+			_add_slider("包裹光", -2.0, 2.0, 0.01, float(params.get("wrap", 0.0)), params, "wrap")
+			_add_slider("过渡", 0.0, 1.0, 0.01, float(params.get("soft", 0.0)), params, "soft")
 			_end_section()
 		"warp":
 			var warp_hint := Label.new()
@@ -4470,6 +4483,17 @@ func _on_vine_preset_pressed() -> void:
 	graph.build_vine_preset()
 	if is_instance_valid(_phase):
 		_phase.set_value_no_signal(1.0)
+	_selected_id = ""
+	_show_params("")
+	_refresh_graph()
+	_refresh_preview()
+
+
+## Builds the toon shaded 3d shape: banded light, a pixel border and the greens
+## of the pixel grass demo the technique comes from.
+func _on_model3d_preset_pressed() -> void:
+	_push_undo()
+	graph.build_model3d_preset()
 	_selected_id = ""
 	_show_params("")
 	_refresh_graph()
