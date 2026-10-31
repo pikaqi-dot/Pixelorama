@@ -1576,12 +1576,15 @@ func _build_preset_menu() -> void:
 	root.add_item("灌木丛（程序化）", 7)
 	root.add_item("藤蔓叶片（沿路径）", 8)
 	root.add_item("3D 卡通造型（草地色）", 9)
+	root.add_item("3D 像素草丛", 10)
 	root.add_separator()
 	root.add_item("保存当前图…", 2)
 	var saved := _list_presets()
 	if not saved.is_empty():
 		root.add_separator("已保存")
-	var id := 10
+	# Saved presets start well past the built in ids, so a new built in one can be
+	# added without renumbering somebody's files.
+	var id := 100
 	for path in saved:
 		_preset_paths.append(path)
 		root.add_item(path.get_file().get_basename(), id)
@@ -1634,10 +1637,13 @@ func _on_preset_pressed(id: int) -> void:
 	if id == 9:
 		_on_model3d_preset_pressed()
 		return
+	if id == 10:
+		_on_grass_preset_pressed()
+		return
 	if id == 2:
 		_show_preset_dialog()
 		return
-	var index := id - 10
+	var index := id - 100
 	if index >= 0 and index < _preset_paths.size():
 		_load_preset(_preset_paths[index])
 
@@ -2401,12 +2407,15 @@ func _show_params(id: String) -> void:
 			hint.text = (
 				"输出当前帧的相位（0…1）。接到 Wave、Transform 等节点的输入口，"
 				+ "生成时按帧数逐帧出图。速度是每帧前进的圈数。"
+				+ "「量化帧数」把相位卡在这么多个位置之一，动画就从滑动变成一帧一顿，"
+				+ "像素草地演示的步进感就是这么来的；0 保持连续。"
 			)
 			hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 			hint.add_theme_font_size_override("font_size", 13)
 			_params_box.add_child(hint)
 			_add_slider("速度", 0.0, 4.0, 0.05, float(params.get("speed", 1.0)), params, "speed")
 			_add_slider("偏移", 0.0, 1.0, 0.01, float(params.get("offset", 0.0)), params, "offset")
+			_add_number("量化帧数", 0, 60, 1, int(params.get("steps", 0)), params, "steps")
 		"wave":
 			_add_slider("频率", 0.5, 16.0, 0.1, float(params["frequency"]), params, "frequency")
 			_add_slider("角度", 0.0, 360.0, 1.0, float(params["angle"]), params, "angle")
@@ -4494,6 +4503,16 @@ func _on_vine_preset_pressed() -> void:
 func _on_model3d_preset_pressed() -> void:
 	_push_undo()
 	graph.build_model3d_preset()
+	_selected_id = ""
+	_show_params("")
+	_refresh_graph()
+	_refresh_preview()
+
+
+## Builds a patch of grass out of scattered toon shaded blades.
+func _on_grass_preset_pressed() -> void:
+	_push_undo()
+	graph.build_grass_preset()
 	_selected_id = ""
 	_show_params("")
 	_refresh_graph()

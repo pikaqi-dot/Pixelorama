@@ -1022,7 +1022,9 @@ static func default_params(type: String) -> Dictionary:
 				"crop_h": 0,
 			}
 		"time":
-			return {"speed": 1.0, "offset": 0.0}
+			# "steps" is the stepped framerate of the pixel grass demo: the phase
+			# is held on one of that many positions instead of moving smoothly.
+			return {"speed": 1.0, "offset": 0.0, "steps": 0}
 		"wave":
 			return {"frequency": 2.0, "angle": 0.0, "amplitude": 1.0}
 		"transform":
@@ -1746,7 +1748,14 @@ func _eval(node_id: String, uv: Vector2, size: Vector2i, depth: int) -> float:
 		# Loops of the animation and a per node offset, so several time driven
 		# parts of a graph can run out of phase.
 		var loops := maxf(float(params.get("speed", 1.0)), 0.0)
-		return fposmod(time * loops + float(params.get("offset", 0.0)), 1.0)
+		var phase := fposmod(time * loops + float(params.get("offset", 0.0)), 1.0)
+		# Stepped clock, the way the pixel grass demo quantises its time: a hand
+		# drawn look comes from the picture holding still for a few frames instead
+		# of sliding smoothly. Zero leaves the clock as it is.
+		var steps := clampi(int(params.get("steps", 0)), 0, 60)
+		if steps > 0:
+			phase = floorf(phase * float(steps)) / float(steps)
+		return phase
 	elif node_type == "radial":
 		var center := Vector2(float(params["center_x"]), float(params["center_y"]))
 		var distance := (normalized - center).length()
@@ -4914,7 +4923,10 @@ static func describe(node: Dictionary) -> String:
 				]
 			return source_text
 		"time":
-			return "速度 %.1f" % float(params.get("speed", 1.0))
+			var time_text := "速度 %.1f" % float(params.get("speed", 1.0))
+			if clampi(int(params.get("steps", 0)), 0, 60) > 0:
+				time_text += " · %d 帧" % clampi(int(params.get("steps", 0)), 0, 60)
+			return time_text
 		"wave":
 			return "%.1f 周期 · %d°" % [float(params["frequency"]), int(params["angle"])]
 		"transform":
@@ -5177,6 +5189,78 @@ func build_model3d_preset() -> void:
 			"color_b": Color(0.604, 0.718, 0.0),
 			"mid_position": 0.5,
 			"steps": 4,
+			"transparent": true,
+			"alpha_cut": 0.04,
+		},
+		true
+	)
+
+
+## Replaces the graph with a patch of pixel grass, the way the demo builds one: a
+## single toon shaded blade is the stamp and the scatter node lays a field of them
+## down at random angles and sizes, with the brightness of each one wandering so
+## the patch is not painted with one brush.
+func build_grass_preset() -> void:
+	nodes.clear()
+	groups.clear()
+	_noise_cache.clear()
+	_noise_signature.clear()
+	var blade := add_node("model3d", Vector2(20, 40))
+	var squash := add_node("scale", Vector2(220, 40))
+	var field := add_node("scatter", Vector2(400, 40))
+	var out := add_node("output", Vector2(640, 40))
+	connect_nodes(blade, squash, 0)
+	connect_nodes(squash, field, 0)
+	connect_nodes(field, out, 0)
+	# The blade is a prism seen from the front and squeezed through a scale node:
+	# the factors are what the sampler divides by, so below one narrows that axis
+	# and above one stretches it. A tapered upright blade is what comes out.
+	get_node_by_id(blade)["params"].merge(
+		{
+			"shape": 4,
+			"yaw": 0.0,
+			"pitch": 0.0,
+			"zoom": 1.0,
+			"perspective": 0.0,
+			"shade": 0.0,
+			"outline": 0,
+		},
+		true
+	)
+	get_node_by_id(squash)["params"].merge(
+		{"mode": 0, "scale_x": 0.4, "scale_y": 2.4, "tile": false}, true
+	)
+	# The scatter only takes the shape of the blade, so the brightness of a stamp
+	# is what gives the patch its depth: every tuft lands in a different band.
+	get_node_by_id(field)["params"].merge(
+		{
+			"amount": 88,
+			"mode": 0,
+			"spread": 0.95,
+			# A blade has to stay small: the stamp is a share of the canvas, so a
+			# third of it would put one tuft over the whole patch.
+			"stamp": 0.1,
+			"level": 0.75,
+			"level_random": 0.6,
+			"angle": 0.0,
+			"angle_random": 180.0,
+			"scale_min": 0.55,
+			"scale_max": 1.35,
+			"seed": 4,
+			"distribution": 0,
+			"distance": 0.12,
+			"sort_y": true,
+			"tint": false,
+		},
+		true
+	)
+	get_node_by_id(out)["params"].merge(
+		{
+			"color_a": Color(0.20, 0.33, 0.07),
+			"color_mid": Color(0.443, 0.635, 0.0),
+			"color_b": Color(0.604, 0.718, 0.0),
+			"mid_position": 0.5,
+			"steps": 3,
 			"transparent": true,
 			"alpha_cut": 0.04,
 		},
