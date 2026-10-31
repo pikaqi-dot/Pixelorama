@@ -931,6 +931,12 @@ static func default_params(type: String) -> Dictionary:
 				# Phase of its own per stamp, hashed from where it stands, so the
 				# field ripples like the demo's grass instead of leaning in one piece.
 				"sway_jitter": 0.0,
+				# Something standing in the field. The bright part of the second
+				# input shoves the stamps away and tips them over, which is what the
+				# demo does with the positions of its characters. Above zero the
+				# second input stops acting as a density mask.
+				"push": 0.0,
+				"push_radius": 0.25,
 				# Stamp the lower stamps last, so they cover the higher ones.
 				"sort_y": false,
 				# Wrap the stamps around the edges, for a pattern that tiles.
@@ -3525,6 +3531,9 @@ func _scatter_image(
 	var wind := Vector2.from_angle(deg_to_rad(float(params.get("sway_angle", 90.0))))
 	var sway_wave := clampf(float(params.get("sway_speed", 1.0)), -8.0, 8.0) * time
 	var sway_jitter := clampf(float(params.get("sway_jitter", 0.0)), 0.0, 1.0)
+	# Something standing in the field: a strength and how wide it reaches.
+	var push := clampf(float(params.get("push", 0.0)), 0.0, 1.0)
+	var push_radius := clampf(float(params.get("push_radius", 0.25)), 0.02, 1.0)
 	# Keep the aspect of a layer brush, so a wide leaf stays wide.
 	var footprint := Vector2(shortest * stamp, shortest * stamp)
 	# A painted element keeps its own pixels: its size is asked for in pixels, and
@@ -3661,7 +3670,10 @@ func _scatter_image(
 		if align:
 			position = position.round()
 		var density := 1.0
-		if not density_id.is_empty() and not along_path and mode != 2:
+		# With a pusher in the field the second input is read as that, so it no
+		# longer thins the stamps out: pushing and thinning at the same time would
+		# mean two very different meanings for one wire.
+		if push <= 0.0 and not density_id.is_empty() and not along_path and mode != 2:
 			density = clampf(_eval(density_id, position, size, depth + 1), 0.0, 1.0)
 			if density < chance:
 				continue
@@ -3684,6 +3696,41 @@ func _scatter_image(
 			stamp_scale *= maxf(
 				1.0 + scale_per_radius * (radius / maxf(shortest * 0.5, 1.0)), 0.05
 			)
+		if push > 0.0 and not density_id.is_empty() and not along_path and mode != 2:
+			# The gradient of the field points into the pusher, so the stamps step
+			# the other way and tip over with the push. Sampling it over a radius
+			# wide enough to see a whole shape keeps the direction from flipping on
+			# the noise of a single pixel.
+			var pressed := clampf(_eval(density_id, position, size, depth + 1), 0.0, 1.0)
+			if pressed > 0.02:
+				# Sampled well inside the pusher, not across the whole of it: a step
+				# as wide as the shape reads the same value on both sides and comes
+				# back with no direction at all, which is what made the push look
+				# like it did nothing.
+				var step := maxf(push_radius * shortest * 0.3, 1.5)
+				var ahead := clampf(
+					_eval(density_id, position + Vector2(step, 0.0), size, depth + 1), 0.0, 1.0
+				)
+				var behind := clampf(
+					_eval(density_id, position - Vector2(step, 0.0), size, depth + 1), 0.0, 1.0
+				)
+				var under := clampf(
+					_eval(density_id, position + Vector2(0.0, step), size, depth + 1), 0.0, 1.0
+				)
+				var over := clampf(
+					_eval(density_id, position - Vector2(0.0, step), size, depth + 1), 0.0, 1.0
+				)
+				var into := Vector2(ahead - behind, under - over)
+				if into.length_squared() > 0.0001:
+					var away := -into.normalized()
+					# The shove is measured against the canvas, not against the
+					# sampling radius: at full strength a stamp standing right on the
+					# pusher moves half the short edge, which is what actually parts
+					# the field instead of nudging it.
+					position += away * (push * pressed * shortest * 0.5)
+					rotation += deg_to_rad(push * 30.0 * pressed) * signf(away.x)
+					if align:
+						position = position.round()
 		if sway_degrees > 0.0:
 			# One wave over the field, advancing with the clock. The position is in
 			# pixels, so it is measured against the short edge to stay square. The
@@ -4906,6 +4953,8 @@ static func describe(node: Dictionary) -> String:
 				scatter_text += " · 上色"
 			if float(params.get("sway", 0.0)) > 0.0:
 				scatter_text += " · 摆动 %.0f°" % float(params.get("sway", 0.0))
+			if float(params.get("push", 0.0)) > 0.0:
+				scatter_text += " · 推挤 %.0f%%" % (float(params.get("push", 0.0)) * 100.0)
 			return scatter_text
 		"particles":
 			var particles_text := "%d 颗 · %.1fpx" % [
@@ -5255,10 +5304,18 @@ func build_grass_preset() -> void:
 	var blade := add_node("model3d", Vector2(20, 40))
 	var squash := add_node("scale", Vector2(220, 40))
 	var field := add_node("scatter", Vector2(400, 40))
+	var pusher := add_node("radial", Vector2(220, 260))
 	var out := add_node("output", Vector2(640, 40))
 	connect_nodes(blade, squash, 0)
 	connect_nodes(squash, field, 0)
+	connect_nodes(pusher, field, 1)
 	connect_nodes(field, out, 0)
+	# Something standing in the patch: a soft disc whose bright middle shoves the
+	# blades away, the way the demo lets a character part its grass.
+	get_node_by_id(pusher)["params"].merge(
+		{"center_x": 0.5, "center_y": 0.62, "radius": 0.2, "falloff": 1.4, "invert": false},
+		true
+	)
 	# The blade is a prism seen from the front and squeezed through a scale node:
 	# the factors are what the sampler divides by, so below one narrows that axis
 	# and above one stretches it. A tapered upright blade is what comes out.
@@ -5305,6 +5362,8 @@ func build_grass_preset() -> void:
 			"sway_scale": 1.2,
 			"sway_angle": 90.0,
 			"sway_jitter": 0.35,
+			"push": 1.0,
+			"push_radius": 0.3,
 		},
 		true
 	)
