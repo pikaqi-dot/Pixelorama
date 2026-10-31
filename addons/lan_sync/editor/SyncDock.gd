@@ -21,6 +21,7 @@ var _name_edit: LineEdit
 var _path_edit: LineEdit
 var _address_edit: LineEdit
 var _start_button: Button
+var _consent_dialog: ConfirmationDialog
 var _rescan_left := 0.0
 
 
@@ -31,6 +32,7 @@ func _ready() -> void:
 	_core.log_line.connect(_on_log)
 	_core.peers_changed.connect(_refresh_peers)
 	_core.file_synced.connect(_on_file_synced)
+	_core.consent_requested.connect(_on_consent_requested)
 	add_child(_core)
 	if _core.folders.is_empty():
 		_ensure_default_folder()
@@ -89,6 +91,10 @@ func _build() -> void:
 	_start_button.text = "开始"
 	_start_button.pressed.connect(_on_start_pressed)
 	run_row.add_child(_start_button)
+	var scan_button := Button.new()
+	scan_button.text = "扫描局域网"
+	scan_button.pressed.connect(_on_scan_pressed)
+	run_row.add_child(scan_button)
 	var connect_button := Button.new()
 	connect_button.text = "按地址连接"
 	connect_button.pressed.connect(_on_connect_pressed)
@@ -190,6 +196,29 @@ func _on_remove_folder() -> void:
 		return
 	_core.remove_folder(str(names[index]))
 	_refresh_folders()
+
+
+func _on_scan_pressed() -> void:
+	_core.scan()
+	_refresh_status()
+
+
+## Another device wants to sync: nothing moves until this is answered.
+func _on_consent_requested(id: String, peer_label: String, address: String) -> void:
+	if is_instance_valid(_consent_dialog):
+		_consent_dialog.queue_free()
+	_consent_dialog = ConfirmationDialog.new()
+	_consent_dialog.title = "同步请求"
+	_consent_dialog.dialog_text = "%s（%s）请求与这个项目同步文件。\n同意后它的文件夹会与本机同名文件夹保持一致。" % [
+		peer_label, address
+	]
+	_consent_dialog.ok_button_text = "同意"
+	_consent_dialog.cancel_button_text = "拒绝"
+	_consent_dialog.confirmed.connect(_core.answer_consent.bind(true))
+	_consent_dialog.canceled.connect(_core.answer_consent.bind(false))
+	add_child(_consent_dialog)
+	_consent_dialog.popup_centered(Vector2i(420, 160))
+	_on_log("%s 请求同步，等待确认" % peer_label)
 
 
 func _on_connect_pressed() -> void:

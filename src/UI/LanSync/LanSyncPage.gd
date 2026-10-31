@@ -23,6 +23,7 @@ var _name_edit: LineEdit
 var _path_edit: LineEdit
 var _address_edit: LineEdit
 var _start_button: Button
+var _consent_dialog: ConfirmationDialog
 
 
 func _ready() -> void:
@@ -33,6 +34,7 @@ func _ready() -> void:
 	_core.log_line.connect(_on_log)
 	_core.peers_changed.connect(_refresh_peers)
 	_core.file_synced.connect(_on_file_synced)
+	_core.consent_requested.connect(_on_consent_requested)
 	add_child(_core)
 	if _core.folders.is_empty():
 		var absolute := ProjectSettings.globalize_path(DEFAULT_FOLDER)
@@ -101,6 +103,7 @@ func _build() -> void:
 	var run_row := HBoxContainer.new()
 	_start_button = _button("开始", _on_start_pressed)
 	run_row.add_child(_start_button)
+	run_row.add_child(_button("扫描局域网", _on_scan_pressed))
 	run_row.add_child(_button("按地址连接", _on_connect_pressed))
 	column.add_child(run_row)
 	_address_edit = _line_edit("地址 例 192.168.1.20:45990")
@@ -213,6 +216,30 @@ func _on_remove_folder() -> void:
 	_core.remove_folder(str(names[index]))
 	_refresh_folders()
 	_refresh_status()
+
+
+func _on_scan_pressed() -> void:
+	_core.scan()
+	_refresh_status()
+
+
+## Another device wants to sync. Nothing moves until this is answered, and the
+## dialog is the whole point: a scan finds devices, it does not trust them.
+func _on_consent_requested(id: String, peer_label: String, address: String) -> void:
+	if is_instance_valid(_consent_dialog):
+		_consent_dialog.queue_free()
+	_consent_dialog = ConfirmationDialog.new()
+	_consent_dialog.title = "同步请求"
+	_consent_dialog.dialog_text = "%s（%s）请求同步文件。\n同意后，两侧同名文件夹会保持一致。" % [
+		peer_label, address
+	]
+	_consent_dialog.ok_button_text = "同意"
+	_consent_dialog.cancel_button_text = "拒绝"
+	_consent_dialog.confirmed.connect(_core.answer_consent.bind(true))
+	_consent_dialog.canceled.connect(_core.answer_consent.bind(false))
+	add_child(_consent_dialog)
+	_consent_dialog.popup_centered(Vector2i(360, 150))
+	_on_log("%s 请求同步，等待确认" % peer_label)
 
 
 func _on_connect_pressed() -> void:

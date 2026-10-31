@@ -18,6 +18,10 @@ extends Node
 signal peers_changed()
 signal log_line(text: String)
 signal file_synced(path: String, direction: String)
+## A device asked to sync and is waiting for this side to say yes.
+signal consent_requested(id: String, peer_label: String, address: String)
+## A scan has queued all of its probes.
+signal scan_finished()
 
 ## Version of the wire format. A peer speaking another one is reported instead of
 ## being half understood.
@@ -37,6 +41,14 @@ const MAX_FILE_BYTES := 1_500_000
 const MAX_FILES := 4000
 const CONFIG_PATH := "user://lan_sync.cfg"
 const IGNORED_NAMES := [".godot", ".import", ".git", ".DS_Store", "Thumbs.db"]
+## Probes sent per frame while scanning. A /24 is 254 addresses, so the sweep of
+## one network is finished in about a tenth of a second without ever blocking.
+const SCAN_BATCH := 24
+## Networks swept in one scan. A phone has one, a desktop with virtual adapters
+## may have six, and probing all of them would only cost time.
+const SCAN_MAX_PREFIXES := 3
+## How long a scan keeps a peer marked as "answered" before the list settles.
+const CONSENT_TIMEOUT := 30.0
 
 ## Folder name to absolute path. The name is what the two peers match on.
 var folders: Dictionary = {}
@@ -62,6 +74,11 @@ var _get_queue: Array[String] = []
 var _expecting := 0
 var _received := 0
 var _phase := ""
+## Addresses still to probe, and the label of a hello waiting for an answer.
+var _scan_pending: Array[String] = []
+var _consent_at := 0
+var _consent_label := ""
+var _consent_address := ""
 
 
 func _init() -> void:
@@ -80,7 +97,9 @@ func _process(delta: float) -> void:
 	if _beacon_left <= 0.0:
 		_beacon_left = BEACON_INTERVAL
 		_broadcast()
+	_poll_scan()
 	_poll_discovery()
+	_poll_consent()
 	_poll_server()
 	_poll_peer()
 	_poll_timeouts()
@@ -120,6 +139,8 @@ func stop() -> void:
 	_udp.close()
 	_server.stop()
 	_drop_peer("")
+	_scan_pending.clear()
+	_consent_at = 0
 	running = false
 	set_process(false)
 	peers.clear()
@@ -134,6 +155,37 @@ func connect_to(address: String, port: int) -> void:
 	if not running and not start():
 		return
 	_open_peer(address, port, "", "")
+
+
+## Sweeps the networks this device is on with one small UDP probe per address.
+## That is what turns "wait for a beacon" into "go and look": nothing is connected
+## to, nothing is left in TIME_WAIT, and whoever answers tells us its TCP port, so
+## no port is ever guessed at.
+func scan() -> void:
+	if not running:
+		log_line.emit("先点开始，再扫描")
+		return
+	_scan_pending.clear()
+	for prefix: String in _local_prefixes():
+		for host in range(1, 255):
+			_scan_pending.append("%s%d" % [prefix, host])
+	log_line.emit("正在扫描局域网（%d 个地址）…" % _scan_pending.size())
+
+
+## Answers the device that asked to sync. Nothing moves until this is called, on
+## the side that received the connection.
+func answer_consent(agree: bool) -> void:
+	if _consent_at == 0 or _peer == null:
+		return
+	_consent_at = 0
+	if agree:
+		_outbox.append({"t": "hello_ok"})
+		_phase = "manifest"
+		_note_peer("已连接")
+		log_line.emit("已允许 %s 同步" % _consent_label)
+		return
+	_outbox.append({"t": "hello_no"})
+	_drop_peer("已拒绝 %s" % _consent_label)
 
 
 func set_folder(folder_name: String, path: String) -> void:
@@ -186,6 +238,12 @@ func _poll_discovery() -> void:
 		var data := _udp.get_packet()
 		var address := _udp.get_packet_ip()
 		var parts := data.get_string_from_utf8().split("|")
+		if parts[0] == "LANSYNC?":
+			# Somebody is sweeping the network. Answering this one address only
+			# keeps a scan as cheap for the swept as it is for the sweeper.
+			if parts.size() >= 3 and int(parts[1]) == PROTOCOL and parts[2] != device_id:
+				_reply_beacon(address)
+			continue
 		if parts.size() < 5 or parts[0] != "LANSYNC":
 			continue
 		if int(parts[1]) != PROTOCOL or parts[2] == device_id:
@@ -248,6 +306,82 @@ func _poll_server() -> void:
 		_phase = "accepted"
 
 
+## Sends this device's beacon to one address, which is how a scan gets answered.
+func _reply_beacon(to_address: String) -> void:
+	var packet := "LANSYNC|%d|%s|%s|%d" % [
+		PROTOCOL, device_id, label.replace("|", " "), sync_port
+	]
+	_udp.set_dest_address(to_address, DISCOVERY_PORT)
+	_udp.put_packet(packet.to_utf8_buffer())
+
+
+## The networks worth sweeping, best first. A desktop can easily carry half a
+## dozen addresses from virtual adapters and VPNs, and sweeping all of them would
+## mean thousands of probes for one real network, so the home ranges come first
+## and the list is cut short.
+func _local_prefixes() -> Array[String]:
+	var home: Array[String] = []
+	var other_private: Array[String] = []
+	var rest: Array[String] = []
+	for address: String in IP.get_local_addresses():
+		if address.begins_with("127.") or address.begins_with("169.254."):
+			continue
+		var parts := address.split(".")
+		if parts.size() != 4:
+			continue
+		var second := int(parts[1])
+		# Carrier grade NAT, which is what a tunnel hands out, is never the LAN.
+		if int(parts[0]) == 100 and second >= 64 and second <= 127:
+			continue
+		var prefix := "%s.%s.%s." % [parts[0], parts[1], parts[2]]
+		if prefix.begins_with("192.168."):
+			if not home.has(prefix):
+				home.append(prefix)
+		elif prefix.begins_with("10."):
+			if not other_private.has(prefix):
+				other_private.append(prefix)
+		elif not rest.has(prefix):
+			rest.append(prefix)
+	var result: Array[String] = []
+	result.append_array(home)
+	result.append_array(other_private)
+	result.append_array(rest)
+	if result.size() > SCAN_MAX_PREFIXES:
+		result.resize(SCAN_MAX_PREFIXES)
+	return result
+
+
+## One batch of probes per frame, so a sweep never blocks the drawing view.
+func _poll_scan() -> void:
+	if _scan_pending.is_empty():
+		return
+	var sent := 0
+	while not _scan_pending.is_empty() and sent < SCAN_BATCH:
+		if not _udp.is_bound():
+			_scan_pending.clear()
+			return
+		var host: String = _scan_pending.pop_back()
+		var packet := "LANSYNC?|%d|%s|%s|%d" % [
+			PROTOCOL, device_id, label.replace("|", " "), sync_port
+		]
+		_udp.set_dest_address(host, DISCOVERY_PORT)
+		_udp.put_packet(packet.to_utf8_buffer())
+		sent += 1
+	if _scan_pending.is_empty():
+		log_line.emit("扫描请求已全部发出，回应的设备会出现在列表里")
+		scan_finished.emit()
+
+
+## A request nobody answers must not hold a connection open forever.
+func _poll_consent() -> void:
+	if _consent_at == 0:
+		return
+	if Time.get_ticks_msec() - _consent_at > int(CONSENT_TIMEOUT * 1000.0):
+		_consent_at = 0
+		log_line.emit("确认超时，已断开")
+		_drop_peer("")
+
+
 func _open_peer(address: String, port: int, id: String, peer_label: String) -> void:
 	_drop_peer("")
 	var socket := StreamPeerTCP.new()
@@ -271,6 +405,7 @@ func _drop_peer(reason: String) -> void:
 	_peer_label = ""
 	_initiator = false
 	_phase = ""
+	_consent_at = 0
 	_buffer = PackedByteArray()
 	_outbox.clear()
 	_get_queue.clear()
@@ -346,6 +481,10 @@ func _handle_line(text: String) -> void:
 	match str(message.get("t", "")):
 		"hello":
 			_handle_hello(message)
+		"hello_ok":
+			_handle_hello_ok()
+		"hello_no":
+			_handle_hello_no()
 		"request":
 			_send_manifest()
 		"manifest":
@@ -357,6 +496,21 @@ func _handle_line(text: String) -> void:
 		"done":
 			_phase = "done"
 			log_line.emit("同步完成")
+
+
+## The other side agreed: from here on this side may ask for the manifest.
+func _handle_hello_ok() -> void:
+	if not _initiator or _phase != "await_consent":
+		return
+	_phase = "manifest"
+	_note_peer("已连接")
+	log_line.emit("对方已同意，开始同步")
+	_outbox.append({"t": "request"})
+
+
+func _handle_hello_no() -> void:
+	log_line.emit("对方拒绝了这次同步")
+	_drop_peer("")
 
 
 func _handle_hello(message: Dictionary) -> void:
@@ -374,10 +528,20 @@ func _handle_hello(message: Dictionary) -> void:
 		log_line.emit("没有同名的同步文件夹，什么也没做")
 		_drop_peer("")
 		return
-	log_line.emit("已连接 %s · 共同文件夹 %s" % [_peer_label, ", ".join(shared)])
 	if _initiator:
-		_phase = "manifest"
-		_outbox.append({"t": "request"})
+		# The dialer asks for nothing until the other side has agreed, so a probe
+		# of the network never turns into a sync nobody approved.
+		_phase = "await_consent"
+		_note_peer("等待对方确认")
+		log_line.emit("已连上 %s，等待对方确认" % _peer_label)
+		return
+	_consent_at = Time.get_ticks_msec()
+	_consent_label = _peer_label
+	_consent_address = str(peers.get(_peer_id, {}).get("address", ""))
+	_phase = "consent"
+	_note_peer("待确认")
+	log_line.emit("%s（%s）请求同步，等待本机同意" % [_peer_label, _consent_address])
+	consent_requested.emit(_peer_id, _peer_label, _consent_address)
 
 
 func _shared_folders(remote_names: Variant) -> Array[String]:
