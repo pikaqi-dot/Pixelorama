@@ -174,8 +174,8 @@ func _refresh_status() -> void:
 	if not _core.running:
 		_status.text = "未开始 · 点「开始」让同一局域网里的编辑器找到这台设备"
 		return
-	_status.text = "运行中 · 端口 %d · 文件夹 %d 个\n本机 %s" % [
-		int(_core.sync_port), _core.folders.size(), str(_core.local_addresses())
+	_status.text = "运行中 · 文件夹 %d 个\n本机地址（可直接填到对方）%s" % [
+		_core.folders.size(), str(_core.local_endpoints())
 	]
 
 

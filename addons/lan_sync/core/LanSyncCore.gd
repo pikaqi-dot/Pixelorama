@@ -177,14 +177,47 @@ func scan() -> void:
 ## The IPv4 addresses this device answers on, for the status line. Somebody has to
 ## read one of these out loud when the two sides cannot find each other.
 func local_addresses() -> String:
+	return ", ".join(_local_ipv4())
+
+
+## The same addresses with the port attached. "10.52.20.82:45990" is the exact text
+## to type on the other device, so it is handed over ready-made instead of being
+## assembled from two separate lines by eye.
+func local_endpoints() -> String:
+	var port_text := "?"
+	if sync_port > 0:
+		port_text = str(sync_port)
 	var list: Array[String] = []
+	for address: String in _local_ipv4():
+		list.append("%s:%s" % [address, port_text])
+	return ", ".join(list)
+
+
+## The usable addresses, best first. A desktop easily carries half a dozen from
+## virtual adapters and VPNs, and the ones nobody can reach from the phone are
+## exactly the ones that crowd a status line, so they are pushed to the end.
+func _local_ipv4() -> Array[String]:
+	var direct: Array[String] = []
+	var host_only: Array[String] = []
 	for address: String in IP.get_local_addresses():
 		if address.contains(":") or address.begins_with("127."):
 			continue
 		if address.begins_with("169.254."):
 			continue
-		list.append(address)
-	return ", ".join(list)
+		var parts := address.split(".")
+		if parts.size() != 4:
+			continue
+		# Carrier grade NAT, which is what a tunnel hands out, is never the LAN.
+		if int(parts[0]) == 100 and int(parts[1]) >= 64 and int(parts[1]) <= 127:
+			continue
+		# Hyper-V, WSL and VPN switches hold the ".1" end of their own network:
+		# nothing but this machine answers there, so they go last.
+		if address.ends_with(".1"):
+			host_only.append(address)
+		else:
+			direct.append(address)
+	direct.append_array(host_only)
+	return direct
 
 
 ## Answers the device that asked to sync. Nothing moves until this is called, on
