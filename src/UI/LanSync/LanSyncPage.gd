@@ -226,6 +226,7 @@ func _build() -> void:
 	_start_button = _button("开始", _on_start_pressed)
 	run_row.add_child(_start_button)
 	run_row.add_child(_button("扫描局域网", _on_scan_pressed))
+	run_row.add_child(_button("同步一次", _on_sync_now_pressed))
 	run_row.add_child(_button("按地址连接", _on_connect_pressed))
 	column.add_child(run_row)
 	_address_edit = _line_edit("地址 例 192.168.1.20:45990")
@@ -294,7 +295,12 @@ func _refresh_status() -> void:
 	if _core == null or not visible:
 		return
 	if _core.running:
-		_status.text = "运行中 · 文件夹 %d 个" % _core.folders.size()
+		_status.text = "运行中 · 文件夹 %d 个 · 附近 %d 台 · 已发 %d / 已收 %d" % [
+			_core.folders.size(),
+			_core.peers.size(),
+			int(_core.get("sent_files")),
+			int(_core.get("received_files")),
+		]
 	else:
 		_status.text = "未开始 · 点「开始」让同一局域网里的编辑器找到这台设备"
 	# Updated even while stopped: the address is what gets typed in by hand when
@@ -411,6 +417,11 @@ func _on_remove_folder() -> void:
 
 func _on_scan_pressed() -> void:
 	_core.scan()
+	_refresh_status()
+
+
+func _on_sync_now_pressed() -> void:
+	_core.call("request_sync_now")
 	_refresh_status()
 
 

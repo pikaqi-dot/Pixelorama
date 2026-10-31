@@ -35,8 +35,13 @@ const BEACON_INTERVAL := 1.0
 ## A peer not heard from for this long is shown as gone.
 const PEER_TIMEOUT := 5.0
 ## Largest single file that is moved. A bigger one is left alone and reported,
-## which keeps a stray video out of the memory of a phone.
-const MAX_FILE_BYTES := 1_500_000
+## which keeps a stray video out of the memory of a phone. A project file is
+## easily a few megabytes, so the ceiling is set for those, not for sprites.
+const MAX_FILE_BYTES := 4_000_000
+## How often a finished link asks for another round. A sync is not an event that
+## happens once when two devices meet: a file saved ten seconds later has to
+## travel too, and asking again is cheaper than reconnecting.
+const RESYNC_INTERVAL := 3.0
 ## Most files read from one folder. A pasted music library is not what this is for.
 const MAX_FILES := 4000
 const CONFIG_PATH := "user://lan_sync.cfg"
@@ -95,6 +100,17 @@ var _scan_active := false
 ## Where the current link came from, for the peer list: a hello does not carry it.
 var _peer_address := ""
 var _peer_since := 0
+## Counters of the current link, for the status line and the round summary.
+var sent_files := 0
+var received_files := 0
+var _resync_left := 0.0
+## What the last report said, so a round that moved nothing stays out of the log.
+var _reported_sent := 0
+var _reported_received := 0
+## Whether a manifest was asked for, so either side can start a round.
+var _awaiting_manifest := false
+## When the application was paused, and how long it was away.
+var _paused_at := 0
 
 
 func _init() -> void:
@@ -104,6 +120,31 @@ func _init() -> void:
 
 func _ready() -> void:
 	set_process(false)
+
+
+## A phone that opens a file picker leaves the application: the main loop stops,
+## but the clock does not. Every deadline is shifted by the time it was away, or
+## the link would time out and a consent request would die while the person is
+## still choosing a folder.
+func _notification(what: int) -> void:
+	if what == NOTIFICATION_APPLICATION_PAUSED:
+		_paused_at = Time.get_ticks_msec()
+	elif what == NOTIFICATION_APPLICATION_RESUMED:
+		if _paused_at > 0:
+			_shift_deadlines(Time.get_ticks_msec() - _paused_at)
+		_paused_at = 0
+
+
+func _shift_deadlines(elapsed: int) -> void:
+	if elapsed <= 0:
+		return
+	if _peer_since > 0:
+		_peer_since += elapsed
+	if _consent_at > 0:
+		_consent_at += elapsed
+	for id: String in peers:
+		var entry: Dictionary = peers[id]
+		entry["last_seen"] = int(entry.get("last_seen", 0)) + elapsed
 
 
 func _process(delta: float) -> void:
@@ -120,6 +161,7 @@ func _process(delta: float) -> void:
 	_poll_consent()
 	_poll_server()
 	_poll_peer()
+	_poll_resync(delta)
 	_poll_timeouts()
 
 
@@ -340,6 +382,21 @@ func answer_consent(agree: bool) -> void:
 		return
 	_outbox.append({"t": "hello_no"})
 	_drop_peer("已拒绝 %s" % _consent_label)
+
+
+## Asks the current link for another round, without waiting for the timer. The
+## other side answers with its manifest, so either end can start one.
+func request_sync_now() -> void:
+	if _peer == null:
+		log_line.emit("还没连上：先点「扫描局域网」或「按地址连接」")
+		return
+	if _phase == "manifest" or _phase == "transfer":
+		log_line.emit("正在同步，稍等")
+		return
+	_outbox.append({"t": "request"})
+	_awaiting_manifest = true
+	_phase = "manifest"
+	log_line.emit("请求同步…")
 
 
 func set_folder(folder_name: String, path: String) -> void:
@@ -595,6 +652,23 @@ func _poll_sweep() -> void:
 	_sweep_sockets = keep
 
 
+## Keeps a finished link alive for later changes. Only the side that dialed asks,
+## so two timers never trade manifests across one socket; whoever ended up as the
+## responder is asked by the next round anyway.
+func _poll_resync(delta: float) -> void:
+	if _peer == null or not _initiator:
+		return
+	if _phase != "done" or _awaiting_manifest:
+		return
+	_resync_left -= delta
+	if _resync_left > 0.0:
+		return
+	_resync_left = RESYNC_INTERVAL
+	_outbox.append({"t": "request"})
+	_awaiting_manifest = true
+	_phase = "manifest"
+
+
 ## A request nobody answers must not hold a connection open forever.
 func _poll_consent() -> void:
 	if _consent_at == 0:
@@ -647,12 +721,18 @@ func _drop_peer(reason: String) -> void:
 	_peer_since = 0
 	_initiator = false
 	_phase = ""
+	_awaiting_manifest = false
+	_resync_left = 0.0
 	_consent_at = 0
 	_buffer = PackedByteArray()
 	_outbox.clear()
 	_get_queue.clear()
 	_expecting = 0
 	_received = 0
+	sent_files = 0
+	received_files = 0
+	_reported_sent = 0
+	_reported_received = 0
 	if not reason.is_empty():
 		log_line.emit(reason)
 
@@ -745,7 +825,8 @@ func _handle_line(text: String) -> void:
 			_receive_file(message)
 		"done":
 			_phase = "done"
-			log_line.emit("同步完成")
+			_resync_left = RESYNC_INTERVAL
+			_report_round()
 
 
 ## The other side agreed: from here on this side may ask for the manifest.
@@ -753,6 +834,7 @@ func _handle_hello_ok() -> void:
 	if not _initiator or _phase != "await_consent":
 		return
 	_phase = "manifest"
+	_awaiting_manifest = true
 	_note_peer("已连接")
 	log_line.emit("对方已同意，开始同步")
 	_outbox.append({"t": "request"})
@@ -816,8 +898,11 @@ func _send_manifest() -> void:
 
 
 func _handle_manifest(message: Dictionary) -> void:
-	if not _initiator:
+	# Whoever asked for it plans the round, so a look at the peer's list is only
+	# answered when one was actually requested.
+	if not _awaiting_manifest:
 		return
+	_awaiting_manifest = false
 	var remote_names := {}
 	var files: Variant = message.get("files", [])
 	var remote := {}
@@ -827,6 +912,14 @@ func _handle_manifest(message: Dictionary) -> void:
 				remote[str((entry as Dictionary).get("key", ""))] = entry
 				remote_names[str((entry as Dictionary).get("key", ""))] = true
 	_plan(remote)
+	# Nothing to receive would leave the round parked in "transfer" forever, and
+	# the next round would never be asked for: a link that has nothing to do is a
+	# finished round, not a hung one.
+	if _expecting == 0:
+		_phase = "done"
+		_resync_left = RESYNC_INTERVAL
+		_report_round()
+		return
 	_phase = "transfer"
 
 
@@ -861,6 +954,7 @@ func _queue_push(key: String, entry: Dictionary) -> void:
 	var bytes := _read_file(key)
 	if bytes.is_empty():
 		return
+	sent_files += 1
 	_outbox.append(
 		{
 			"t": "file",
@@ -876,6 +970,7 @@ func _send_file(key: String) -> void:
 	if bytes.is_empty():
 		_outbox.append({"t": "file", "key": key, "data": ""})
 		return
+	sent_files += 1
 	_outbox.append(
 		{
 			"t": "file",
@@ -893,7 +988,10 @@ func _receive_file(message: Dictionary) -> void:
 		return
 	var bytes := Marshalls.base64_to_raw(data)
 	if bytes.size() > MAX_FILE_BYTES:
-		log_line.emit("%s 太大，已跳过" % key)
+		log_line.emit(
+			"%s 太大（%.1f MB），上限 %.1f MB，已跳过"
+			% [key, float(bytes.size()) / 1048576.0, float(MAX_FILE_BYTES) / 1048576.0]
+		)
 		return
 	var path := _absolute(key)
 	if path.is_empty():
@@ -908,15 +1006,30 @@ func _receive_file(message: Dictionary) -> void:
 	file.store_buffer(bytes)
 	file.close()
 	file_synced.emit(path, "in")
+	received_files += 1
 	log_line.emit("收到 %s" % key)
-	if not _initiator:
+	# Counting only matters on the side that planned the round; the other side is
+	# answering, and for it every arriving file is simply good news.
+	if _phase != "transfer":
 		_note_peer("已同步")
 		return
 	_received += 1
 	if _received >= _expecting:
 		_outbox.append({"t": "done"})
+		_phase = "done"
+		_resync_left = RESYNC_INTERVAL
 		_note_peer("已同步")
-		log_line.emit("同步完成")
+		_report_round()
+
+
+## A round that moved nothing is the normal case once two devices agree, and
+## saying so every three seconds would bury the lines that matter.
+func _report_round() -> void:
+	if sent_files == _reported_sent and received_files == _reported_received:
+		return
+	_reported_sent = sent_files
+	_reported_received = received_files
+	log_line.emit("同步完成：发出 %d 个，收到 %d 个" % [sent_files, received_files])
 
 
 func _note_peer(state: String) -> void:
@@ -983,8 +1096,12 @@ func _read_file(key: String) -> PackedByteArray:
 	var path := _absolute(key)
 	if path.is_empty() or not FileAccess.file_exists(path):
 		return PackedByteArray()
-	if _size_of(path) > MAX_FILE_BYTES:
-		log_line.emit("%s 超过大小上限，已跳过" % key)
+	var size := _size_of(path)
+	if size > MAX_FILE_BYTES:
+		log_line.emit(
+			"%s 太大（%.1f MB），上限 %.1f MB，已跳过"
+			% [key, float(size) / 1048576.0, float(MAX_FILE_BYTES) / 1048576.0]
+		)
 		return PackedByteArray()
 	return FileAccess.get_file_as_bytes(path)
 

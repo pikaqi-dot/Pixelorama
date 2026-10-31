@@ -117,6 +117,10 @@ func _build() -> void:
 	scan_button.text = "扫描局域网"
 	scan_button.pressed.connect(_on_scan_pressed)
 	run_row.add_child(scan_button)
+	var sync_button := Button.new()
+	sync_button.text = "同步一次"
+	sync_button.pressed.connect(_on_sync_now_pressed)
+	run_row.add_child(sync_button)
 	var connect_button := Button.new()
 	connect_button.text = "按地址连接"
 	connect_button.pressed.connect(_on_connect_pressed)
@@ -177,7 +181,10 @@ func _refresh_status() -> void:
 	if _core == null:
 		return
 	if _core.running:
-		_status.text = "运行中 · %s" % str(_core.label)
+		_status.text = "运行中 · %s · 附近 %d 台 · 已发 %d / 已收 %d" % [
+			str(_core.label), _core.peers.size(),
+			int(_core.get("sent_files")), int(_core.get("received_files"))
+		]
 	else:
 		_status.text = "未开始 · 点「开始」才会监听"
 	# Updated even while stopped: the address is what gets typed in by hand when
@@ -274,6 +281,11 @@ func _on_remove_folder() -> void:
 
 func _on_scan_pressed() -> void:
 	_core.scan()
+	_refresh_status()
+
+
+func _on_sync_now_pressed() -> void:
+	_core.call("request_sync_now")
 	_refresh_status()
 
 
