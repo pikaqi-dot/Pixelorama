@@ -18,8 +18,6 @@ extends Node
 signal peers_changed()
 signal log_line(text: String)
 signal file_synced(path: String, direction: String)
-## A device asked to sync and is waiting for this side to say yes.
-signal consent_requested(id: String, peer_label: String, address: String)
 ## A scan has queued all of its probes.
 signal scan_finished()
 
@@ -59,8 +57,6 @@ const SCAN_BATCH := 24
 ## Networks swept in one scan. A phone has one, a desktop with virtual adapters
 ## may have six, and probing all of them would only cost time.
 const SCAN_MAX_PREFIXES := 4
-## A request nobody answers must not hold a connection open forever.
-const CONSENT_TIMEOUT := 30.0
 ## Dial attempts a sweep keeps open at once. Every address of a /24 is tried, but
 ## only this many sockets exist at a time, so a phone never holds 254 of them.
 const SWEEP_WINDOW := 48
@@ -105,9 +101,6 @@ var _phase := ""
 ## Addresses still to probe, and the label of a hello waiting for an answer.
 var _scan_pending: Array[String] = []
 var _scan_base_peers := 0
-var _consent_at := 0
-var _consent_label := ""
-var _consent_address := ""
 ## Addresses a sweep still has to dial, and the dials it is waiting on.
 var _sweep_queue: Array[String] = []
 var _sweep_sockets: Array[Dictionary] = []
@@ -189,8 +182,6 @@ func _shift_deadlines(elapsed: int) -> void:
 		_peer_since += elapsed
 	if _peer_last_rx > 0:
 		_peer_last_rx += elapsed
-	if _consent_at > 0:
-		_consent_at += elapsed
 	for id: String in peers:
 		var entry: Dictionary = peers[id]
 		entry["last_seen"] = int(entry.get("last_seen", 0)) + elapsed
@@ -207,7 +198,6 @@ func _process(delta: float) -> void:
 	_poll_sweep()
 	_report_scan()
 	_poll_discovery()
-	_poll_consent()
 	_poll_server()
 	# Before _poll_peer, so the chunks appended here leave on this same frame.
 	_poll_send()
@@ -259,7 +249,6 @@ func stop() -> void:
 	_sweep_sockets.clear()
 	_scan_active = false
 	_reconnect_at = 0
-	_consent_at = 0
 	running = false
 	set_process(false)
 	peers.clear()
@@ -421,20 +410,28 @@ func _usable_ipv4(address: String) -> String:
 	return address
 
 
-## Answers the device that asked to sync. Nothing moves until this is called, on
-## the side that received the connection.
-func answer_consent(agree: bool) -> void:
-	if _consent_at == 0 or _peer == null:
-		return
-	_consent_at = 0
-	if agree:
-		_outbox.append({"t": "hello_ok"})
-		_phase = "connected"
-		_note_peer("已连接")
-		log_line.emit("已允许 %s 连接；点「同步一次」会把它的文件拉过来" % _consent_label)
-		return
-	_outbox.append({"t": "hello_no"})
-	_drop_peer("已拒绝 %s" % _consent_label)
+## One line for the panel: what the link is doing at this moment. A list of peers
+## says who is nearby; only this says whether anything is connected.
+func link_text() -> String:
+	if not running:
+		return "未开始"
+	if _peer != null:
+		var who := _peer_label if not _peer_label.is_empty() else "对方"
+		var where := _peer_address if not _peer_address.is_empty() else "?"
+		match _phase:
+			"connecting", "hello":
+				return "正在连接 %s（%s）…" % [who, where]
+			"manifest":
+				return "已连接 %s（%s）· 正在核对清单" % [who, where]
+			"transfer":
+				return "已连接 %s（%s）· 正在传输" % [who, where]
+			_:
+				return "已连接 %s（%s）" % [who, where]
+	if _reconnect_at > 0:
+		return "已断开，重连中（%s:%d）" % [_reconnect_address, _reconnect_port]
+	if not peers.is_empty():
+		return "发现 %d 台设备，正在自动连接…" % peers.size()
+	return "等待设备…"
 
 
 ## Pulls the other side's folder into this one, overwriting local files that
@@ -741,16 +738,6 @@ func _poll_sweep() -> void:
 	_sweep_sockets = keep
 
 
-## A request nobody answers must not hold a connection open forever.
-func _poll_consent() -> void:
-	if _consent_at == 0:
-		return
-	if Time.get_ticks_msec() - _consent_at > int(CONSENT_TIMEOUT * 1000.0):
-		_consent_at = 0
-		log_line.emit("确认超时，已断开")
-		_drop_peer("")
-
-
 func _open_peer(
 	address: String, port: int, id: String, peer_label: String, quiet := false
 ) -> void:
@@ -790,7 +777,7 @@ func _adopt_peer(socket: StreamPeerTCP, address: String) -> void:
 	_initiator = true
 	_buffer = PackedByteArray()
 	_phase = "connecting"
-	log_line.emit("已连上 %s:%d，等待对方确认" % [address, SYNC_PORT])
+	log_line.emit("已连上 %s:%d，握手中…" % [address, SYNC_PORT])
 
 
 ## A link is dropped, but the address that worked is remembered: a phone that was
@@ -855,7 +842,6 @@ func _drop_peer(reason: String) -> void:
 	_awaiting_manifest = false
 	_has_plan = false
 	_pulling = false
-	_consent_at = 0
 	_buffer = PackedByteArray()
 	_write_left = PackedByteArray()
 	_outbox.clear()
@@ -991,18 +977,20 @@ func _handle_line(text: String) -> void:
 			_report_round()
 
 
-## The other side agreed. Nothing is exchanged from here on until somebody presses
+## The other side accepted. Nothing is exchanged from here on until somebody presses
 ## the button: the link is a channel, not a schedule.
 func _handle_hello_ok() -> void:
-	if not _initiator or _phase != "await_consent":
+	if not _initiator:
 		return
 	_phase = "connected"
 	_note_peer("已连接")
-	log_line.emit("对方已同意；点「同步一次」把它的文件拉过来")
+	log_line.emit("已连上 %s；点「同步一次」把它那边的文件拉过来" % _peer_label)
 
 
 func _handle_hello_no() -> void:
-	log_line.emit("对方拒绝了这次同步")
+	# Kept for compatibility with a peer that still gates the connection: this
+	# build never sends it.
+	log_line.emit("对方拒绝连接")
 	_drop_peer("")
 
 
@@ -1015,26 +1003,23 @@ func _handle_hello(message: Dictionary) -> void:
 		_peer_id = str(message.get("id", ""))
 	_peer_label = str(message.get("label", "?"))
 	_remember_peer(_peer_id, _peer_label, _peer_address, 0)
-	_note_peer("已连接")
 	var shared := _shared_folders(message.get("folders", []))
 	if shared.is_empty():
 		log_line.emit("没有同名的同步文件夹，什么也没做")
 		_drop_peer("")
 		return
 	if _initiator:
-		# The dialer asks for nothing until the other side has agreed, so a probe
-		# of the network never turns into a sync nobody approved.
-		_phase = "await_consent"
-		_note_peer("等待对方确认")
-		log_line.emit("已连上 %s，等待对方确认" % _peer_label)
+		# The dialer already sent its own hello and is waiting for hello_ok. Saying
+		# anything else here would send a second hello for every one received.
+		_note_peer("连接中")
 		return
-	_consent_at = Time.get_ticks_msec()
-	_consent_label = _peer_label
-	_consent_address = str(peers.get(_peer_id, {}).get("address", ""))
-	_phase = "consent"
-	_note_peer("待确认")
-	log_line.emit("%s（%s）请求同步，等待本机同意" % [_peer_label, _consent_address])
-	consent_requested.emit(_peer_id, _peer_label, _consent_address)
+	# Connecting is the whole handshake now: a link is accepted as soon as it is
+	# understood, because there is nothing to approve — nothing moves until
+	# somebody presses 「同步一次」 anyway, and that press is the approval.
+	_outbox.append({"t": "hello_ok"})
+	_phase = "connected"
+	_note_peer("已连接")
+	log_line.emit("已连上 %s（%s）" % [_peer_label, _peer_address])
 
 
 func _shared_folders(remote_names: Variant) -> Array[String]:

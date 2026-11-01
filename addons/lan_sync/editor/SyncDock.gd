@@ -22,7 +22,6 @@ var _name_edit: LineEdit
 var _path_edit: LineEdit
 var _address_edit: LineEdit
 var _start_button: Button
-var _consent_dialog: ConfirmationDialog
 var _browse_dialog: EditorFileDialog
 var _rescan_left := 0.0
 
@@ -34,7 +33,6 @@ func _ready() -> void:
 	_core.log_line.connect(_on_log)
 	_core.peers_changed.connect(_refresh_peers)
 	_core.file_synced.connect(_on_file_synced)
-	_core.consent_requested.connect(_on_consent_requested)
 	add_child(_core)
 	if _core.folders.is_empty():
 		_ensure_default_folder()
@@ -185,12 +183,12 @@ func _refresh_status() -> void:
 	if _core == null:
 		return
 	if _core.running:
-		_status.text = "运行中 · %s · 附近 %d 台 · 已发 %d / 已收 %d" % [
-			str(_core.label), _core.peers.size(),
+		_status.text = "%s · 已发 %d / 已收 %d" % [
+			str(_core.call("link_text")),
 			int(_core.get("sent_files")), int(_core.get("received_files"))
 		]
 	else:
-		_status.text = "未开始 · 点「开始」才会监听"
+		_status.text = "未开始 · 点「开始」后自动发现并连接另一侧"
 	# Updated even while stopped: the address is what gets typed in by hand when
 	# nothing else works, so it must not wait on a successful start.
 	_endpoint_edit.text = str(_core.primary_endpoint())
@@ -291,25 +289,6 @@ func _on_scan_pressed() -> void:
 func _on_sync_now_pressed() -> void:
 	_core.call("request_sync_now")
 	_refresh_status()
-
-
-## Another device wants to sync: nothing moves until this is answered.
-func _on_consent_requested(id: String, peer_label: String, address: String) -> void:
-	if is_instance_valid(_consent_dialog):
-		_consent_dialog.queue_free()
-	_consent_dialog = ConfirmationDialog.new()
-	_consent_dialog.title = "同步请求"
-	_consent_dialog.dialog_text = (
-		"%s（%s）请求连接。\n同意后，任意一侧点「同步一次」都能把对方的文件拉过来，覆盖本机同名文件。"
-		% [peer_label, address]
-	)
-	_consent_dialog.ok_button_text = "同意"
-	_consent_dialog.cancel_button_text = "拒绝"
-	_consent_dialog.confirmed.connect(_core.answer_consent.bind(true))
-	_consent_dialog.canceled.connect(_core.answer_consent.bind(false))
-	add_child(_consent_dialog)
-	_consent_dialog.popup_centered(Vector2i(420, 160))
-	_on_log("%s 请求同步，等待确认" % peer_label)
 
 
 func _on_connect_pressed() -> void:
