@@ -25,6 +25,28 @@
 下面依旧是属性列表。导入的资源在 Godot 里是**只读**的——它由 `.pxo` 生成，不能就地改；
 要改就回 Pixelorama 编辑源文件，保存后切回 Godot 会自动重新导入。
 
+## 导出成 Godot 自己的资源
+
+`.pxo` 导入出来的是只读资源，Godot 的动画编辑器、切片工具都打不开它。预览面板上有两个按钮，
+在 `.pxo` 旁边写出普通文件，之后就能用原生工具：
+
+| 按钮 | 产出 | 用来做什么 |
+|---|---|---|
+| 帧资源 | `<名字>_spriteframes.tres` | 双击进 SpriteFrames 面板编辑；拖给 `AnimatedSprite2D` |
+| 精灵表 | `<名字>_sheet.png` | `Sprite2D` 设 `hframes`/`vframes` 切片；`TileSet` 当图集 |
+
+- 帧资源内嵌图像，不依赖 `.pxo`，可以随便改；重新点按钮会覆盖它（它就是从 `.pxo` 派生的）。
+- 精灵表按画布尺寸横向排一行，第 N 格就是第 N 帧。想换行数就在代码里调
+  `PxoExport.export_sheet(project, path, columns)`。
+
+```gdscript
+# 生成精灵表后用 hframes 切片
+$Sprite2D.texture = preload("res://art/player_sheet.png")
+$Sprite2D.hframes = 4
+$Sprite2D.vframes = 1
+$Sprite2D.frame = 2
+```
+
 ## 用
 
 ### 动画：给 AnimatedSprite2D
@@ -123,4 +145,5 @@ PxoProject (Resource)
 | `pxo_import_plugin.gd` | `EditorImportPlugin` | 否 |
 | `pxo_inspector_plugin.gd` | 让 Inspector 显示预览 | 否 |
 | `pxo_preview.gd` | 预览面板本身 | 否 |
+| `pxo_export.gd` | 导出 SpriteFrames / 精灵表 | 否 |
 | `plugin.gd` / `plugin.cfg` | 编辑器插件注册 | 否 |

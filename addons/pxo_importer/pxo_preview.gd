@@ -10,8 +10,11 @@ extends VBoxContainer
 const THUMB := 96
 const CAPTION_HEIGHT := 26
 
+const ExportScript := preload("res://addons/pxo_importer/pxo_export.gd")
+
 var project: PxoProject
 
+var _note: Label
 var _info: Label
 var _frames_row: HBoxContainer
 var _layers_row: HBoxContainer
@@ -33,12 +36,12 @@ func setup(source: PxoProject) -> void:
 func _build() -> void:
 	add_theme_constant_override("separation", 6)
 
-	var note := Label.new()
-	note.text = "从 .pxo 导入的只读资源：改动请编辑源文件，保存后 Godot 会自动重新导入。"
-	note.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	note.add_theme_font_size_override("font_size", 11)
-	note.add_theme_color_override("font_color", Color(0.68, 0.72, 0.8))
-	add_child(note)
+	_note = Label.new()
+	_note.text = "从 .pxo 导入的只读资源：改动请编辑源文件，保存后 Godot 会自动重新导入。"
+	_note.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	_note.add_theme_font_size_override("font_size", 11)
+	_note.add_theme_color_override("font_color", Color(0.68, 0.72, 0.8))
+	add_child(_note)
 
 	_info = Label.new()
 	_info.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
@@ -53,6 +56,19 @@ func _build() -> void:
 	_play.tooltip_text = "按工程的 fps 轮播各帧"
 	_play.toggled.connect(_on_play_toggled)
 	controls.add_child(_play)
+
+	# The two files Godot's own tools can open: the animation editor needs a
+	# SpriteFrames, the sprite and tile tools need one image to slice.
+	var frames_button := Button.new()
+	frames_button.text = "帧资源"
+	frames_button.tooltip_text = "生成 SpriteFrames 资源：可在 SpriteFrames 面板里编辑，直接给 AnimatedSprite2D 用"
+	frames_button.pressed.connect(_on_export_sprite_frames)
+	controls.add_child(frames_button)
+	var sheet_button := Button.new()
+	sheet_button.text = "精灵表"
+	sheet_button.tooltip_text = "把所有帧拼成一张 PNG：Sprite2D 用 hframes/vframes 切片，TileSet 当图集"
+	sheet_button.pressed.connect(_on_export_sheet)
+	controls.add_child(sheet_button)
 
 	_timer = Timer.new()
 	_timer.wait_time = 1.0 / max(0.001, project.fps if project != null else 12.0)
@@ -152,6 +168,38 @@ func _thumb_button(texture: Texture2D, caption: String) -> Button:
 	label.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	column.add_child(label)
 	return button
+
+
+## Writes the SpriteFrames resource next to the `.pxo` and shows it in the
+## FileSystem dock, so it can be dragged onto an AnimatedSprite2D or opened in the
+## SpriteFrames panel.
+func _on_export_sprite_frames() -> void:
+	if project == null:
+		return
+	var path := ExportScript.default_sprite_frames_path(project.source_path)
+	var err: Error = ExportScript.export_sprite_frames(project, path)
+	_reported(path, err, "双击它就能在 SpriteFrames 面板里编辑")
+
+
+## Writes the grid image next to the `.pxo`.
+func _on_export_sheet() -> void:
+	if project == null:
+		return
+	var path := ExportScript.default_sheet_path(project.source_path)
+	var err: Error = ExportScript.export_sheet(project, path)
+	_reported(path, err, "Sprite2D 设 hframes=%d、vframes=1 即可切片" % project.frames.size())
+
+
+func _reported(path: String, err: Error, hint: String) -> void:
+	if err != OK:
+		_note.text = "生成失败：%s（错误 %d）" % [path, err]
+		return
+	_note.text = "已生成 %s —— %s" % [path, hint]
+	if Engine.is_editor_hint():
+		# The new file has to show up in the FileSystem dock before it can be
+		# dragged anywhere, and a scan is the only reliable way for a file that
+		# did not exist a moment ago.
+		EditorInterface.get_resource_filesystem().scan()
 
 
 func _on_play_toggled(pressed: bool) -> void:
