@@ -5,6 +5,7 @@ extends VBoxContainer
 ## lives in the core, so the dock is only a view of it.
 
 const CoreScript := preload("res://addons/lan_sync/core/LanSyncCore.gd")
+const LogStyle := preload("res://addons/lan_sync/ui/log_style.gd")
 ## Folder shared out of the box. Both sides default to the same name, so a fresh
 ## install on either end lines up without any setup at all.
 const DEFAULT_NAME := "shared"
@@ -354,9 +355,7 @@ func _on_connect_pressed() -> void:
 
 
 func _on_log(text: String) -> void:
-	if not is_instance_valid(_log):
-		return
-	_log.append_text("[color=#9fb0c8]•[/color] %s\n" % text)
+	LogStyle.append_to(_log, text)
 
 
 func _on_file_synced(path: String, direction: String) -> void:

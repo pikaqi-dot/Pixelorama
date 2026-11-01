@@ -7,6 +7,7 @@ extends Control
 signal page_closed()
 
 const CoreScript := preload("res://addons/lan_sync/core/LanSyncCore.gd")
+const LogStyle := preload("res://addons/lan_sync/ui/log_style.gd")
 ## Folder shared out of the box, named the same way the editor dock names its
 ## own, so a fresh build and a fresh dock line up with no setup at all.
 const DEFAULT_NAME := "shared"
@@ -559,8 +560,7 @@ func _on_connect_pressed() -> void:
 
 
 func _on_log(text: String) -> void:
-	if is_instance_valid(_log):
-		_log.append_text("[color=#9fb0c8]•[/color] %s\n" % text)
+	LogStyle.append_to(_log, text)
 
 
 func _on_file_synced(path: String, direction: String) -> void:
