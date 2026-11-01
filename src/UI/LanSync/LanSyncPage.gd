@@ -13,8 +13,11 @@ const DEFAULT_NAME := "shared"
 const DEFAULT_FOLDER := "user://lan_shared"
 ## Sub-folder of the system Downloads directory used on a phone.
 const DOWNLOADS_SUBDIR := "Pixelorama"
-const ROW_HEIGHT := 44
-const MARGIN := 14
+## Sized for a phone in landscape: every row that is not the log is a row the
+## log does not get, so the controls are deliberately short and tight.
+const ROW_HEIGHT := 34
+const MARGIN := 8
+const SEPARATION := 5
 
 var _core: Node
 var _folders: ItemList
@@ -28,6 +31,10 @@ var _path_edit: LineEdit
 var _address_edit: LineEdit
 var _start_button: Button
 var _browse_dialog: FileDialog
+## Folder management is a one-time chore, so it lives behind a toggle instead of
+## taking four rows away from the log on every visit.
+var _folder_box: VBoxContainer
+var _folder_toggle: CheckButton
 
 
 func _ready() -> void:
@@ -184,25 +191,23 @@ func _build() -> void:
 	margin.add_theme_constant_override("margin_bottom", MARGIN)
 	add_child(margin)
 	var column := VBoxContainer.new()
-	column.add_theme_constant_override("separation", 8)
+	column.add_theme_constant_override("separation", SEPARATION)
 	margin.add_child(column)
 
-	var title := Label.new()
-	title.text = "局域网同步"
-	title.add_theme_font_size_override("font_size", 18)
-	column.add_child(title)
-
+	# No page title: the tab already says 同步, and a title row costs the log a
+	# whole line on a phone.
 	_status = Label.new()
 	_status.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	_status.add_theme_font_size_override("font_size", 13)
+	_status.add_theme_font_size_override("font_size", 12)
 	column.add_child(_status)
 
-	# Its own row, not a line inside the status text: this is the one thing that
-	# has to be read off a phone screen and typed into another machine, so it has
-	# to be selectable and it has to be there before anything is started.
-	column.add_child(_heading("本机地址（填到对方）"))
+	# Address and copy share one row. It is still selectable and still there
+	# before anything is started, it just no longer owns a heading and a row of
+	# its own.
 	var endpoint_row := HBoxContainer.new()
+	endpoint_row.add_theme_constant_override("separation", SEPARATION)
 	column.add_child(endpoint_row)
+	endpoint_row.add_child(_heading("本机地址"))
 	_endpoint_edit = LineEdit.new()
 	_endpoint_edit.editable = false
 	_endpoint_edit.size_flags_horizontal = Control.SIZE_EXPAND_FILL
@@ -210,64 +215,102 @@ func _build() -> void:
 	endpoint_row.add_child(_endpoint_edit)
 	endpoint_row.add_child(_button("复制", _on_copy_endpoint))
 
-	column.add_child(_heading("同步文件夹"))
+	var run_row := HBoxContainer.new()
+	run_row.add_theme_constant_override("separation", SEPARATION)
+	column.add_child(run_row)
+	_start_button = _button("开始", _on_start_pressed)
+	run_row.add_child(_start_button)
+	run_row.add_child(_button("扫描", _on_scan_pressed))
+	# Which way the files go is the one thing about this button that is easy to
+	# get wrong, so it is written down — in the tooltip, where it costs no row.
+	var sync_button := _button("同步一次", _on_sync_now_pressed)
+	sync_button.tooltip_text = "把对方的文件拉过来，覆盖本机同名文件"
+	run_row.add_child(sync_button)
+
+	_folder_toggle = CheckButton.new()
+	_folder_toggle.text = "文件夹与地址"
+	_folder_toggle.add_theme_font_size_override("font_size", 12)
+	_folder_toggle.custom_minimum_size = Vector2(0, 26)
+	_folder_toggle.toggled.connect(_on_folder_toggle)
+	column.add_child(_folder_toggle)
+
+	_folder_box = VBoxContainer.new()
+	_folder_box.add_theme_constant_override("separation", SEPARATION)
+	_folder_box.visible = false
+	column.add_child(_folder_box)
 	_folders = ItemList.new()
-	_folders.custom_minimum_size = Vector2(0, 70)
-	column.add_child(_folders)
+	_folders.custom_minimum_size = Vector2(0, 56)
+	_folder_box.add_child(_folders)
 	var add_row := HBoxContainer.new()
+	add_row.add_theme_constant_override("separation", SEPARATION)
+	_folder_box.add_child(add_row)
 	_name_edit = _line_edit("名称（留空取目录名）")
-	_name_edit.custom_minimum_size = Vector2(110, ROW_HEIGHT)
+	_name_edit.custom_minimum_size = Vector2(96, ROW_HEIGHT)
 	add_row.add_child(_name_edit)
 	_path_edit = _line_edit("留空则用默认目录")
 	add_row.add_child(_path_edit)
-	column.add_child(add_row)
 	var folder_row := HBoxContainer.new()
+	folder_row.add_theme_constant_override("separation", SEPARATION)
+	_folder_box.add_child(folder_row)
 	folder_row.add_child(_button("浏览", _on_browse_folder))
 	folder_row.add_child(_button("添加", _on_add_folder))
 	folder_row.add_child(_button("移到下载目录", _on_use_downloads))
 	folder_row.add_child(_button("移除选中", _on_remove_folder))
-	column.add_child(folder_row)
-
-	var run_row := HBoxContainer.new()
-	_start_button = _button("开始", _on_start_pressed)
-	run_row.add_child(_start_button)
-	run_row.add_child(_button("扫描局域网", _on_scan_pressed))
-	run_row.add_child(_button("同步一次", _on_sync_now_pressed))
-	run_row.add_child(_button("按地址连接", _on_connect_pressed))
-	column.add_child(run_row)
-
-	# Which way the files go is the one thing about this button that is easy to
-	# get wrong, so it is written down instead of being implied by its name.
-	column.add_child(_heading("「同步一次」= 把对方的文件拉过来，覆盖本机同名文件"))
+	# Connecting by hand is a fallback that is reached for rarely, so it belongs
+	# with the rest of the setup rather than in the row of everyday buttons.
+	var address_row := HBoxContainer.new()
+	address_row.add_theme_constant_override("separation", SEPARATION)
+	_folder_box.add_child(address_row)
 	_address_edit = _line_edit("地址 例 192.168.1.20:45990")
-	column.add_child(_address_edit)
+	address_row.add_child(_address_edit)
+	address_row.add_child(_button("按地址连接", _on_connect_pressed))
 
-	column.add_child(_heading("附近设备"))
+	# The two lists sit in a band that can scroll, so however many devices or
+	# files turn up they never push the log off the bottom of the screen.
+	var scroll := ScrollContainer.new()
+	scroll.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	scroll.size_flags_stretch_ratio = 1.0
+	scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+	column.add_child(scroll)
+	var lists := VBoxContainer.new()
+	lists.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	lists.add_theme_constant_override("separation", SEPARATION)
+	scroll.add_child(lists)
+	lists.add_child(_heading("附近设备"))
 	_peers = ItemList.new()
-	_peers.custom_minimum_size = Vector2(0, 60)
-	column.add_child(_peers)
-
+	_peers.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_peers.custom_minimum_size = Vector2(0, 44)
+	lists.add_child(_peers)
 	# What the other side is offering, before anything is taken: a pull is a
 	# decision, and a decision needs a list to look at.
-	column.add_child(_heading("对方的文件"))
+	lists.add_child(_heading("对方的文件"))
 	_remote_files = ItemList.new()
-	_remote_files.custom_minimum_size = Vector2(0, 90)
-	column.add_child(_remote_files)
+	_remote_files.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_remote_files.custom_minimum_size = Vector2(0, 64)
+	lists.add_child(_remote_files)
 
+	# The log gets the larger share of what is left: it is the part that is
+	# actually read, and the part that was unreadable on a phone.
 	column.add_child(_heading("日志"))
 	_log = RichTextLabel.new()
 	_log.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	_log.size_flags_stretch_ratio = 2.0
+	_log.custom_minimum_size = Vector2(0, 96)
 	_log.scroll_following = true
-	_log.add_theme_font_size_override("normal_font_size", 12)
+	_log.add_theme_font_size_override("normal_font_size", 11)
 	column.add_child(_log)
 
 	column.add_child(_button("返回绘画", _on_close_pressed))
 
 
+func _on_folder_toggle(pressed: bool) -> void:
+	_folder_box.visible = pressed
+
+
 func _heading(text: String) -> Label:
 	var label := Label.new()
 	label.text = text
-	label.add_theme_font_size_override("font_size", 13)
+	label.add_theme_font_size_override("font_size", 11)
 	label.add_theme_color_override("font_color", Color(0.68, 0.72, 0.8))
 	return label
 
@@ -295,6 +338,9 @@ func _refresh_folders() -> void:
 		# The count is the answer to the first question anybody asks when nothing
 		# moves: is there anything in there at all?
 		_folders.add_item("%s → %s（%d 个文件）" % [folder_name, path, int(_core.call("count_files", path))])
+	# The toggle carries the count so the collapsed state is still informative.
+	if is_instance_valid(_folder_toggle):
+		_folder_toggle.text = "文件夹与地址 · %d 个" % _core.folders.size()
 
 
 func _refresh_peers() -> void:
@@ -461,6 +507,9 @@ func _on_sync_now_pressed() -> void:
 func _on_connect_pressed() -> void:
 	var text := _address_edit.text.strip_edges()
 	if text.is_empty():
+		# Silent failure reads as "the button does nothing"; the address field
+		# lives in the collapsed setup now, so say where to type it.
+		_on_log("先在「文件夹与地址」里填对方的地址，例如 192.168.1.20:45990")
 		return
 	var port := int(CoreScript.SYNC_PORT)
 	var parts := text.split(":")
