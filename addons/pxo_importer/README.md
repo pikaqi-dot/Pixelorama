@@ -7,12 +7,24 @@
 
 不需要导出 PNG 序列，不需要安装 Pixelorama 就能在游戏里读。
 
-## 启用
+## 安装到任意工程
 
-1. 项目 → 项目设置 → 插件，勾上 **PXO Importer**（或确认 `project.godot` 的
-   `[editor_plugins]` 里已有 `res://addons/pxo_importer/plugin.cfg`）。
-2. 把 `.pxo` 拖进文件系统面板。
-3. 在 Pixelorama 里改完再保存，切回 Godot 会自动重新导入，和 `.png` 一样。
+这个插件**自包含**：所有代码都在 `addons/pxo_importer/` 里，不引用 Pixelorama 仓库里的
+其他任何文件（没有 autoload、没有 `res://src/`、没有别的 addon），拷走就能用。
+
+1. 把整个 `addons/pxo_importer/` 文件夹复制到目标工程的 `addons/` 下。
+   保持文件夹名 `addons/pxo_importer`——插件内部用绝对路径互相引用，改名会找不到。
+2. 项目 → 项目设置 → 插件，勾上 **PXO Importer**（等同于在 `project.godot` 的
+   `[editor_plugins]` 里加上 `res://addons/pxo_importer/plugin.cfg`）。
+3. 把 `.pxo` 拖进文件系统面板。
+4. 在 Pixelorama 里改完再保存，切回 Godot 会自动重新导入，和 `.png` 一样。
+
+插件注册了三个全局类名：`PxoProject`、`PxoFrame`、`PxoTileset`。同名冲突只会发生在
+另一个插件也用了这三个名字的情况下。
+
+不用编辑器插件、只想在运行时读 `.pxo` 的话，可以不启用插件，直接保留
+`pxo_project.gd` / `pxo_frame.gd` / `pxo_reader.gd` / `pxo_tileset.gd` 四个脚本即可
+（见文末的文件表）。
 
 ## 在编辑器里看
 
@@ -181,7 +193,7 @@ PxoProject (Resource)
 | `pxo_project.gd` | 资源类型 | 是 |
 | `pxo_frame.gd` | 单帧资源类型 | 是 |
 | `pxo_tileset.gd` | 图块集 → `TileSet` / `TileMapLayer`（运行时可调） | 是 |
-| `pxo_reader.gd` | 解析器（导入时用） | 否 |
+| `pxo_reader.gd` | 解析器：导入时用；运行时想直接读 `.pxo` 也用它 | 否（运行时直读才需要） |
 | `pxo_import_plugin.gd` | `EditorImportPlugin` | 否 |
 | `pxo_inspector_plugin.gd` | 让 Inspector 显示预览 | 否 |
 | `pxo_preview.gd` | 预览面板本身 | 否 |
