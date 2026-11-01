@@ -119,8 +119,8 @@ func _build() -> void:
 	scan_button.pressed.connect(_on_scan_pressed)
 	run_row.add_child(scan_button)
 	var sync_button := Button.new()
-	sync_button.text = "同步一次"
-	sync_button.tooltip_text = "把对方的文件拉过来，覆盖本机同名文件"
+	sync_button.text = "同步"
+	sync_button.tooltip_text = "把对方的文件拉过来；修改时间相同的文件不会覆盖"
 	sync_button.pressed.connect(_on_sync_now_pressed)
 	run_row.add_child(sync_button)
 	var connect_button := Button.new()
@@ -139,9 +139,10 @@ func _build() -> void:
 	add_child(_peers)
 
 	# What the other side is offering, before anything is taken.
-	add_child(_heading("对方的文件"))
+	add_child(_heading("对方的文件（双击一行只同步这一个）"))
 	_remote_files = ItemList.new()
 	_remote_files.custom_minimum_size = Vector2(0, 70)
+	_remote_files.item_activated.connect(_on_remote_file_activated)
 	add_child(_remote_files)
 
 	add_child(_heading("日志"))
@@ -192,11 +193,40 @@ func _refresh_remote_files() -> void:
 	if not is_instance_valid(_remote_files):
 		return
 	_remote_files.clear()
-	if _core.peer_files.is_empty():
+	if _core.peer_entries.is_empty():
 		_remote_files.add_item("（对方的清单是空的，或还没连上）")
+		_remote_files.set_item_disabled(0, true)
 		return
-	for key: String in _core.peer_files:
-		_remote_files.add_item(key)
+	for entry: Dictionary in _core.peer_entries:
+		_remote_files.add_item(
+			"%s · %s" % [str(entry.get("key", "")), _mtime_text(int(entry.get("mtime", 0)))]
+		)
+
+
+## A modification time as it reads in a file manager.
+func _mtime_text(mtime: int) -> String:
+	if mtime <= 0:
+		return "时间未知"
+	var when := Time.get_datetime_dict_from_unix_time(mtime)
+	return "%02d-%02d %02d:%02d:%02d" % [
+		int(when["month"]),
+		int(when["day"]),
+		int(when["hour"]),
+		int(when["minute"]),
+		int(when["second"]),
+	]
+
+
+## Double-clicking one row takes that file and nothing else, so a single stale
+## project can be replaced without touching the rest of the folder.
+func _on_remote_file_activated(index: int) -> void:
+	if index < 0 or index >= _core.peer_entries.size():
+		return
+	var key := str(_core.peer_entries[index].get("key", ""))
+	if key.is_empty():
+		return
+	_core.call("request_file", key)
+	_refresh_status()
 
 
 func _refresh_status() -> void:

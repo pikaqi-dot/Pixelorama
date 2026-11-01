@@ -88,6 +88,12 @@ var sync_port := 0
 var peers: Dictionary = {}
 ## The file keys the other side last reported, for the panel's file list.
 var peer_files: Array[String] = []
+## The same list with what came alongside each key: {key, mtime, size, h}. The
+## panel shows the timestamp, and the timestamp is also what decides whether a
+## file is worth overwriting at all.
+var peer_entries: Array[Dictionary] = []
+## Keys a pull is narrowed to. Empty means "everything on the other side".
+var _pull_keys: Array[String] = []
 
 var _udp := PacketPeerUDP.new()
 var _server := TCPServer.new()
@@ -443,21 +449,44 @@ func link_text() -> String:
 ## which side asks decides which way the files go.
 func request_sync_now() -> void:
 	if _peer == null:
-		log_line.emit("还没连上：先点「扫描局域网」或「按地址连接」")
+		log_line.emit("还没连上：先点「扫描」或「按地址连接」")
 		return
 	if _phase == "manifest" or _phase == "transfer":
 		log_line.emit("正在同步，稍等")
 		return
 	if _phase == "connecting" or _phase == "hello" or _phase == "await_consent" \
 			or _phase == "consent":
-		log_line.emit("还没连上（等对方点同意），稍后再点")
+		log_line.emit("还没连上，稍后再点")
 		return
+	_pull_keys.clear()
 	_outbox.append({"t": "pull"})
 	_awaiting_manifest = true
 	_pulling = true
 	_manual_round = true
 	_phase = "manifest"
 	log_line.emit("开始拉取对方的文件…")
+
+
+## Pulls exactly one file, by the key the panel shows. It runs over the same
+## channel as a full sync, narrowed to one key, so a single .pxo can be replaced
+## without touching anything else. A click on one file is a deliberate choice, so
+## this is also the one case where an equal timestamp does not block the copy.
+func request_file(key: String) -> void:
+	if key.is_empty():
+		return
+	if _peer == null:
+		log_line.emit("还没连上：先点「扫描」或「按地址连接」")
+		return
+	if _phase == "manifest" or _phase == "transfer":
+		log_line.emit("正在同步，稍等")
+		return
+	_pull_keys = [key]
+	_outbox.append({"t": "pull"})
+	_awaiting_manifest = true
+	_pulling = true
+	_manual_round = true
+	_phase = "manifest"
+	log_line.emit("准备同步 %s…" % key)
 
 
 ## Asks for the other side's file list without taking anything. Called once a link
@@ -1006,7 +1035,7 @@ func _handle_hello_ok() -> void:
 		return
 	_phase = "connected"
 	_note_peer("已连接")
-	log_line.emit("已连上 %s；点「同步一次」把它那边的文件拉过来" % _peer_label)
+	log_line.emit("已连上 %s；点「同步」把它那边的文件拉过来" % _peer_label)
 	list_peer_files()
 
 
@@ -1038,7 +1067,7 @@ func _handle_hello(message: Dictionary) -> void:
 		return
 	# Connecting is the whole handshake now: a link is accepted as soon as it is
 	# understood, because there is nothing to approve — nothing moves until
-	# somebody presses 「同步一次」 anyway, and that press is the approval.
+	# somebody presses 「同步」 anyway, and that press is the approval.
 	_outbox.append({"t": "hello_ok"})
 	_phase = "connected"
 	_note_peer("已连接")
@@ -1103,10 +1132,24 @@ func _handle_manifest(message: Dictionary) -> void:
 	if not _pulling:
 		# A list request: show what the other side has and stop there. Nothing is
 		# fetched, because nothing was asked to be.
-		peer_files.clear()
+		var keys: Array[String] = []
 		for key: String in remote:
-			peer_files.append(key)
-		peer_files.sort()
+			keys.append(key)
+		keys.sort()
+		peer_files = keys
+		# The timestamp travels with the list: it is what a person reads to decide
+		# whether the copy on the other side is the one they want.
+		peer_entries.clear()
+		for key: String in keys:
+			var entry: Dictionary = remote[key]
+			peer_entries.append(
+				{
+					"key": key,
+					"mtime": int(entry.get("mtime", 0)),
+					"size": int(entry.get("size", 0)),
+					"h": str(entry.get("h", "")),
+				}
+			)
 		peer_files_changed.emit()
 		_phase = "connected"
 		log_line.emit("对方" + _manifest_summary(remote))
@@ -1138,7 +1181,13 @@ func _plan_pull(remote: Dictionary) -> void:
 	_skipped_files = 0
 	var unshared := 0
 	var identical := 0
+	var same_time := 0
+	# A single-file pull is a deliberate click on one row, so it overrides the
+	# timestamp rule below; a whole-folder sync obeys it.
+	var forced := not _pull_keys.is_empty()
 	for key: String in remote:
+		if forced and not _pull_keys.has(key):
+			continue
 		# A key whose folder this side does not share would be asked for and then
 		# dropped on arrival, leaving the pull waiting for a file that never lands.
 		if _absolute(key).is_empty():
@@ -1148,19 +1197,31 @@ func _plan_pull(remote: Dictionary) -> void:
 			if str(local[key].get("h", "")) == str(remote[key].get("h", "-")):
 				identical += 1
 				continue
+			# An identical modification time means both copies come from the same
+			# write, so neither is newer and a sync has no business replacing one
+			# with the other. Only a real edit moves the timestamp.
+			if not forced \
+					and int(local[key].get("mtime", -1)) == int(remote[key].get("mtime", -2)):
+				same_time += 1
+				continue
 		_get_queue.append(key)
 		_expecting += 1
 	# "0 files moved" has four causes and only one of them is good news, so the
 	# other three are said out loud instead of being left to be guessed at.
-	_skipped_files = unshared + identical
+	_skipped_files = unshared + identical + same_time
 	if unshared > 0:
 		log_line.emit("%d 个文件所属的文件夹没有在本机共享，已跳过" % unshared)
 	if identical > 0:
 		log_line.emit("%d 个文件内容已经相同，已跳过" % identical)
+	if same_time > 0:
+		log_line.emit("%d 个文件修改时间相同，未覆盖" % same_time)
 	for key: String in _get_queue:
 		_outbox.append({"t": "get", "key": key})
 	if _expecting == 0:
 		_outbox.append({"t": "done"})
+	# The narrow pull is spent once it has been turned into a get queue; leaving
+	# it set would silently narrow the next full sync to the same single file.
+	_pull_keys.clear()
 
 
 ## Puts a file on the outgoing list. Nothing is read here: the bytes are taken
@@ -1377,7 +1438,7 @@ func _size_text(bytes: int) -> String:
 ## saying so every three seconds would bury the lines that matter.
 func _report_round() -> void:
 	# A round nobody asked for stays quiet when it moved nothing; a round somebody
-	# pressed 「同步一次」 for always answers, because silence there is
+	# pressed 「同步」 for always answers, because silence there is
 	# indistinguishable from "the button does nothing".
 	var asked := _manual_round
 	var planned := _has_plan
@@ -1398,7 +1459,7 @@ func _report_round() -> void:
 	)
 	if _local_file_count > 0 or _peer_file_count > 0:
 		return
-	log_line.emit("两侧的共享文件夹里都还没有文件：把文件存进去，再点「同步一次」")
+	log_line.emit("两侧的共享文件夹里都还没有文件：把文件存进去，再点「同步」")
 
 
 func _note_peer(state: String) -> void:
