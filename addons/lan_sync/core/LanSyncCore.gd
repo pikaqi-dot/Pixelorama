@@ -75,6 +75,10 @@ const IDLE_SILENCE := 8.0
 ## A link that fell over is dialed again after this pause, then every retry.
 const RECONNECT_DELAY := 1.0
 const RECONNECT_RETRY := 3.0
+## Dials at the remembered address before the network is swept as well. The same
+## network usually answers on the first try; a phone that hopped to another Wi-Fi
+## only answers a sweep, and dialling a dead address forever would never find it.
+const RECONNECT_SCAN_AFTER := 3
 
 ## Folder name to absolute path. The name is what the two peers match on.
 var folders: Dictionary = {}
@@ -134,10 +138,20 @@ var _write_left := PackedByteArray()
 ## When the peer last said anything, and where to dial it again after a loss.
 var _peer_last_rx := 0
 var _peer_port := 0
+## The address and port the other side is actually listening on, remembered for
+## the life of the session. Unlike the live socket's address this survives a
+## dropped link, and unlike the accepted side's view it is a port worth dialling,
+## so coming back from the background can go straight at it.
+var _link_address := ""
+var _link_port := 0
 var _reconnect_at := 0
 var _reconnect_address := ""
 var _reconnect_port := 0
 var _reconnect_tries := 0
+## Dials since the link was last up. A phone that changed networks will never
+## reach the old address again, so after a few misses the network is swept as
+## well, which is the only thing that finds a peer on a new subnet.
+var _reconnect_failures := 0
 ## path -> {size, mtime, hash, checked}. Rounds run every three seconds; reading
 ## every file that often would make an idle link cost as much as a busy one.
 var _hash_cache: Dictionary = {}
@@ -178,11 +192,21 @@ func _notification(what: int) -> void:
 		if _paused_at > 0:
 			_shift_deadlines(Time.get_ticks_msec() - _paused_at)
 		_paused_at = 0
-		# Back on screen: a link that died while the app was suspended is dialed
-		# again now instead of on some timer. Nothing is pulled here — pulling is
-		# the person's decision, not a side effect of switching apps.
-		if _peer == null and not _reconnect_address.is_empty():
-			_reconnect_at = Time.get_ticks_msec()
+		# Back on screen: dial the address that worked last time, right now, rather
+		# than on some timer. That address is tried before anything else — a sweep
+		# of the whole subnet is the fallback, not the first move. A phone that
+		# changed networks cannot reach the old address, so a sweep is scheduled as
+		# well once dialling has missed a few times. Nothing is pulled here:
+		# pulling is the person's decision, not a side effect of switching apps.
+		if _peer == null:
+			if not _link_address.is_empty() and _link_port > 0:
+				_reconnect_address = _link_address
+				_reconnect_port = _link_port
+				_reconnect_tries = 0
+				_reconnect_at = Time.get_ticks_msec()
+			if _reconnect_failures >= RECONNECT_SCAN_AFTER:
+				_reconnect_failures = 0
+				scan()
 
 
 func _shift_deadlines(elapsed: int) -> void:
@@ -620,6 +644,12 @@ func _remember_peer(id: String, peer_label: String, address: String, port: int) 
 		entry["address"] = address
 	if port > 0:
 		entry["port"] = port
+	# A beacon is the only word on which port the peer listens on, and it keeps
+	# arriving while the link is up. Keeping it here means a drop — or a phone
+	# waking up on a different address — always has somewhere to dial.
+	if id == _peer_id and port > 0 and not address.is_empty():
+		_link_address = address
+		_link_port = port
 	if added:
 		peers_changed.emit()
 		log_line.emit("发现 %s（%s）" % [peer_label, address])
@@ -800,7 +830,10 @@ func _open_peer(
 	_peer_port = port
 	_peer_since = Time.get_ticks_msec()
 	_peer_last_rx = Time.get_ticks_msec()
+	_link_address = address
+	_link_port = port
 	_reconnect_at = 0
+	_reconnect_failures = 0
 	_initiator = true
 	_buffer = PackedByteArray()
 	_phase = "connecting"
@@ -819,7 +852,10 @@ func _adopt_peer(socket: StreamPeerTCP, address: String) -> void:
 	_peer_port = SYNC_PORT
 	_peer_since = Time.get_ticks_msec()
 	_peer_last_rx = Time.get_ticks_msec()
+	_link_address = address
+	_link_port = SYNC_PORT
 	_reconnect_at = 0
+	_reconnect_failures = 0
 	_initiator = true
 	_buffer = PackedByteArray()
 	_phase = "connecting"
@@ -829,13 +865,12 @@ func _adopt_peer(socket: StreamPeerTCP, address: String) -> void:
 ## A link is dropped, but the address that worked is remembered: a phone that was
 ## in the background, or a Wi-Fi hiccup, must not end the session for good.
 func _link_lost(reason: String) -> void:
-	var address := _peer_address
-	var port := _peer_port
-	# Only a port somebody is listening on is worth dialling. The dialer knows its
-	# own target; the side that accepted holds the peer's *ephemeral* port, and the
-	# beacon is the only other place that knows the listening one. Dialling a dead
-	# port would also hold the slot that a good incoming connection needs.
-	var dialable := _initiator
+	# Always the remembered listening address, never the live socket's one: the
+	# side that accepted holds the peer's *ephemeral* port, which nothing listens
+	# on. [_link_address] is written from whichever source knew better — the dial
+	# itself, or a beacon heard since.
+	var address := _link_address
+	var port := _link_port
 	if peers.has(_peer_id):
 		var entry: Dictionary = peers[_peer_id]
 		var heard_port := int(entry.get("port", 0))
@@ -843,14 +878,12 @@ func _link_lost(reason: String) -> void:
 		if heard_port > 0 and not heard_address.is_empty():
 			address = heard_address
 			port = heard_port
-			dialable = true
-	if not dialable:
-		address = ""
 	_drop_peer(reason)
 	if address.is_empty() or port <= 0:
 		return
 	_reconnect_address = address
 	_reconnect_port = port
+	_reconnect_tries = 0
 	_reconnect_at = Time.get_ticks_msec() + int(RECONNECT_DELAY * 1000.0)
 	log_line.emit("连接断了，%d 秒后重连 %s:%d" % [int(RECONNECT_DELAY), address, port])
 
@@ -866,10 +899,17 @@ func _poll_reconnect() -> void:
 		return
 	_reconnect_at = now + int(RECONNECT_RETRY * 1000.0)
 	_reconnect_tries += 1
+	_reconnect_failures += 1
 	if _reconnect_tries == 1 or _reconnect_tries % 10 == 0:
 		log_line.emit(
 			"重连 %s:%d（第 %d 次）" % [_reconnect_address, _reconnect_port, _reconnect_tries]
 		)
+	# The remembered address has stopped answering, which on a phone usually means
+	# it is on another network now. Sweep as well; the dials above keep going, so a
+	# peer that is still there is picked up by whichever arrives first.
+	if _reconnect_failures == RECONNECT_SCAN_AFTER:
+		log_line.emit("上次的地址连不上，开始扫描局域网")
+		scan()
 	_open_peer(_reconnect_address, _reconnect_port, "", "", true)
 
 
@@ -1038,6 +1078,7 @@ func _handle_hello_ok() -> void:
 	if not _initiator:
 		return
 	_phase = "connected"
+	_reconnect_failures = 0
 	_note_peer("已连接")
 	log_line.emit("已连上 %s；点「同步」把它那边的文件拉过来" % _peer_label)
 	list_peer_files()
@@ -1074,6 +1115,7 @@ func _handle_hello(message: Dictionary) -> void:
 	# somebody presses 「同步」 anyway, and that press is the approval.
 	_outbox.append({"t": "hello_ok"})
 	_phase = "connected"
+	_reconnect_failures = 0
 	_note_peer("已连接")
 	log_line.emit("已连上 %s（%s）" % [_peer_label, _peer_address])
 	list_peer_files()
