@@ -40,13 +40,9 @@ const CHUNK_BYTES := 262144
 ## Chunks handed to the socket per frame, which is also what stops a long send
 ## from freezing the UI of the side doing the sending.
 const CHUNKS_PER_FRAME := 4
-## How often a finished link asks for another round. A sync is not an event that
-## happens once when two devices meet: a file saved ten seconds later has to
-## travel too, and asking again is cheaper than reconnecting.
-const RESYNC_INTERVAL := 3.0
-## How long a round may go without hearing anything before it is abandoned. The
+## How long a pull may go without hearing anything before it is abandoned. The
 ## link is kept, because the other side is probably asleep; only the half finished
-## round is dropped, or the next one would never be asked for.
+## pull is dropped, so the next press of the button starts clean.
 const TRANSFER_SILENCE := 15.0
 ## How long a computed hash is trusted. A round runs every three seconds, and
 ## re-reading every file that often is the one cost worth avoiding — but a
@@ -122,7 +118,6 @@ var _peer_since := 0
 ## Counters of the current link, for the status line and the round summary.
 var sent_files := 0
 var received_files := 0
-var _resync_left := 0.0
 ## What the last report said, so a round that moved nothing stays out of the log.
 var _reported_sent := 0
 var _reported_received := 0
@@ -151,8 +146,10 @@ var _manual_round := false
 ## Whether this side planned the round, and so knows both sides' file counts. The
 ## side that only answered does not, and must not report zeros as facts.
 var _has_plan := false
-## Whether a manifest was asked for, so either side can start a round.
+## Whether a manifest was asked for, and whether it was asked for in order to
+## pull: a pull overwrites, it does not negotiate which copy is newer.
 var _awaiting_manifest := false
+var _pulling := false
 ## When the application was paused, and how long it was away.
 var _paused_at := 0
 
@@ -177,12 +174,10 @@ func _notification(what: int) -> void:
 		if _paused_at > 0:
 			_shift_deadlines(Time.get_ticks_msec() - _paused_at)
 		_paused_at = 0
-		# Back on screen: either the link survived the nap and gets a round right
-		# away, or it died while the app was suspended and is dialed again now
-		# instead of on some timer.
-		if _peer != null:
-			request_sync_now()
-		elif not _reconnect_address.is_empty():
+		# Back on screen: a link that died while the app was suspended is dialed
+		# again now instead of on some timer. Nothing is pulled here — pulling is
+		# the person's decision, not a side effect of switching apps.
+		if _peer == null and not _reconnect_address.is_empty():
 			_reconnect_at = Time.get_ticks_msec()
 
 
@@ -217,7 +212,6 @@ func _process(delta: float) -> void:
 	_poll_send()
 	_poll_peer()
 	_poll_reconnect()
-	_poll_resync(delta)
 	_poll_watchdog()
 	_poll_timeouts()
 
@@ -434,16 +428,17 @@ func answer_consent(agree: bool) -> void:
 	_consent_at = 0
 	if agree:
 		_outbox.append({"t": "hello_ok"})
-		_phase = "manifest"
+		_phase = "connected"
 		_note_peer("已连接")
-		log_line.emit("已允许 %s 同步" % _consent_label)
+		log_line.emit("已允许 %s 连接；点「同步一次」会把它的文件拉过来" % _consent_label)
 		return
 	_outbox.append({"t": "hello_no"})
 	_drop_peer("已拒绝 %s" % _consent_label)
 
 
-## Asks the current link for another round, without waiting for the timer. The
-## other side answers with its manifest, so either end can start one.
+## Pulls the other side's folder into this one, overwriting local files that
+## differ. Nothing happens by itself: a sync is something a person asks for, and
+## which side asks decides which way the files go.
 func request_sync_now() -> void:
 	if _peer == null:
 		log_line.emit("还没连上：先点「扫描局域网」或「按地址连接」")
@@ -451,11 +446,12 @@ func request_sync_now() -> void:
 	if _phase == "manifest" or _phase == "transfer":
 		log_line.emit("正在同步，稍等")
 		return
-	_outbox.append({"t": "request"})
+	_outbox.append({"t": "pull"})
 	_awaiting_manifest = true
+	_pulling = true
 	_manual_round = true
 	_phase = "manifest"
-	log_line.emit("请求同步…")
+	log_line.emit("开始拉取对方的文件…")
 
 
 ## Rough file count of a folder, capped: enough to tell "this folder is empty"
@@ -740,28 +736,6 @@ func _poll_sweep() -> void:
 	_sweep_sockets = keep
 
 
-## Keeps a finished link alive for later changes. Only the side that dialed asks,
-## so two timers never trade manifests across one socket; whoever ended up as the
-## responder is asked by the next round anyway.
-func _poll_resync(delta: float) -> void:
-	if _peer == null or not _initiator:
-		return
-	if _phase != "done" or _awaiting_manifest:
-		return
-	# A peer that has said nothing for a while is asleep, not gone: an Android app
-	# in the background answers nothing at all, and every request typed into that
-	# silence is one more message it has to work through when it wakes up.
-	if Time.get_ticks_msec() - _peer_last_rx > int(IDLE_SILENCE * 1000.0):
-		return
-	_resync_left -= delta
-	if _resync_left > 0.0:
-		return
-	_resync_left = RESYNC_INTERVAL
-	_outbox.append({"t": "request"})
-	_awaiting_manifest = true
-	_phase = "manifest"
-
-
 ## A request nobody answers must not hold a connection open forever.
 func _poll_consent() -> void:
 	if _consent_at == 0:
@@ -875,7 +849,7 @@ func _drop_peer(reason: String) -> void:
 	_phase = ""
 	_awaiting_manifest = false
 	_has_plan = false
-	_resync_left = 0.0
+	_pulling = false
 	_consent_at = 0
 	_buffer = PackedByteArray()
 	_write_left = PackedByteArray()
@@ -991,7 +965,9 @@ func _handle_line(text: String) -> void:
 			_handle_hello_ok()
 		"hello_no":
 			_handle_hello_no()
-		"request":
+		# The other side is pulling: hand over the list, and wait to be asked for
+		# the files one by one. Nothing travels the other way.
+		"pull":
 			_send_manifest()
 		"manifest":
 			_handle_manifest(message)
@@ -1005,19 +981,17 @@ func _handle_line(text: String) -> void:
 			_handle_file_end(message)
 		"done":
 			_phase = "done"
-			_resync_left = RESYNC_INTERVAL
 			_report_round()
 
 
-## The other side agreed: from here on this side may ask for the manifest.
+## The other side agreed. Nothing is exchanged from here on until somebody presses
+## the button: the link is a channel, not a schedule.
 func _handle_hello_ok() -> void:
 	if not _initiator or _phase != "await_consent":
 		return
-	_phase = "manifest"
-	_awaiting_manifest = true
+	_phase = "connected"
 	_note_peer("已连接")
-	log_line.emit("对方已同意，开始同步")
-	_outbox.append({"t": "request"})
+	log_line.emit("对方已同意；点「同步一次」把它的文件拉过来")
 
 
 func _handle_hello_no() -> void:
@@ -1078,36 +1052,35 @@ func _send_manifest() -> void:
 
 
 func _handle_manifest(message: Dictionary) -> void:
-	# Whoever asked for it plans the round, so a look at the peer's list is only
-	# answered when one was actually requested.
+	# A manifest only means something to the side that asked for it, and only one
+	# thing is ever asked for: a pull.
 	if not _awaiting_manifest:
 		return
 	_awaiting_manifest = false
-	var remote_names := {}
 	var files: Variant = message.get("files", [])
 	var remote := {}
 	if files is Array:
 		for entry: Variant in files:
 			if entry is Dictionary:
 				remote[str((entry as Dictionary).get("key", ""))] = entry
-				remote_names[str((entry as Dictionary).get("key", ""))] = true
-	_plan(remote)
-	# Nothing to receive would leave the round parked in "transfer" forever, and
-	# the next round would never be asked for: a link that has nothing to do is a
-	# finished round, not a hung one.
+	if not _pulling:
+		return
+	_pulling = false
+	_plan_pull(remote)
+	# Nothing to receive would leave the pull parked in "transfer" forever, and the
+	# button would stop working: an empty pull is a finished pull.
 	if _expecting == 0:
 		_phase = "done"
-		_resync_left = RESYNC_INTERVAL
-		# Files of ours may still be on their way out; the summary belongs after
-		# them, not before, or it reads "sent 0" for a round that sent something.
 		_report_if_idle()
 		return
 	_phase = "transfer"
 
 
-## Decides what moves. Both sides send a hash, so a file that only changed its
-## timestamp is left alone, and the newer one wins when the content differs.
-func _plan(remote: Dictionary) -> void:
+## Everything the other side has, this side takes: the button is a pull, so the
+## remote copy wins and a local file is overwritten whenever the content differs.
+## Files that already match are left alone — rewriting identical bytes would only
+## cost disk and time.
+func _plan_pull(remote: Dictionary) -> void:
 	var local := _build_manifest()
 	_peer_file_count = remote.size()
 	_local_file_count = local.size()
@@ -1116,19 +1089,15 @@ func _plan(remote: Dictionary) -> void:
 	_expecting = 0
 	_received = 0
 	for key: String in remote:
-		var remote_entry: Dictionary = remote[key]
+		# A key whose folder this side does not share would be asked for and then
+		# dropped on arrival, leaving the pull waiting for a file that never lands.
+		if _absolute(key).is_empty():
+			continue
 		if local.has(key):
-			var local_entry: Dictionary = local[key]
-			if str(local_entry.get("h", "")) == str(remote_entry.get("h", "-")):
-				continue
-			if int(remote_entry.get("mtime", 0)) <= int(local_entry.get("mtime", 0)):
-				_enqueue_file(key)
+			if str(local[key].get("h", "")) == str(remote[key].get("h", "-")):
 				continue
 		_get_queue.append(key)
 		_expecting += 1
-	for key: String in local:
-		if not remote.has(key):
-			_enqueue_file(key)
 	for key: String in _get_queue:
 		_outbox.append({"t": "get", "key": key})
 	if _expecting == 0:
@@ -1216,10 +1185,11 @@ func _finish_file() -> void:
 	_outbox.append({"t": "file_end", "key": _sending["key"]})
 	sent_files += 1
 	_sending = {}
-	_report_if_idle()
+	# No summary here: several files are served one after another, and a line per
+	# file would read like several separate syncs. The summary comes with `done`.
 
 
-## The round's summary waits until everything this side had to push has left.
+## The pull's summary waits until everything this side had to hand over has left.
 func _report_if_idle() -> void:
 	if not _sending.is_empty() or not _send_queue.is_empty():
 		return
@@ -1300,7 +1270,6 @@ func _finish_received() -> void:
 		return
 	_outbox.append({"t": "done"})
 	_phase = "done"
-	_resync_left = RESYNC_INTERVAL
 	_note_peer("已同步")
 	_report_round()
 
@@ -1321,7 +1290,6 @@ func _poll_watchdog() -> void:
 	_expecting = 0
 	_received = 0
 	_phase = "done"
-	_resync_left = RESYNC_INTERVAL
 	log_line.emit("传输中断，等对方回来再续")
 
 

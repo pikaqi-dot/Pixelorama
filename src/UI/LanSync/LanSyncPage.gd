@@ -229,6 +229,10 @@ func _build() -> void:
 	run_row.add_child(_button("同步一次", _on_sync_now_pressed))
 	run_row.add_child(_button("按地址连接", _on_connect_pressed))
 	column.add_child(run_row)
+
+	# Which way the files go is the one thing about this button that is easy to
+	# get wrong, so it is written down instead of being implied by its name.
+	column.add_child(_heading("「同步一次」= 把对方的文件拉过来，覆盖本机同名文件"))
 	_address_edit = _line_edit("地址 例 192.168.1.20:45990")
 	column.add_child(_address_edit)
 
@@ -435,9 +439,10 @@ func _on_consent_requested(id: String, peer_label: String, address: String) -> v
 		_consent_dialog.queue_free()
 	_consent_dialog = ConfirmationDialog.new()
 	_consent_dialog.title = "同步请求"
-	_consent_dialog.dialog_text = "%s（%s）请求同步文件。\n同意后，两侧同名文件夹会保持一致。" % [
-		peer_label, address
-	]
+	_consent_dialog.dialog_text = (
+		"%s（%s）请求连接。\n同意后，任意一侧点「同步一次」都能把对方的文件拉过来，覆盖本机同名文件。"
+		% [peer_label, address]
+	)
 	_consent_dialog.ok_button_text = "同意"
 	_consent_dialog.cancel_button_text = "拒绝"
 	_consent_dialog.confirmed.connect(_core.answer_consent.bind(true))

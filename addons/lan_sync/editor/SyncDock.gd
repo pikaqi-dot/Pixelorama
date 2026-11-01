@@ -119,6 +119,7 @@ func _build() -> void:
 	run_row.add_child(scan_button)
 	var sync_button := Button.new()
 	sync_button.text = "同步一次"
+	sync_button.tooltip_text = "把对方的文件拉过来，覆盖本机同名文件"
 	sync_button.pressed.connect(_on_sync_now_pressed)
 	run_row.add_child(sync_button)
 	var connect_button := Button.new()
@@ -298,9 +299,10 @@ func _on_consent_requested(id: String, peer_label: String, address: String) -> v
 		_consent_dialog.queue_free()
 	_consent_dialog = ConfirmationDialog.new()
 	_consent_dialog.title = "同步请求"
-	_consent_dialog.dialog_text = "%s（%s）请求与这个项目同步文件。\n同意后它的文件夹会与本机同名文件夹保持一致。" % [
-		peer_label, address
-	]
+	_consent_dialog.dialog_text = (
+		"%s（%s）请求连接。\n同意后，任意一侧点「同步一次」都能把对方的文件拉过来，覆盖本机同名文件。"
+		% [peer_label, address]
+	)
 	_consent_dialog.ok_button_text = "同意"
 	_consent_dialog.cancel_button_text = "拒绝"
 	_consent_dialog.confirmed.connect(_core.answer_consent.bind(true))
