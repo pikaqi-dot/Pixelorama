@@ -28,6 +28,9 @@ _tmp_*
 # Export build output
 /build/
 
+# LAN sync default shared folder, filled by whatever the phone sends
+/lan_shared/
+
 # macOS ignores
 .DS_Store
 
