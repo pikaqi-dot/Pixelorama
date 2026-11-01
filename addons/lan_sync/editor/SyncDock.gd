@@ -15,6 +15,7 @@ const RESCAN_DELAY := 0.5
 var _core: Node
 var _folders: ItemList
 var _peers: ItemList
+var _remote_files: ItemList
 var _log: RichTextLabel
 var _status: Label
 var _endpoint_edit: LineEdit
@@ -33,11 +34,13 @@ func _ready() -> void:
 	_core.log_line.connect(_on_log)
 	_core.peers_changed.connect(_refresh_peers)
 	_core.file_synced.connect(_on_file_synced)
+	_core.peer_files_changed.connect(_refresh_remote_files)
 	add_child(_core)
 	if _core.folders.is_empty():
 		_ensure_default_folder()
 	_refresh_folders()
 	_refresh_peers()
+	_refresh_remote_files()
 	_refresh_status()
 	_on_log("本机网卡：%s" % str(_core.local_details()))
 	_on_log("文件夹名两侧要一致；默认都是 %s" % DEFAULT_NAME)
@@ -135,6 +138,12 @@ func _build() -> void:
 	_peers.custom_minimum_size = Vector2(0, 50)
 	add_child(_peers)
 
+	# What the other side is offering, before anything is taken.
+	add_child(_heading("对方的文件"))
+	_remote_files = ItemList.new()
+	_remote_files.custom_minimum_size = Vector2(0, 70)
+	add_child(_remote_files)
+
 	add_child(_heading("日志"))
 	_log = RichTextLabel.new()
 	_log.size_flags_vertical = Control.SIZE_EXPAND_FILL
@@ -177,6 +186,17 @@ func _refresh_peers() -> void:
 			]
 		)
 	_refresh_status()
+
+
+func _refresh_remote_files() -> void:
+	if not is_instance_valid(_remote_files):
+		return
+	_remote_files.clear()
+	if _core.peer_files.is_empty():
+		_remote_files.add_item("（对方的清单是空的，或还没连上）")
+		return
+	for key: String in _core.peer_files:
+		_remote_files.add_item(key)
 
 
 func _refresh_status() -> void:

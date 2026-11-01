@@ -20,6 +20,8 @@ signal log_line(text: String)
 signal file_synced(path: String, direction: String)
 ## A scan has queued all of its probes.
 signal scan_finished()
+## The other side's manifest arrived: the list of what it has to offer.
+signal peer_files_changed()
 
 ## Version of the wire format. A peer speaking another one is reported instead of
 ## being half understood.
@@ -84,6 +86,8 @@ var sync_port := 0
 
 ## id -> {label, address, port, state, last_seen}
 var peers: Dictionary = {}
+## The file keys the other side last reported, for the panel's file list.
+var peer_files: Array[String] = []
 
 var _udp := PacketPeerUDP.new()
 var _server := TCPServer.new()
@@ -454,6 +458,19 @@ func request_sync_now() -> void:
 	_manual_round = true
 	_phase = "manifest"
 	log_line.emit("开始拉取对方的文件…")
+
+
+## Asks for the other side's file list without taking anything. Called once a link
+## comes up, so the panel can show what is on offer before anybody pulls.
+func list_peer_files() -> void:
+	if _peer == null or _awaiting_manifest:
+		return
+	if _phase == "manifest" or _phase == "transfer":
+		return
+	_outbox.append({"t": "list"})
+	_awaiting_manifest = true
+	_pulling = false
+	_phase = "manifest"
 
 
 ## Rough file count of a folder, capped: enough to tell "this folder is empty"
@@ -842,6 +859,8 @@ func _drop_peer(reason: String) -> void:
 	_awaiting_manifest = false
 	_has_plan = false
 	_pulling = false
+	peer_files.clear()
+	peer_files_changed.emit()
 	_buffer = PackedByteArray()
 	_write_left = PackedByteArray()
 	_outbox.clear()
@@ -962,6 +981,9 @@ func _handle_line(text: String) -> void:
 		"pull":
 			if _phase == "connected" or _phase == "done" or _phase.is_empty():
 				_send_manifest()
+		# Just the list, no files: the other side wants to see what is on offer.
+		"list":
+			_send_manifest()
 		"manifest":
 			_handle_manifest(message)
 		"get":
@@ -985,6 +1007,7 @@ func _handle_hello_ok() -> void:
 	_phase = "connected"
 	_note_peer("已连接")
 	log_line.emit("已连上 %s；点「同步一次」把它那边的文件拉过来" % _peer_label)
+	list_peer_files()
 
 
 func _handle_hello_no() -> void:
@@ -1020,6 +1043,7 @@ func _handle_hello(message: Dictionary) -> void:
 	_phase = "connected"
 	_note_peer("已连接")
 	log_line.emit("已连上 %s（%s）" % [_peer_label, _peer_address])
+	list_peer_files()
 
 
 func _shared_folders(remote_names: Variant) -> Array[String]:
@@ -1077,6 +1101,15 @@ func _handle_manifest(message: Dictionary) -> void:
 			if entry is Dictionary:
 				remote[str((entry as Dictionary).get("key", ""))] = entry
 	if not _pulling:
+		# A list request: show what the other side has and stop there. Nothing is
+		# fetched, because nothing was asked to be.
+		peer_files.clear()
+		for key: String in remote:
+			peer_files.append(key)
+		peer_files.sort()
+		peer_files_changed.emit()
+		_phase = "connected"
+		log_line.emit("对方" + _manifest_summary(remote))
 		return
 	_pulling = false
 	log_line.emit("对方" + _manifest_summary(remote))
