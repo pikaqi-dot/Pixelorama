@@ -114,7 +114,9 @@ var _received := 0
 var _phase := ""
 ## Addresses still to probe, and the label of a hello waiting for an answer.
 var _scan_pending: Array[String] = []
-var _scan_base_peers := 0
+## How many times a peer was heard while the current sweep was running. A peer
+## that was already known still counts: it answered.
+var _scan_hits := 0
 ## Addresses a sweep still has to dial, and the dials it is waiting on.
 var _sweep_queue: Array[String] = []
 var _sweep_sockets: Array[Dictionary] = []
@@ -314,7 +316,7 @@ func scan() -> void:
 	_scan_pending.clear()
 	_sweep_queue.clear()
 	_scan_active = true
-	_scan_base_peers = peers.size()
+	_scan_hits = 0
 	var own := {}
 	for entry: Dictionary in local_ipv4_entries():
 		own[str(entry["address"])] = true
@@ -640,6 +642,10 @@ func _remember_peer(id: String, peer_label: String, address: String, port: int) 
 	var entry: Dictionary = peers[id]
 	entry["label"] = peer_label
 	entry["last_seen"] = Time.get_ticks_msec()
+	# Anything heard during a sweep is an answer to it, whether or not the peer was
+	# already in the list.
+	if _scan_active:
+		_scan_hits += 1
 	if not address.is_empty():
 		entry["address"] = address
 	if port > 0:
@@ -766,8 +772,16 @@ func _report_scan() -> void:
 		return
 	_scan_active = false
 	scan_finished.emit()
-	if peers.size() > _scan_base_peers:
-		log_line.emit("扫描完成，找到 %d 台设备" % (peers.size() - _scan_base_peers))
+	# What the button is asking is "what is nearby", so the list is the answer.
+	# Comparing the count before and after said "no device replied" while the peer
+	# sat right there in the list, simply because it was known before the sweep.
+	if not peers.is_empty():
+		if _scan_hits > 0:
+			log_line.emit("扫描完成，附近 %d 台设备" % peers.size())
+		else:
+			log_line.emit(
+				"扫描完成，附近 %d 台设备；这次没收到回应，是之前发现过的" % peers.size()
+			)
 		return
 	# Silence has one usual cause on a desktop, and saying it here saves the
 	# person a long hunt: the system firewall answering for the other side.
