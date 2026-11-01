@@ -143,6 +143,14 @@ var _reconnect_tries := 0
 ## path -> {size, mtime, hash, checked}. Rounds run every three seconds; reading
 ## every file that often would make an idle link cost as much as a busy one.
 var _hash_cache: Dictionary = {}
+## How many files each side offered in the last round, and whether a person asked
+## for it — a round somebody asked for has to say what came of it, even "nothing".
+var _local_file_count := 0
+var _peer_file_count := 0
+var _manual_round := false
+## Whether this side planned the round, and so knows both sides' file counts. The
+## side that only answered does not, and must not report zeros as facts.
+var _has_plan := false
 ## Whether a manifest was asked for, so either side can start a round.
 var _awaiting_manifest := false
 ## When the application was paused, and how long it was away.
@@ -445,8 +453,32 @@ func request_sync_now() -> void:
 		return
 	_outbox.append({"t": "request"})
 	_awaiting_manifest = true
+	_manual_round = true
 	_phase = "manifest"
 	log_line.emit("请求同步…")
+
+
+## Rough file count of a folder, capped: enough to tell "this folder is empty"
+## from "this folder is not" in the panel, not a full inventory.
+func count_files(path: String) -> int:
+	var total := 0
+	var pending: Array[String] = [path]
+	while not pending.is_empty() and total < 1000:
+		var current: String = pending.pop_back()
+		var directory := DirAccess.open(current)
+		if directory == null:
+			continue
+		directory.list_dir_begin()
+		var entry := directory.get_next()
+		while not entry.is_empty():
+			if not entry.begins_with(".") and not IGNORED_NAMES.has(entry):
+				if directory.current_is_dir():
+					pending.append(current.path_join(entry))
+				else:
+					total += 1
+			entry = directory.get_next()
+		directory.list_dir_end()
+	return total
 
 
 func set_folder(folder_name: String, path: String) -> void:
@@ -842,6 +874,7 @@ func _drop_peer(reason: String) -> void:
 	_initiator = false
 	_phase = ""
 	_awaiting_manifest = false
+	_has_plan = false
 	_resync_left = 0.0
 	_consent_at = 0
 	_buffer = PackedByteArray()
@@ -1065,7 +1098,9 @@ func _handle_manifest(message: Dictionary) -> void:
 	if _expecting == 0:
 		_phase = "done"
 		_resync_left = RESYNC_INTERVAL
-		_report_round()
+		# Files of ours may still be on their way out; the summary belongs after
+		# them, not before, or it reads "sent 0" for a round that sent something.
+		_report_if_idle()
 		return
 	_phase = "transfer"
 
@@ -1074,6 +1109,9 @@ func _handle_manifest(message: Dictionary) -> void:
 ## timestamp is left alone, and the newer one wins when the content differs.
 func _plan(remote: Dictionary) -> void:
 	var local := _build_manifest()
+	_peer_file_count = remote.size()
+	_local_file_count = local.size()
+	_has_plan = true
 	_get_queue.clear()
 	_expecting = 0
 	_received = 0
@@ -1178,6 +1216,14 @@ func _finish_file() -> void:
 	_outbox.append({"t": "file_end", "key": _sending["key"]})
 	sent_files += 1
 	_sending = {}
+	_report_if_idle()
+
+
+## The round's summary waits until everything this side had to push has left.
+func _report_if_idle() -> void:
+	if not _sending.is_empty() or not _send_queue.is_empty():
+		return
+	_report_round()
 
 
 func _handle_file_begin(message: Dictionary) -> void:
@@ -1271,6 +1317,7 @@ func _poll_watchdog() -> void:
 	_outbox.clear()
 	_write_left = PackedByteArray()
 	_awaiting_manifest = false
+	_has_plan = false
 	_expecting = 0
 	_received = 0
 	_phase = "done"
@@ -1302,11 +1349,27 @@ func _size_text(bytes: int) -> String:
 ## A round that moved nothing is the normal case once two devices agree, and
 ## saying so every three seconds would bury the lines that matter.
 func _report_round() -> void:
-	if sent_files == _reported_sent and received_files == _reported_received:
+	# A round nobody asked for stays quiet when it moved nothing; a round somebody
+	# pressed 「同步一次」 for always answers, because silence there is
+	# indistinguishable from "the button does nothing".
+	var asked := _manual_round
+	var planned := _has_plan
+	_manual_round = false
+	_has_plan = false
+	if not asked and sent_files == _reported_sent and received_files == _reported_received:
 		return
 	_reported_sent = sent_files
 	_reported_received = received_files
-	log_line.emit("同步完成：发出 %d 个，收到 %d 个" % [sent_files, received_files])
+	if not planned:
+		log_line.emit("同步完成：发出 %d 个，收到 %d 个" % [sent_files, received_files])
+		return
+	log_line.emit(
+		"同步完成：发出 %d 个，收到 %d 个（本机 %d 个文件，对方 %d 个）"
+		% [sent_files, received_files, _local_file_count, _peer_file_count]
+	)
+	if _local_file_count > 0 or _peer_file_count > 0:
+		return
+	log_line.emit("两侧的共享文件夹里都还没有文件：把文件存进去，再点「同步一次」")
 
 
 func _note_peer(state: String) -> void:

@@ -160,7 +160,10 @@ func _ensure_default_folder() -> void:
 func _refresh_folders() -> void:
 	_folders.clear()
 	for folder_name: String in _core.folders:
-		_folders.add_item("%s → %s" % [folder_name, str(_core.folders[folder_name])])
+		var path := str(_core.folders[folder_name])
+		_folders.add_item(
+			"%s → %s（%d 个文件）" % [folder_name, path, int(_core.call("count_files", path))]
+		)
 
 
 func _refresh_peers() -> void:
@@ -327,4 +330,5 @@ func _on_log(text: String) -> void:
 
 func _on_file_synced(path: String, direction: String) -> void:
 	_rescan_left = RESCAN_DELAY
+	_refresh_folders()
 	_on_log("%s %s" % ["收到" if direction == "in" else "发出", path.get_file()])
