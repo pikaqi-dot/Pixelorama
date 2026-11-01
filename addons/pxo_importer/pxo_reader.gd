@@ -23,6 +23,10 @@ const LAYER_TILEMAP := 3
 ## Above this many pixels the per-pixel opacity pass is skipped: a project that
 ## big is not what a sprite importer is for, and the import should not crawl.
 const OPACITY_PIXEL_LIMIT := 262144
+## What this reader puts into the resource. An imported resource from an older
+## number is missing whatever was added since, so the panel can say "re-import"
+## instead of quietly showing nothing.
+const READER_VERSION := 2
 
 
 ## Reads [param path] into a [PxoProject]. Returns null when the file is not a
@@ -58,6 +62,7 @@ static func _build(zip: ZIPReader, path: String, options: Dictionary) -> PxoProj
 
 	var project := PxoProject.new()
 	project.source_path = path
+	project.reader_version = READER_VERSION
 	project.canvas_size = Vector2i(int(dict.get("size_x", 0)), int(dict.get("size_y", 0)))
 	if project.canvas_size.x <= 0 or project.canvas_size.y <= 0:
 		push_error("PXO: %s 没有有效的画布尺寸" % path)

@@ -11,6 +11,7 @@ const THUMB := 96
 const CAPTION_HEIGHT := 26
 
 const ExportScript := preload("res://addons/pxo_importer/pxo_export.gd")
+const ReaderScript := preload("res://addons/pxo_importer/pxo_reader.gd")
 
 var project: PxoProject
 
@@ -72,17 +73,26 @@ func _build() -> void:
 
 	# The tile side only means something for a project that has tilesets, and a
 	# greyed-out button says "not this project" better than a file that comes out
-	# empty.
+	# empty — as long as it also says why, or it reads like a broken button.
+	var has_tiles := project != null and project.has_tilesets()
 	var tile_set_button := Button.new()
 	tile_set_button.text = "图块集"
-	tile_set_button.tooltip_text = "把工程里的图块拼成图集，生成 TileSet 资源（含自动图块地形）"
-	tile_set_button.disabled = project == null or not project.has_tilesets()
+	tile_set_button.disabled = not has_tiles
+	tile_set_button.tooltip_text = (
+		"把工程里的图块拼成图集，生成 TileSet 资源（含自动图块地形）"
+		if has_tiles
+		else _no_tiles_reason()
+	)
 	tile_set_button.pressed.connect(_on_export_tile_set)
 	controls.add_child(tile_set_button)
 	var tile_map_button := Button.new()
 	tile_map_button.text = "地图"
-	tile_map_button.tooltip_text = "把当前帧的图块层放成 TileMapLayer 场景，格子已经摆好"
-	tile_map_button.disabled = project == null or not project.has_tilesets()
+	tile_map_button.disabled = not has_tiles
+	tile_map_button.tooltip_text = (
+		"把当前帧的图块层放成 TileMapLayer 场景，格子已经摆好"
+		if has_tiles
+		else _no_tiles_reason()
+	)
 	tile_map_button.pressed.connect(_on_export_tile_map)
 	controls.add_child(tile_map_button)
 
@@ -230,17 +240,42 @@ func _on_export_tile_map() -> void:
 	_reported(path, err, "第 %d 帧，%d 个格子已经摆好" % [_current, cells])
 
 
-## "· 1 个图块集 53 块（16×16）· 图块层 1 个", or nothing for a plain sprite.
+## Whether the resource was built by an older reader. Godot only re-imports when
+## the source file changes, so a `.pxo` imported before the tile work keeps its
+## empty tile fields forever — and an empty field looks exactly like a project
+## that has no tilesets.
+func _is_stale() -> bool:
+	return project != null and project.reader_version < ReaderScript.READER_VERSION
+
+
+## Why the two tile buttons are grey: either the resource is from an older
+## reader, or the project was never drawn with a TileMap layer — a decision made
+## in Pixelorama, not here.
+func _no_tiles_reason() -> String:
+	if _is_stale():
+		return "这个资源是旧版导入器导入的：右键 .pxo → 重新导入，图块信息才会进来"
+	return "这个 .pxo 里没有图块集：Pixelorama 里没建 TileMap 图层，只有普通图层"
+
+
+## "· 1 个图块集 53 块（16×16）· 图块层 1 个", or a line saying why there is none.
 func _tileset_line() -> String:
-	if project == null or not project.has_tilesets():
+	if project == null:
 		return ""
+	if _is_stale():
+		return "\n这个资源是旧版导入器导入的：右键 .pxo → 重新导入 才有图块信息"
+	if not project.has_tilesets():
+		return "\n没有图块集：这个工程在 Pixelorama 里没有 TileMap 图层"
 	var counts: Array[String] = []
 	for entry: Dictionary in project.tilesets:
+		# The size is stored as Pixelorama prints it, "(16, 16)"; the brackets are
+		# already around it here.
+		var size_text := str(entry.get("tile_size", "")).strip_edges()
+		size_text = size_text.trim_prefix("(").trim_suffix(")")
 		counts.append(
 			"%s %d 块（%s）" % [
 				str(entry.get("name", "")),
 				int(entry.get("tile_amount", 0)),
-				str(entry.get("tile_size", "")),
+				size_text,
 			]
 		)
 	var layers := project.tile_layer_names()

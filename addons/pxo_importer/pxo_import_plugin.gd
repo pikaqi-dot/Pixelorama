@@ -9,6 +9,17 @@ extends EditorImportPlugin
 
 const ReaderScript := preload("res://addons/pxo_importer/pxo_reader.gd")
 
+## Bumped whenever what ends up inside the imported resource changes. Godot
+## compares it with the version recorded for each `.pxo` and re-imports when they
+## differ; without it a resource built by an older reader keeps being loaded, and
+## the new fields look like they were never there (greyed-out buttons, empty
+## tile lists).
+const FORMAT_VERSION := 2
+
+
+func _get_format_version() -> int:
+	return FORMAT_VERSION
+
 
 func _get_importer_name() -> String:
 	return "pxo_project"

@@ -39,6 +39,9 @@ extends Resource
 @export var sprite_frames: SpriteFrames
 ## Where this was imported from, for messages and debugging.
 @export var source_path: String = ""
+## The version of the reader that produced this resource. Zero means it was
+## imported before the field existed, so it is missing whatever came after.
+@export var reader_version: int = 0
 ## The project's tilesets, metadata only: [code]{name, tile_size, tile_shape,
 ## tile_amount, terrain_colors, terrain_names, tile_bits}[/code]. The tile images
 ## stay inside the `.pxo` and are read on demand by [PxoTileset].
