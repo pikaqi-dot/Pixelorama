@@ -400,8 +400,16 @@ func _show_splash_screen() -> void:
 		# Wait for the window to adjust itself, so the popup is correctly centered
 		await get_tree().process_frame
 
+		# The session restore dialog already holds the exclusive child slot when
+		# the last session looked like a crash, and a second popup cannot take it.
+		# Dimming the application for a splash that never appears is what leaves a
+		# grey window with nothing drawn on top of it, so neither happens here.
+		if restore_session_confirmation_dialog.visible:
+			return
 		splash_dialog.popup_centered_clamped()  # Splash screen
-		modulate = Color(0.5, 0.5, 0.5)
+		# Dimming goes through the same entry point every other dialog uses, so
+		# the splash's own visibility_changed handler always undims it again.
+		Global.dialog_open(true)
 
 
 func _handle_cmdline_arguments() -> void:
