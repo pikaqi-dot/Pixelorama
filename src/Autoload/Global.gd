@@ -862,11 +862,14 @@ func _init() -> void:
 
 
 func _ready() -> void:
-	if not is_instance_valid(main_viewport):
+	if is_instance_valid(control) and not is_instance_valid(main_viewport):
 		# Running a sub-scene (F6, or a .tscn opened in the editor) instead of
 		# Main.tscn leaves every one of the nodes above unresolved, and the code
 		# that follows dereferences them one after another. Stopping here turns a
 		# cascade of null references into one sentence that says what to do.
+		#
+		# A run with no scene at all is not this case: `--script` entry points have
+		# no current scene, and those must be left alone.
 		push_warning(
 			"Global: 当前运行的场景不是 res://src/Main.tscn，缺少 "
 			+ "SubViewportContainer / Canvas 等主界面节点，无法启动界面。"

@@ -1026,6 +1026,10 @@ func _handle_line(text: String) -> void:
 		"done":
 			_phase = "done"
 			_report_round()
+			# The other side has finished taking files, so its folder is not what
+			# it was when this link came up. Ask for its list again: the panel here
+			# must not keep showing timestamps from before the pull.
+			list_peer_files()
 
 
 ## The other side accepted. Nothing is exchanged from here on until somebody presses
