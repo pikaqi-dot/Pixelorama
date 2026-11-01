@@ -315,7 +315,8 @@ func stop() -> void:
 		socket.disconnect_from_host()
 	_sweep_sockets.clear()
 	_sweep_ports.clear()
-	_dead_dials.clear()
+	if _dead_dials != null:
+		_dead_dials.clear()
 	_scan_active = false
 	_reconnect_at = 0
 	running = false
@@ -346,6 +347,13 @@ func scan() -> void:
 	if not running:
 		log_line.emit("先点开始，再扫描")
 		return
+	# Rebuilt rather than assumed, for the same reason as in [_poll_sweep].
+	if _scan_fallback == null:
+		_scan_fallback = []
+	if _scan_own == null:
+		_scan_own = {}
+	if _dead_dials == null:
+		_dead_dials = {}
 	_scan_pending.clear()
 	_sweep_queue.clear()
 	_scan_fallback.clear()
@@ -719,7 +727,12 @@ func _remember_peer(id: String, peer_label: String, address: String, port: int) 
 	if not address.is_empty():
 		entry["address"] = address
 		# A device that said its name is a peer again, whatever a sweep made of
-		# the socket it once accepted and never answered on.
+		# the socket it once accepted and never answered on. The dictionary is
+		# rebuilt when it is missing: a script edited while the editor is running
+		# leaves the instances created before that edit with the new members
+		# unset, and null answers nothing at all.
+		if _dead_dials == null:
+			_dead_dials = {}
 		_dead_dials.erase(address)
 	if port > 0:
 		entry["port"] = port
@@ -934,6 +947,14 @@ func _report_scan() -> void:
 ## that connects is not thrown away and re-dialed: it becomes the link, so the
 ## sweep and the handshake are the same connection.
 func _poll_sweep() -> void:
+	# Rebuilt rather than assumed: a script edited while the editor is running
+	# leaves the instances created before that edit with these members unset.
+	if _sweep_sockets == null:
+		_sweep_sockets = []
+	if _dead_dials == null:
+		_dead_dials = {}
+	if _scan_fallback == null:
+		_scan_fallback = []
 	# Somebody answered a beacon during this scan, and a broadcast reaches every
 	# device on the network at once, so the dial half has nothing left to find.
 	if _scan_active and _scan_hits > 0:
