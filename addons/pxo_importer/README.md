@@ -13,6 +13,18 @@
 2. 把 `.pxo` 拖进文件系统面板。
 3. 在 Pixelorama 里改完再保存，切回 Godot 会自动重新导入，和 `.png` 一样。
 
+## 在编辑器里看
+
+在文件系统面板里选中或双击 `.pxo`，Inspector 顶部会出现预览：
+
+- 一行信息：画布尺寸、帧数、fps、层名
+- 「帧」条：每帧的合成图，点一下切换
+- 「图层（当前帧）」条：当前帧每一层的图，带层名
+- 「播放」按钮：按工程的 fps 轮播各帧
+
+下面依旧是属性列表。导入的资源在 Godot 里是**只读**的——它由 `.pxo` 生成，不能就地改；
+要改就回 Pixelorama 编辑源文件，保存后切回 Godot 会自动重新导入。
+
 ## 用
 
 ### 动画：给 AnimatedSprite2D
@@ -109,4 +121,6 @@ PxoProject (Resource)
 | `pxo_frame.gd` | 单帧资源类型 | 是 |
 | `pxo_reader.gd` | 解析器（导入时用） | 否 |
 | `pxo_import_plugin.gd` | `EditorImportPlugin` | 否 |
+| `pxo_inspector_plugin.gd` | 让 Inspector 显示预览 | 否 |
+| `pxo_preview.gd` | 预览面板本身 | 否 |
 | `plugin.gd` / `plugin.cfg` | 编辑器插件注册 | 否 |
