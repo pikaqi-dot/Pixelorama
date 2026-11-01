@@ -34,10 +34,12 @@ const SYNC_PORT_TRIES := 8
 const BEACON_INTERVAL := 1.0
 ## A peer not heard from for this long is shown as gone.
 const PEER_TIMEOUT := 5.0
-## Largest single file that is moved. A bigger one is left alone and reported,
-## which keeps a stray video out of the memory of a phone. A project file is
-## easily a few megabytes, so the ceiling is set for those, not for sprites.
-const MAX_FILE_BYTES := 4_000_000
+## Bytes read from disk per message. A file of any size moves in these: the whole
+## file is never held in memory, so the ceiling is the disk, not the phone.
+const CHUNK_BYTES := 262144
+## Chunks handed to the socket per frame, which is also what stops a long send
+## from freezing the UI of the side doing the sending.
+const CHUNKS_PER_FRAME := 4
 ## How often a finished link asks for another round. A sync is not an event that
 ## happens once when two devices meet: a file saved ten seconds later has to
 ## travel too, and asking again is cheaper than reconnecting.
@@ -107,6 +109,13 @@ var _resync_left := 0.0
 ## What the last report said, so a round that moved nothing stays out of the log.
 var _reported_sent := 0
 var _reported_received := 0
+## Files waiting to be sent, and the one being read right now.
+var _send_queue: Array[Dictionary] = []
+var _sending: Dictionary = {}
+## The file being written on this side.
+var _receiving: Dictionary = {}
+## Bytes of a message the socket did not take yet.
+var _write_left := PackedByteArray()
 ## Whether a manifest was asked for, so either side can start a round.
 var _awaiting_manifest := false
 ## When the application was paused, and how long it was away.
@@ -160,6 +169,8 @@ func _process(delta: float) -> void:
 	_poll_discovery()
 	_poll_consent()
 	_poll_server()
+	# Before _poll_peer, so the chunks appended here leave on this same frame.
+	_poll_send()
 	_poll_peer()
 	_poll_resync(delta)
 	_poll_timeouts()
@@ -725,8 +736,10 @@ func _drop_peer(reason: String) -> void:
 	_resync_left = 0.0
 	_consent_at = 0
 	_buffer = PackedByteArray()
+	_write_left = PackedByteArray()
 	_outbox.clear()
 	_get_queue.clear()
+	_close_transfers()
 	_expecting = 0
 	_received = 0
 	sent_files = 0
@@ -789,15 +802,34 @@ func _read_available() -> void:
 		_handle_line(line)
 
 
+## Writes what fits and keeps the rest. put_data() would drop the tail of a
+## message the socket could not take in one go, which for a 256 KB chunk means a
+## corrupted file nobody notices until the receiver compares the sizes.
 func _write_outbox() -> void:
 	if _peer == null:
 		return
+	if not _write_left.is_empty():
+		if not _flush_write():
+			return
 	while not _outbox.is_empty():
 		var message: Dictionary = _outbox.front()
-		var bytes := (JSON.stringify(message) + "\n").to_utf8_buffer()
-		if _peer.put_data(bytes) != OK:
-			return
+		_write_left = (JSON.stringify(message) + "\n").to_utf8_buffer()
 		_outbox.pop_front()
+		if not _flush_write():
+			return
+
+
+## Pushes the pending bytes into the socket, keeping whatever did not fit.
+func _flush_write() -> bool:
+	var result: Array = _peer.put_partial_data(_write_left)
+	if int(result[0]) != OK:
+		return false
+	var sent: int = result[1]
+	if sent >= _write_left.size():
+		_write_left = PackedByteArray()
+		return true
+	_write_left = _write_left.slice(sent)
+	return false
 
 
 # Messages.
@@ -820,9 +852,13 @@ func _handle_line(text: String) -> void:
 		"manifest":
 			_handle_manifest(message)
 		"get":
-			_send_file(str(message.get("key", "")))
-		"file":
-			_receive_file(message)
+			_enqueue_file(str(message.get("key", "")))
+		"file_begin":
+			_handle_file_begin(message)
+		"file_chunk":
+			_handle_file_chunk(message)
+		"file_end":
+			_handle_file_end(message)
 		"done":
 			_phase = "done"
 			_resync_left = RESYNC_INTERVAL
@@ -934,80 +970,153 @@ func _plan(remote: Dictionary) -> void:
 		var remote_entry: Dictionary = remote[key]
 		if local.has(key):
 			var local_entry: Dictionary = local[key]
-			if int(local_entry.get("h", 0)) == int(remote_entry.get("h", -1)):
+			if str(local_entry.get("h", "")) == str(remote_entry.get("h", "-")):
 				continue
 			if int(remote_entry.get("mtime", 0)) <= int(local_entry.get("mtime", 0)):
-				_queue_push(key, local_entry)
+				_enqueue_file(key)
 				continue
 		_get_queue.append(key)
 		_expecting += 1
 	for key: String in local:
 		if not remote.has(key):
-			_queue_push(key, local[key])
+			_enqueue_file(key)
 	for key: String in _get_queue:
 		_outbox.append({"t": "get", "key": key})
 	if _expecting == 0:
 		_outbox.append({"t": "done"})
 
 
-func _queue_push(key: String, entry: Dictionary) -> void:
-	var bytes := _read_file(key)
-	if bytes.is_empty():
+## Puts a file on the outgoing list. Nothing is read here: the bytes are taken
+## from disk a chunk at a time when the socket is ready for them.
+func _enqueue_file(key: String) -> void:
+	var path := _absolute(key)
+	if path.is_empty() or not FileAccess.file_exists(path):
 		return
-	sent_files += 1
-	_outbox.append(
-		{
-			"t": "file",
-			"key": key,
-			"mtime": int(entry.get("mtime", 0)),
-			"data": Marshalls.raw_to_base64(bytes),
-		}
-	)
+	for queued: Dictionary in _send_queue:
+		if str(queued["key"]) == key:
+			return
+	_send_queue.append({"key": key, "path": path})
 
 
-func _send_file(key: String) -> void:
-	var bytes := _read_file(key)
-	if bytes.is_empty():
-		_outbox.append({"t": "file", "key": key, "data": ""})
+## Reads the next chunks of the file being sent, a few per frame, so a long send
+## neither stalls the frame nor fills memory with the whole file.
+func _poll_send() -> void:
+	if _peer == null:
 		return
-	sent_files += 1
-	_outbox.append(
-		{
-			"t": "file",
-			"key": key,
-			"mtime": FileAccess.get_modified_time(_absolute(key)),
-			"data": Marshalls.raw_to_base64(bytes),
-		}
-	)
-
-
-func _receive_file(message: Dictionary) -> void:
-	var key := str(message.get("key", ""))
-	var data := str(message.get("data", ""))
-	if key.is_empty() or data.is_empty():
+	# Backpressure: while the socket is still swallowing the last chunk, reading
+	# more of the file would only pile the whole thing up in memory again.
+	if not _write_left.is_empty() or _outbox.size() > 8:
 		return
-	var bytes := Marshalls.base64_to_raw(data)
-	if bytes.size() > MAX_FILE_BYTES:
-		log_line.emit(
-			"%s 太大（%.1f MB），上限 %.1f MB，已跳过"
-			% [key, float(bytes.size()) / 1048576.0, float(MAX_FILE_BYTES) / 1048576.0]
+	var moves := 0
+	while moves < CHUNKS_PER_FRAME:
+		if _sending.is_empty():
+			if _send_queue.is_empty():
+				return
+			_start_file()
+			if _sending.is_empty():
+				return
+		var handle: FileAccess = _sending["handle"]
+		var left: int = int(_sending["size"]) - int(_sending["sent"])
+		if left <= 0:
+			_finish_file()
+			moves += 1
+			continue
+		var bytes := handle.get_buffer(mini(CHUNK_BYTES, left))
+		if bytes.is_empty():
+			_finish_file()
+			moves += 1
+			continue
+		_sending["sent"] = int(_sending["sent"]) + bytes.size()
+		_outbox.append(
+			{
+				"t": "file_chunk",
+				"key": _sending["key"],
+				"data": Marshalls.raw_to_base64(bytes),
+			}
 		)
+		moves += 1
+
+
+func _start_file() -> void:
+	var queued: Dictionary = _send_queue.pop_front()
+	var handle := FileAccess.open(str(queued["path"]), FileAccess.READ)
+	if handle == null:
 		return
+	var size := int(handle.get_length())
+	_sending = {
+		"key": str(queued["key"]),
+		"handle": handle,
+		"size": size,
+		"sent": 0,
+	}
+	_outbox.append(
+		{"t": "file_begin", "key": str(queued["key"]), "size": size}
+	)
+	log_line.emit("发送 %s（%s）" % [str(queued["key"]), _size_text(size)])
+
+
+func _finish_file() -> void:
+	if _sending.is_empty():
+		return
+	var handle: FileAccess = _sending["handle"]
+	handle.close()
+	_outbox.append({"t": "file_end", "key": _sending["key"]})
+	sent_files += 1
+	_sending = {}
+
+
+func _handle_file_begin(message: Dictionary) -> void:
+	var key := str(message.get("key", ""))
 	var path := _absolute(key)
 	if path.is_empty():
 		return
 	var directory := path.get_base_dir()
 	if not DirAccess.dir_exists_absolute(directory):
 		DirAccess.make_dir_recursive_absolute(directory)
-	var file := FileAccess.open(path, FileAccess.WRITE)
-	if file == null:
+	var handle := FileAccess.open(path, FileAccess.WRITE)
+	if handle == null:
+		# The rest of the file is still read and dropped, so the sender is never
+		# left pushing into a socket nobody is draining.
 		log_line.emit("无法写入 %s" % key)
+	_receiving = {
+		"key": key,
+		"path": path,
+		"handle": handle,
+		"size": int(message.get("size", 0)),
+		"written": 0,
+	}
+
+
+func _handle_file_chunk(message: Dictionary) -> void:
+	if _receiving.is_empty():
 		return
-	file.store_buffer(bytes)
-	file.close()
+	if str(message.get("key", "")) != str(_receiving["key"]):
+		return
+	var bytes := Marshalls.base64_to_raw(str(message.get("data", "")))
+	var handle: FileAccess = _receiving["handle"]
+	if handle != null:
+		handle.store_buffer(bytes)
+	_receiving["written"] = int(_receiving["written"]) + bytes.size()
+
+
+func _handle_file_end(message: Dictionary) -> void:
+	if _receiving.is_empty():
+		return
+	var key := str(_receiving["key"])
+	var path := str(_receiving["path"])
+	var handle: FileAccess = _receiving["handle"]
+	var written := int(_receiving["written"])
+	var declared := int(_receiving["size"])
+	_receiving = {}
+	if handle == null:
+		return
+	handle.close()
+	if written != declared:
+		log_line.emit("%s 没有收全（%d/%d 字节）" % [key, written, declared])
+		return
 	file_synced.emit(path, "in")
 	received_files += 1
-	log_line.emit("收到 %s" % key)
+	log_line.emit("收到 %s（%s）" % [key, _size_text(written)])
 	# Counting only matters on the side that planned the round; the other side is
 	# answering, and for it every arriving file is simply good news.
 	if _phase != "transfer":
@@ -1020,6 +1129,27 @@ func _receive_file(message: Dictionary) -> void:
 		_resync_left = RESYNC_INTERVAL
 		_note_peer("已同步")
 		_report_round()
+
+
+## A link can die with a file half read. Both handles are closed here, or the
+## next round would write into the file the previous one still had open.
+func _close_transfers() -> void:
+	if not _sending.is_empty():
+		var out_handle: FileAccess = _sending["handle"]
+		out_handle.close()
+		_sending = {}
+	if not _receiving.is_empty():
+		var in_handle: FileAccess = _receiving["handle"]
+		if in_handle != null:
+			in_handle.close()
+		_receiving = {}
+	_send_queue.clear()
+
+
+func _size_text(bytes: int) -> String:
+	if bytes < 1048576:
+		return "%.1f KB" % (float(bytes) / 1024.0)
+	return "%.2f MB" % (float(bytes) / 1048576.0)
 
 
 ## A round that moved nothing is the normal case once two devices agree, and
@@ -1077,7 +1207,7 @@ func _scan(root: String, folder_name: String, manifest: Dictionary) -> void:
 					manifest[key] = {
 						"mtime": FileAccess.get_modified_time(full),
 						"size": size,
-						"h": hash(FileAccess.get_file_as_bytes(full)) if size > 0 else 0,
+						"h": _file_hash(full),
 					}
 			entry = directory.get_next()
 		directory.list_dir_end()
@@ -1092,18 +1222,25 @@ func _size_of(path: String) -> int:
 	return size
 
 
-func _read_file(key: String) -> PackedByteArray:
-	var path := _absolute(key)
-	if path.is_empty() or not FileAccess.file_exists(path):
-		return PackedByteArray()
-	var size := _size_of(path)
-	if size > MAX_FILE_BYTES:
-		log_line.emit(
-			"%s 太大（%.1f MB），上限 %.1f MB，已跳过"
-			% [key, float(size) / 1048576.0, float(MAX_FILE_BYTES) / 1048576.0]
-		)
-		return PackedByteArray()
-	return FileAccess.get_file_as_bytes(path)
+## The content hash, read in blocks and folded as it goes. Loading a file to
+## compare it would put a copy of it in memory on both machines, which is the
+## one thing a file sync must never do.
+func _file_hash(path: String) -> String:
+	var handle := FileAccess.open(path, FileAccess.READ)
+	if handle == null:
+		return ""
+	var context := HashingContext.new()
+	context.start(HashingContext.HASH_SHA256)
+	var size := int(handle.get_length())
+	var read := 0
+	while read < size:
+		var chunk := handle.get_buffer(mini(CHUNK_BYTES, size - read))
+		if chunk.is_empty():
+			break
+		context.update(chunk)
+		read += chunk.size()
+	handle.close()
+	return context.finish().hex_encode()
 
 
 ## Turns a manifest key back into a real path. The first segment is the folder
