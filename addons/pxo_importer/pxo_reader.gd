@@ -18,6 +18,7 @@ extends RefCounted
 ## Pixelorama's layer type values, from [code]Global.LayerTypes[/code].
 const LAYER_PIXEL := 0
 const LAYER_GROUP := 1
+const LAYER_TILEMAP := 3
 
 ## Above this many pixels the per-pixel opacity pass is skipped: a project that
 ## big is not what a sprite importer is for, and the import should not crawl.
@@ -64,11 +65,33 @@ static func _build(zip: ZIPReader, path: String, options: Dictionary) -> PxoProj
 	project.fps = max(0.001, float(dict.get("fps", 12.0)))
 
 	var format := _image_format(dict)
+	project.color_mode = format
 	var layer_defs: Array = dict.get("layers", [])
 	var names := PackedStringArray()
 	for layer_def: Dictionary in layer_defs:
 		names.append(str(layer_def.get("name", "")))
 	project.layer_names = names
+
+	# The tilesets: name, tile size, terrain colours and the autotile bits. Only
+	# the metadata is kept here — the tile images stay in the `.pxo` and are read
+	# by PxoTileset when somebody actually asks for a TileSet.
+	var tileset_defs: Array = dict.get("tilesets", [])
+	for tileset_def: Dictionary in tileset_defs:
+		project.tilesets.append(_tileset_meta(tileset_def))
+
+	# Which layers draw with tiles, and from which tileset.
+	for layer_index in layer_defs.size():
+		var layer_def: Dictionary = layer_defs[layer_index]
+		if int(layer_def.get("type", LAYER_PIXEL)) != LAYER_TILEMAP:
+			continue
+		project.tile_layers.append(
+			{
+				"layer": layer_index,
+				"tileset": int(layer_def.get("tileset_index", 0)),
+				"tile_size": str(layer_def.get("tile_size", "")),
+				"name": str(layer_def.get("name", "")),
+			}
+		)
 
 	var wanted := _wanted_layers(options)
 
@@ -94,6 +117,14 @@ static func _build(zip: ZIPReader, path: String, options: Dictionary) -> PxoProj
 				frame.layer_images.append(null)
 			else:
 				frame.layer_images.append(ImageTexture.create_from_image(image))
+		# The tile placement of every layer, in the same order: a cell map for a
+		# tilemap layer, an empty dictionary for everything else.
+		for cell_cel in cel_defs.size():
+			var tile_cel_def: Dictionary = cel_defs[cell_cel]
+			var tile_layer_def: Dictionary = {}
+			if cell_cel < layer_defs.size():
+				tile_layer_def = layer_defs[cell_cel]
+			frame.tile_cells.append(_cel_cells(tile_cel_def, tile_layer_def))
 		frame.composite = _composite_texture(zip, project.canvas_size, format, frame_index, images, layer_defs)
 		project.frames.append(frame)
 		frame_index += 1
@@ -111,6 +142,84 @@ static func _build(zip: ZIPReader, path: String, options: Dictionary) -> PxoProj
 
 	project.sprite_frames = project.build_sprite_frames()
 	return project
+
+
+## One tileset's metadata, as the panel and [PxoTileset] need it. The images are
+## deliberately not read here: a project can carry a big tileset, and a re-import
+## should not pay for tiles nobody asked to see.
+static func _tileset_meta(tileset_def: Dictionary) -> Dictionary:
+	var colors: Array = []
+	var terrain_names: Array = []
+	var terrain_data: Array = tileset_def.get("terrain_data", [])
+	for terrain_def: Dictionary in terrain_data:
+		colors.append(str(terrain_def.get("color", "Color(1, 1, 1, 1)")))
+		terrain_names.append(str(terrain_def.get("name", "")))
+	var bits := {}
+	var tile_data: Variant = tileset_def.get("tile_data", {})
+	if tile_data is Dictionary:
+		var per_tile: Dictionary = tile_data
+		for key: String in per_tile:
+			var info: Variant = per_tile[key]
+			if not info is Dictionary:
+				continue
+			var tile: Dictionary = info
+			bits[key] = {
+				"center": int(tile.get("terrain_center_bit", -1)),
+				"peering": _int_array(tile.get("terrain_peering_bits", [])),
+			}
+	return {
+		"name": str(tileset_def.get("name", "")),
+		"tile_size": str(tileset_def.get("tile_size", "Vector2i(16, 16)")),
+		"tile_shape": int(tileset_def.get("tile_shape", 0)),
+		"tile_amount": int(tileset_def.get("tile_amount", 0)),
+		"terrain_colors": colors,
+		"terrain_names": terrain_names,
+		"tile_bits": bits,
+	}
+
+
+## Where the tiles of one layer sit: a cell position to [code]{index, flip_h,
+## flip_v, transpose}[/code]. Empty for anything that is not a tilemap layer.
+static func _cel_cells(cel_def: Dictionary, layer_def: Dictionary) -> Dictionary:
+	var out := {}
+	if int(layer_def.get("type", LAYER_PIXEL)) != LAYER_TILEMAP:
+		return out
+	var data: Variant = cel_def.get("cell_data", {})
+	if not data is Dictionary:
+		return out
+	var cells: Dictionary = data
+	for key: String in cells:
+		# Pixelorama writes the position as the string key "(x, y)".
+		if not key.begins_with("("):
+			continue
+		var info: Variant = cells[key]
+		if not info is Dictionary:
+			continue
+		var tile: Dictionary = info
+		out[_cell_from(key)] = {
+			"index": int(tile.get("index", -1)),
+			"flip_h": bool(tile.get("flip_h", false)),
+			"flip_v": bool(tile.get("flip_v", false)),
+			"transpose": bool(tile.get("transpose", false)),
+		}
+	return out
+
+
+## "(0, 3)" and "(-1, 2)" both come back as a cell position.
+static func _cell_from(key: String) -> Vector2i:
+	var parts := key.trim_prefix("(").trim_suffix(")").split(",")
+	if parts.size() != 2:
+		return Vector2i.ZERO
+	return Vector2i(int(parts[0].strip_edges()), int(parts[1].strip_edges()))
+
+
+static func _int_array(value: Variant) -> Array:
+	var out: Array = []
+	if not value is Array:
+		return out
+	for item: Variant in value:
+		out.append(int(item))
+	return out
 
 
 ## The Image format the pixels are stored in. Pixelorama records the Godot enum
@@ -149,7 +258,9 @@ static func _cel_image(
 	wanted: PackedStringArray
 ) -> Image:
 	var layer_type := int(layer_def.get("type", LAYER_PIXEL))
-	if layer_type != LAYER_PIXEL:
+	# A tilemap layer has a rendered image too, and it is the only picture of that
+	# layer a .pxo carries: skipping it left the tiles out of every composite.
+	if layer_type != LAYER_PIXEL and layer_type != LAYER_TILEMAP:
 		return null
 	if not wanted.is_empty() and not wanted.has(str(layer_def.get("name", ""))):
 		return null

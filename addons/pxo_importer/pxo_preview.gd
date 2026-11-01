@@ -70,6 +70,22 @@ func _build() -> void:
 	sheet_button.pressed.connect(_on_export_sheet)
 	controls.add_child(sheet_button)
 
+	# The tile side only means something for a project that has tilesets, and a
+	# greyed-out button says "not this project" better than a file that comes out
+	# empty.
+	var tile_set_button := Button.new()
+	tile_set_button.text = "图块集"
+	tile_set_button.tooltip_text = "把工程里的图块拼成图集，生成 TileSet 资源（含自动图块地形）"
+	tile_set_button.disabled = project == null or not project.has_tilesets()
+	tile_set_button.pressed.connect(_on_export_tile_set)
+	controls.add_child(tile_set_button)
+	var tile_map_button := Button.new()
+	tile_map_button.text = "地图"
+	tile_map_button.tooltip_text = "把当前帧的图块层放成 TileMapLayer 场景，格子已经摆好"
+	tile_map_button.disabled = project == null or not project.has_tilesets()
+	tile_map_button.pressed.connect(_on_export_tile_map)
+	controls.add_child(tile_map_button)
+
 	_timer = Timer.new()
 	_timer.wait_time = 1.0 / max(0.001, project.fps if project != null else 12.0)
 	_timer.timeout.connect(_next_frame)
@@ -101,13 +117,14 @@ func _strip(title: String) -> HBoxContainer:
 func _refresh() -> void:
 	if project == null:
 		return
-	_info.text = "画布 %d×%d · %d 帧 · %s fps · %d 层\n%s" % [
+	_info.text = "画布 %d×%d · %d 帧 · %s fps · %d 层\n%s%s" % [
 		project.canvas_size.x,
 		project.canvas_size.y,
 		project.frames.size(),
 		str(project.fps),
 		project.layer_names.size(),
 		"、".join(project.layer_names),
+		_tileset_line(),
 	]
 	for child in _frames_row.get_children():
 		child.queue_free()
@@ -188,6 +205,49 @@ func _on_export_sheet() -> void:
 	var path := ExportScript.default_sheet_path(project.source_path)
 	var err: Error = ExportScript.export_sheet(project, path)
 	_reported(path, err, "Sprite2D 设 hframes=%d、vframes=1 即可切片" % project.frames.size())
+
+
+## Writes the TileSet resource next to the `.pxo`.
+func _on_export_tile_set() -> void:
+	if project == null:
+		return
+	var path := ExportScript.default_tile_set_path(project.source_path)
+	var err: Error = ExportScript.export_tile_set(project, path)
+	_reported(path, err, "拖到 TileMapLayer 的 Tile Set 上即可开始画")
+
+
+## Writes one frame's tilemap layers as a scene next to the `.pxo`.
+func _on_export_tile_map() -> void:
+	if project == null:
+		return
+	var path := ExportScript.default_tile_map_path(project.source_path)
+	var err: Error = ExportScript.export_tile_map(project, _current, path)
+	var cells := 0
+	var frame := project.get_frame(_current)
+	if frame != null:
+		for layer_index in project.tile_layers.size():
+			cells += frame.get_tile_cells(int(project.tile_layers[layer_index]["layer"])).size()
+	_reported(path, err, "第 %d 帧，%d 个格子已经摆好" % [_current, cells])
+
+
+## "· 1 个图块集 53 块（16×16）· 图块层 1 个", or nothing for a plain sprite.
+func _tileset_line() -> String:
+	if project == null or not project.has_tilesets():
+		return ""
+	var counts: Array[String] = []
+	for entry: Dictionary in project.tilesets:
+		counts.append(
+			"%s %d 块（%s）" % [
+				str(entry.get("name", "")),
+				int(entry.get("tile_amount", 0)),
+				str(entry.get("tile_size", "")),
+			]
+		)
+	var layers := project.tile_layer_names()
+	var tail := ""
+	if not layers.is_empty():
+		tail = " · 图块层 %d 个：%s" % [layers.size(), "、".join(layers)]
+	return "\n图块集 %d 个：%s%s" % [project.tilesets.size(), "；".join(counts), tail]
 
 
 func _reported(path: String, err: Error, hint: String) -> void:

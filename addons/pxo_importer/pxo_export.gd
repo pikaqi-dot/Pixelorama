@@ -11,14 +11,20 @@ extends RefCounted
 ##   [AnimatedSprite2D] uses directly;
 ## - a sprite sheet `.png` of every frame in a grid, which [Sprite2D] slices with
 ##   `hframes`/`vframes`, a [TileSet] uses as an atlas, or any other tool reads
-##   as one image.
+##   as one image;
+## - a `TileSet` `.tres` built from the project's own tilesets, tile picker and
+##   autotiling included;
+## - a `.tscn` holding one [TileMapLayer] per tilemap layer of a frame, cells
+##   already placed, so the map Pixelorama drew is a Godot scene.
 ##
-## Neither file depends on the `.pxo` afterwards, so editing them does not get
+## None of them depends on the `.pxo` afterwards, so editing them does not get
 ## overwritten by a re-import. Re-exporting does overwrite them, which is the
 ## point: they are the derived artefacts.
 
 const SUFFIX_FRAMES := "_spriteframes.tres"
 const SUFFIX_SHEET := "_sheet.png"
+const SUFFIX_TILESET := "_tileset.tres"
+const SUFFIX_TILEMAP := "_tilemap.tscn"
 
 
 ## `res://art/player.pxo` for any spelling of the source path.
@@ -32,6 +38,14 @@ static func default_sprite_frames_path(source: String) -> String:
 
 static func default_sheet_path(source: String) -> String:
 	return local_path(source) + SUFFIX_SHEET
+
+
+static func default_tile_set_path(source: String) -> String:
+	return local_path(source) + SUFFIX_TILESET
+
+
+static func default_tile_map_path(source: String) -> String:
+	return local_path(source) + SUFFIX_TILEMAP
 
 
 ## Saves a [SpriteFrames] holding every frame's flattened image, at the speed the
@@ -55,6 +69,34 @@ static func export_sheet(project: PxoProject, path: String, columns := 0) -> Err
 	if sheet == null:
 		return ERR_INVALID_DATA
 	return sheet.save_png(ProjectSettings.globalize_path(path))
+
+
+## Saves the project's tilesets as a [TileSet] the TileSet editor can open, with
+## the tiles already cut out and the autotile terrains filled in.
+static func export_tile_set(project: PxoProject, path: String) -> Error:
+	if project == null or project.tilesets.is_empty():
+		return ERR_INVALID_DATA
+	var tile_set := PxoTileset.build_tile_set(project)
+	if tile_set == null or tile_set.get_source_count() == 0:
+		return ERR_INVALID_DATA
+	return ResourceSaver.save(tile_set, path)
+
+
+## Saves one frame's tilemap layers as a `.tscn`: a [Node2D] with a
+## [TileMapLayer] per tilemap layer, every cell placed, and the [TileSet] embedded
+## so the scene is one file to drop into a game.
+static func export_tile_map(project: PxoProject, frame_index: int, path: String) -> Error:
+	var root := PxoTileset.build_tile_map(project, frame_index)
+	if root == null:
+		return ERR_INVALID_DATA
+	# pack() files every child under [param root], so nothing has to be owned by
+	# hand — the root does it on the way out.
+	var scene := PackedScene.new()
+	var err := scene.pack(root)
+	root.free()
+	if err != OK:
+		return err
+	return ResourceSaver.save(scene, path)
 
 
 ## The grid image itself, for callers that want to keep it in memory.

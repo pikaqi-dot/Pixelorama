@@ -15,12 +15,19 @@ extends Resource
 ##
 ## # One layer of one frame, e.g. the character without the background:
 ## $Shadow.texture = project.get_layer_image(0, "character")
+##
+## # A tilemap project, as a Godot TileSet and a filled-in TileMapLayer:
+## $TileMapLayer.tile_set = project.build_tile_set()
+## add_child(project.build_tile_map(0))
 ## [/codeblock]
 
 ## Canvas size of the project, in pixels.
 @export var canvas_size: Vector2i = Vector2i.ZERO
 ## Frames per second the project was authored at.
 @export var fps: float = 12.0
+## The Image format the pixels are stored in, kept so the tile images can be read
+## the same way the cels were.
+@export var color_mode: int = 4
 ## Layer names, in Pixelorama's own order (bottom to top).
 @export var layer_names: PackedStringArray = PackedStringArray()
 ## Every frame of the drawing tab, in order.
@@ -32,6 +39,13 @@ extends Resource
 @export var sprite_frames: SpriteFrames
 ## Where this was imported from, for messages and debugging.
 @export var source_path: String = ""
+## The project's tilesets, metadata only: [code]{name, tile_size, tile_shape,
+## tile_amount, terrain_colors, terrain_names, tile_bits}[/code]. The tile images
+## stay inside the `.pxo` and are read on demand by [PxoTileset].
+@export var tilesets: Array[Dictionary] = []
+## One entry per tilemap layer: [code]{layer, tileset, tile_size, name}[/code],
+## where [code]layer[/code] is that layer's index in [member layer_names].
+@export var tile_layers: Array[Dictionary] = []
 
 
 func frame_count() -> int:
@@ -71,6 +85,33 @@ func get_tag(tag_name: String) -> Dictionary:
 		if str(tag.get("name", "")) == tag_name:
 			return tag
 	return {}
+
+
+## Whether this project draws with tiles at all, so a panel can hide the tile
+## buttons for a plain sprite.
+func has_tilesets() -> bool:
+	return not tilesets.is_empty()
+
+
+## The names of the tilemap layers, for a menu or a log line.
+func tile_layer_names() -> PackedStringArray:
+	var out := PackedStringArray()
+	for entry: Dictionary in tile_layers:
+		out.append(str(entry.get("name", "")))
+	return out
+
+
+## A Godot [TileSet] built from the project's tilesets, tile images included. The
+## `.pxo` is read again here, so this works at run time as long as the file is
+## still in the project.
+func build_tile_set() -> TileSet:
+	return PxoTileset.build_tile_set(self)
+
+
+## The tilemap layers of one frame as a [Node2D] with a [TileMapLayer] each, cells
+## already placed. Null when that frame has no tilemap layer.
+func build_tile_map(frame_index := 0) -> Node2D:
+	return PxoTileset.build_tile_map(self, frame_index)
 
 
 ## Builds a fresh [SpriteFrames] from [member frames]. [member sprite_frames]
