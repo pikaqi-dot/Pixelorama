@@ -701,29 +701,57 @@ var layer_button_node := preload("res://src/UI/Timeline/LayerButton.tscn")
 var cel_button_scene: PackedScene = load("res://src/UI/Timeline/CelButton.tscn")
 
 ## The control node (aka Main node). It has the [param Main.gd] script attached.
+## Every reference below is resolved through a null check, because the scene that
+## happens to be running is not necessarily [code]Main.tscn[/code]: running a
+## sub-scene (F6, or a .tscn opened in the editor) leaves [member control]
+## pointing at that sub-scene, which holds none of these nodes. Without the
+## guards the very first miss aborts Global's implicit ready and the whole
+## interface is missing, with the only clue being a null-reference stack trace.
 @onready var control := get_tree().current_scene as Control
 ## The project tabs bar. It has the [param Tabs.gd] script attached.
-@onready var tabs: TabBar = control.find_child("TabBar")
+@onready var tabs: TabBar = (
+	control.find_child("TabBar") if is_instance_valid(control) else null
+)
 ## Contains viewport of the main canvas. It has the [param ViewportContainer.gd] script attached.
-@onready var main_viewport: SubViewportContainer = control.find_child("SubViewportContainer")
+@onready var main_viewport: SubViewportContainer = (
+	control.find_child("SubViewportContainer") if is_instance_valid(control) else null
+)
 ## The main canvas node. It has the [param Canvas.gd] script attached.
-@onready var canvas: Canvas = main_viewport.find_child("Canvas")
+@onready var canvas: Canvas = (
+	main_viewport.find_child("Canvas") if is_instance_valid(main_viewport) else null
+)
 ## Camera of the main canvas.
-@onready var camera: CanvasCamera = main_viewport.find_child("Camera2D")
+@onready var camera: CanvasCamera = (
+	main_viewport.find_child("Camera2D") if is_instance_valid(main_viewport) else null
+)
 ## Transparent checker of the main canvas. It has the [param TransparentChecker.gd] script attached.
-@onready var transparent_checker: ColorRect = control.find_child("TransparentChecker")
+@onready var transparent_checker: ColorRect = (
+	control.find_child("TransparentChecker") if is_instance_valid(control) else null
+)
 ## The top menu container. It has the [param TopMenuContainer.gd] script attached.
-@onready var top_menu_container: Panel = control.find_child("TopMenuContainer")
+@onready var top_menu_container: Panel = (
+	control.find_child("TopMenuContainer") if is_instance_valid(control) else null
+)
 ## The animation timeline. It has the [param AnimationTimeline.gd] script attached.
-@onready var animation_timeline: Panel = control.find_child("Animation Timeline")
+@onready var animation_timeline: Panel = (
+	control.find_child("Animation Timeline") if is_instance_valid(control) else null
+)
 ## Popup dialog that displays brushes. It has the [param BrushesPopup.gd] script attached.
-@onready var brushes_popup: Popup = control.find_child("BrushesPopup")
+@onready var brushes_popup: Popup = (
+	control.find_child("BrushesPopup") if is_instance_valid(control) else null
+)
 ## Popup dialog that displays patterns. It has the [param PatternsPopup.gd] script attached.
-@onready var patterns_popup: Popup = control.find_child("PatternsPopup")
+@onready var patterns_popup: Popup = (
+	control.find_child("PatternsPopup") if is_instance_valid(control) else null
+)
 ## Dialog used to export images. It has the [param ExportDialog.gd] script attached.
-@onready var export_dialog: AcceptDialog = control.find_child("ExportDialog")
+@onready var export_dialog: AcceptDialog = (
+	control.find_child("ExportDialog") if is_instance_valid(control) else null
+)
 ## An error dialog to show errors.
-@onready var error_dialog: AcceptDialog = control.find_child("ErrorDialog")
+@onready var error_dialog: AcceptDialog = (
+	control.find_child("ErrorDialog") if is_instance_valid(control) else null
+)
 
 
 class Grid:
@@ -834,6 +862,18 @@ func _init() -> void:
 
 
 func _ready() -> void:
+	if not is_instance_valid(main_viewport):
+		# Running a sub-scene (F6, or a .tscn opened in the editor) instead of
+		# Main.tscn leaves every one of the nodes above unresolved, and the code
+		# that follows dereferences them one after another. Stopping here turns a
+		# cascade of null references into one sentence that says what to do.
+		push_warning(
+			"Global: 当前运行的场景不是 res://src/Main.tscn，缺少 "
+			+ "SubViewportContainer / Canvas 等主界面节点，无法启动界面。"
+			+ "请用 F5（运行项目）而不是 F6（运行当前场景）。"
+		)
+		get_tree().quit()
+		return
 	print(get_system_info())
 	if DirAccess.dir_exists_absolute(FONTS_DIR_PATH):
 		var fonts_dir := DirAccess.open(FONTS_DIR_PATH)
