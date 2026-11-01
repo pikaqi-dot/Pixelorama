@@ -1056,6 +1056,27 @@ func _send_manifest() -> void:
 			{"key": key, "mtime": entry["mtime"], "size": entry["size"], "h": entry["h"]}
 		)
 	_outbox.append({"t": "manifest", "files": files})
+	log_line.emit(_manifest_summary(manifest))
+
+
+## The manifest as a line a person can check against a file manager: folder names
+## with their counts and the first few file names. A count alone leaves the real
+## question — "was my file in there at all?" — unanswered.
+func _manifest_summary(manifest: Dictionary) -> String:
+	var counts := {}
+	var names: Array[String] = []
+	for key: String in manifest:
+		var parts := key.split("/", true, 1)
+		var folder_name := str(parts[0])
+		counts[folder_name] = int(counts.get(folder_name, 0)) + 1
+		if names.size() < 6:
+			names.append(key)
+	var pieces: Array[String] = []
+	for folder_name: String in counts:
+		pieces.append("%s %d 个" % [folder_name, int(counts[folder_name])])
+	if manifest.size() > names.size():
+		names.append("…")
+	return "清单：%s｜文件：%s" % [", ".join(pieces), ", ".join(names)]
 
 
 func _handle_manifest(message: Dictionary) -> void:
@@ -1073,6 +1094,7 @@ func _handle_manifest(message: Dictionary) -> void:
 	if not _pulling:
 		return
 	_pulling = false
+	log_line.emit("对方" + _manifest_summary(remote))
 	_plan_pull(remote)
 	# Nothing to receive would leave the pull parked in "transfer" forever, and the
 	# button would stop working: an empty pull is a finished pull.
