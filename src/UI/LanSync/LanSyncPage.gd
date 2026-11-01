@@ -32,6 +32,11 @@ var _browse_dialog: FileDialog
 
 func _ready() -> void:
 	set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	if OS.get_name() == "Android":
+		# Ask for the storage permissions the manifest declares. On Android 11+ the
+		# all-files access cannot be requested this way and has to be granted in
+		# system settings, which the log says when a folder lists nothing.
+		OS.request_permissions()
 	_build()
 	_core = CoreScript.new()
 	_core.name = "LanSyncCore"

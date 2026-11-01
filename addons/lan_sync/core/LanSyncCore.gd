@@ -1429,6 +1429,12 @@ func _build_manifest() -> Dictionary:
 		var added := _scan(root, folder_name, manifest)
 		if added == 0:
 			log_line.emit("%s：目录里没有可同步的文件（%s）" % [folder_name, root])
+			if root.contains("/storage/emulated/"):
+				# Scoped storage shows an app only what it wrote itself, so a
+				# folder with files in a file manager can still list nothing here.
+				log_line.emit(
+					"如果文件管理器里能看到文件，去「设置 → 应用 → Pixelorama → 特殊权限」授予「所有文件访问权限」"
+				)
 	return manifest
 
 
