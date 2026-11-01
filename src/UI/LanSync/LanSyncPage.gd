@@ -376,7 +376,9 @@ func _refresh_remote_files() -> void:
 		return
 	_remote_files.clear()
 	if _core.peer_entries.is_empty():
-		_remote_files.add_item("（对方的清单是空的，或还没连上）")
+		# Which of the three it is decides what to do about it, so the box says it
+		# instead of one sentence covering all of them.
+		_remote_files.add_item(_empty_remote_text())
 		_remote_files.set_item_disabled(0, true)
 		return
 	for entry: Dictionary in _core.peer_entries:
@@ -385,6 +387,16 @@ func _refresh_remote_files() -> void:
 		_remote_files.add_item(
 			"%s · %s" % [str(entry.get("key", "")), _mtime_text(int(entry.get("mtime", 0)))]
 		)
+
+
+## Why the other side's list is empty: no link, a link still waiting for the list
+## to come back, or a link that answered with nothing.
+func _empty_remote_text() -> String:
+	if _core == null or _core.get("_peer") == null:
+		return "（还没连上对方）"
+	if bool(_core.get("_awaiting_manifest")):
+		return "（已连上，正在等对方回文件清单…）"
+	return "（对方的共享目录里没有文件）"
 
 
 ## A modification time as it reads in a file manager.

@@ -84,6 +84,11 @@ const HANDSHAKE_TIMEOUT := 4.0
 ## left alone. Long enough that a scan is not wasted redialling it, short enough
 ## that a phone which was asleep — the usual reason — is dialled again soon.
 const DEAD_DIAL_TTL := 20.0
+## How long to wait for the other side's file list before asking again, and how
+## many times. A list that never arrives leaves the panel empty with no
+## explanation, which reads exactly like "connected, and it has no files".
+const MANIFEST_RETRY := 4.0
+const MANIFEST_RETRIES := 2
 ## How long a silent peer is treated as asleep instead of gone. An Android app in
 ## the background has its main loop suspended and answers nothing until it comes
 ## back, so asking it every three seconds would only fill a socket buffer that
@@ -196,6 +201,10 @@ var _manual_round := false
 ## Whether this side planned the round, and so knows both sides' file counts. The
 ## side that only answered does not, and must not report zeros as facts.
 var _has_plan := false
+## When the list was last asked for, and how many times it has been asked for
+## again since, so silence from the other side becomes a line in the log.
+var _manifest_since := 0
+var _manifest_retries := 0
 ## Whether a manifest was asked for, and whether it was asked for in order to
 ## pull: a pull overwrites, it does not negotiate which copy is newer.
 var _awaiting_manifest := false
@@ -268,6 +277,7 @@ func _process(delta: float) -> void:
 	# Before _poll_peer, so the chunks appended here leave on this same frame.
 	_poll_send()
 	_poll_peer()
+	_poll_manifest_wait()
 	_poll_reconnect()
 	_poll_watchdog()
 	_poll_timeouts()
@@ -558,6 +568,8 @@ func request_sync_now() -> void:
 	_pull_keys.clear()
 	_outbox.append({"t": "pull"})
 	_awaiting_manifest = true
+	_manifest_since = Time.get_ticks_msec()
+	_manifest_retries = 0
 	_pulling = true
 	_manual_round = true
 	_phase = "manifest"
@@ -580,6 +592,8 @@ func request_file(key: String) -> void:
 	_pull_keys = [key]
 	_outbox.append({"t": "pull"})
 	_awaiting_manifest = true
+	_manifest_since = Time.get_ticks_msec()
+	_manifest_retries = 0
 	_pulling = true
 	_manual_round = true
 	_phase = "manifest"
@@ -595,6 +609,8 @@ func list_peer_files() -> void:
 		return
 	_outbox.append({"t": "list"})
 	_awaiting_manifest = true
+	_manifest_since = Time.get_ticks_msec()
+	_manifest_retries = 0
 	_pulling = false
 	_phase = "manifest"
 
@@ -1388,45 +1404,60 @@ func _manifest_summary(manifest: Dictionary) -> String:
 	return "清单：%s｜文件：%s" % [", ".join(pieces), ", ".join(names)]
 
 
-func _handle_manifest(message: Dictionary) -> void:
-	# A manifest only means something to the side that asked for it, and only one
-	# thing is ever asked for: a pull.
-	if not _awaiting_manifest:
+## Fills the panel with what the other side has. The timestamp travels with the
+## list because it is what a person reads to decide whether the copy on the other
+## side is the one they want, and an empty list says so in words instead of
+## leaving an empty box on screen.
+func _show_remote(remote: Dictionary) -> void:
+	var keys: Array[String] = []
+	for key: String in remote:
+		keys.append(key)
+	keys.sort()
+	peer_files = keys
+	peer_entries.clear()
+	for key: String in keys:
+		var entry: Dictionary = remote[key]
+		peer_entries.append(
+			{
+				"key": key,
+				"mtime": int(entry.get("mtime", 0)),
+				"size": int(entry.get("size", 0)),
+				"h": str(entry.get("h", "")),
+			}
+		)
+	peer_files_changed.emit()
+	if keys.is_empty():
+		log_line.emit(
+			"对方的共享目录里没有文件（对方那边可能报了「读不到这个目录」）"
+		)
 		return
-	_awaiting_manifest = false
+	log_line.emit("对方" + _manifest_summary(remote))
+
+
+func _handle_manifest(message: Dictionary) -> void:
 	var files: Variant = message.get("files", [])
 	var remote := {}
 	if files is Array:
 		for entry: Variant in files:
 			if entry is Dictionary:
 				remote[str((entry as Dictionary).get("key", ""))] = entry
+	# Whatever it was asked for, a manifest is also the answer to "what has the
+	# other side got", so the panel is filled from every single one. Insisting it
+	# only counted when a request was outstanding is what left the file list empty
+	# after a handshake both sides had already agreed to.
+	_show_remote(remote)
+	if not _awaiting_manifest:
+		if _phase == "manifest":
+			_phase = "connected"
+		return
+	_awaiting_manifest = false
+	_manifest_retries = 0
 	if not _pulling:
 		# A list request: show what the other side has and stop there. Nothing is
 		# fetched, because nothing was asked to be.
-		var keys: Array[String] = []
-		for key: String in remote:
-			keys.append(key)
-		keys.sort()
-		peer_files = keys
-		# The timestamp travels with the list: it is what a person reads to decide
-		# whether the copy on the other side is the one they want.
-		peer_entries.clear()
-		for key: String in keys:
-			var entry: Dictionary = remote[key]
-			peer_entries.append(
-				{
-					"key": key,
-					"mtime": int(entry.get("mtime", 0)),
-					"size": int(entry.get("size", 0)),
-					"h": str(entry.get("h", "")),
-				}
-			)
-		peer_files_changed.emit()
 		_phase = "connected"
-		log_line.emit("对方" + _manifest_summary(remote))
 		return
 	_pulling = false
-	log_line.emit("对方" + _manifest_summary(remote))
 	_plan_pull(remote)
 	# Nothing to receive would leave the pull parked in "transfer" forever, and the
 	# button would stop working: an empty pull is a finished pull.
@@ -1663,6 +1694,25 @@ func _finish_received() -> void:
 	_phase = "done"
 	_note_peer("已同步")
 	_report_round()
+
+
+## Asks again when the other side's list never arrives, and finally says so. A
+## request nobody answers used to leave the panel empty for the rest of the
+## session, which is indistinguishable from "connected, and it has no files".
+func _poll_manifest_wait() -> void:
+	if not _awaiting_manifest or _phase != "manifest" or _pulling:
+		return
+	if Time.get_ticks_msec() - _manifest_since < int(MANIFEST_RETRY * 1000.0):
+		return
+	_manifest_since = Time.get_ticks_msec()
+	_manifest_retries += 1
+	if _manifest_retries > MANIFEST_RETRIES:
+		_awaiting_manifest = false
+		_phase = "connected"
+		log_line.emit("对方一直没有回文件清单；再点一次「同步」看它这次回不回")
+		return
+	log_line.emit("对方还没回清单，再问一次（第 %d 次）" % _manifest_retries)
+	_outbox.append({"t": "list"})
 
 
 ## A round stops when the peer stops answering mid-transfer. The link is kept —
