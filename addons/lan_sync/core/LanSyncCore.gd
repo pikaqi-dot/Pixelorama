@@ -142,6 +142,7 @@ var _hash_cache: Dictionary = {}
 ## for it — a round somebody asked for has to say what came of it, even "nothing".
 var _local_file_count := 0
 var _peer_file_count := 0
+var _skipped_files := 0
 var _manual_round := false
 ## Whether this side planned the round, and so knows both sides' file counts. The
 ## side that only answered does not, and must not report zeros as facts.
@@ -445,6 +446,10 @@ func request_sync_now() -> void:
 		return
 	if _phase == "manifest" or _phase == "transfer":
 		log_line.emit("正在同步，稍等")
+		return
+	if _phase == "connecting" or _phase == "hello" or _phase == "await_consent" \
+			or _phase == "consent":
+		log_line.emit("还没连上（等对方点同意），稍后再点")
 		return
 	_outbox.append({"t": "pull"})
 	_awaiting_manifest = true
@@ -966,9 +971,11 @@ func _handle_line(text: String) -> void:
 		"hello_no":
 			_handle_hello_no()
 		# The other side is pulling: hand over the list, and wait to be asked for
-		# the files one by one. Nothing travels the other way.
+		# the files one by one. Nothing travels the other way — but only once this
+		# side has agreed to the connection at all.
 		"pull":
-			_send_manifest()
+			if _phase == "connected" or _phase == "done" or _phase.is_empty():
+				_send_manifest()
 		"manifest":
 			_handle_manifest(message)
 		"get":
@@ -1088,16 +1095,28 @@ func _plan_pull(remote: Dictionary) -> void:
 	_get_queue.clear()
 	_expecting = 0
 	_received = 0
+	_skipped_files = 0
+	var unshared := 0
+	var identical := 0
 	for key: String in remote:
 		# A key whose folder this side does not share would be asked for and then
 		# dropped on arrival, leaving the pull waiting for a file that never lands.
 		if _absolute(key).is_empty():
+			unshared += 1
 			continue
 		if local.has(key):
 			if str(local[key].get("h", "")) == str(remote[key].get("h", "-")):
+				identical += 1
 				continue
 		_get_queue.append(key)
 		_expecting += 1
+	# "0 files moved" has four causes and only one of them is good news, so the
+	# other three are said out loud instead of being left to be guessed at.
+	_skipped_files = unshared + identical
+	if unshared > 0:
+		log_line.emit("%d 个文件所属的文件夹没有在本机共享，已跳过" % unshared)
+	if identical > 0:
+		log_line.emit("%d 个文件内容已经相同，已跳过" % identical)
 	for key: String in _get_queue:
 		_outbox.append({"t": "get", "key": key})
 	if _expecting == 0:
@@ -1329,11 +1348,13 @@ func _report_round() -> void:
 	_reported_sent = sent_files
 	_reported_received = received_files
 	if not planned:
-		log_line.emit("同步完成：发出 %d 个，收到 %d 个" % [sent_files, received_files])
+		# The side that only answered: it has no manifest of its own to compare,
+		# so it reports what it handed over and nothing else.
+		log_line.emit("已把 %d 个文件发给对方" % sent_files)
 		return
 	log_line.emit(
-		"同步完成：发出 %d 个，收到 %d 个（本机 %d 个文件，对方 %d 个）"
-		% [sent_files, received_files, _local_file_count, _peer_file_count]
+		"拉取完成：收到 %d 个，跳过 %d 个（本机 %d 个文件，对方 %d 个）"
+		% [received_files, _skipped_files, _local_file_count, _peer_file_count]
 	)
 	if _local_file_count > 0 or _peer_file_count > 0:
 		return
@@ -1350,23 +1371,37 @@ func _note_peer(state: String) -> void:
 
 
 ## Manifest of every file the two peers may talk about, keyed by name/relative path.
+##
+## A folder that yields nothing says why. "Both sides have 0 files" while a file
+## manager clearly shows files is the one report that cannot be acted on, so the
+## three causes — no path, unreadable path, nothing to list — are named here
+## instead of being folded into a zero.
 func _build_manifest() -> Dictionary:
 	var manifest := {}
 	for folder_name: String in folders:
 		var root := str(folders[folder_name])
-		if root.is_empty() or not DirAccess.dir_exists_absolute(root):
+		if root.is_empty():
+			log_line.emit("%s：还没有设置路径" % folder_name)
 			continue
-		_scan(root, folder_name, manifest)
+		if not DirAccess.dir_exists_absolute(root):
+			log_line.emit("%s：读不到这个目录 %s" % [folder_name, root])
+			continue
+		var added := _scan(root, folder_name, manifest)
+		if added == 0:
+			log_line.emit("%s：目录里没有可同步的文件（%s）" % [folder_name, root])
 	return manifest
 
 
-func _scan(root: String, folder_name: String, manifest: Dictionary) -> void:
+func _scan(root: String, folder_name: String, manifest: Dictionary) -> int:
 	var pending: Array[String] = [root]
 	var seen := 0
+	var added := 0
 	while not pending.is_empty() and seen < MAX_FILES:
 		var current: String = pending.pop_back()
 		var directory := DirAccess.open(current)
 		if directory == null:
+			if current != root:
+				log_line.emit("读不到子目录 %s（权限？）" % current)
 			continue
 		directory.list_dir_begin()
 		var entry := directory.get_next()
@@ -1382,8 +1417,10 @@ func _scan(root: String, folder_name: String, manifest: Dictionary) -> void:
 					var relative := full.substr(root.length()).replace("\\", "/").lstrip("/")
 					var key := "%s/%s" % [folder_name, relative]
 					manifest[key] = _describe_file(full)
+					added += 1
 			entry = directory.get_next()
 		directory.list_dir_end()
+	return added
 
 
 ## What the other side needs to know about one file: when it changed, how big it
