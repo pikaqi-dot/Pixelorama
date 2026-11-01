@@ -64,6 +64,14 @@ const SWEEP_TIMEOUT := 3.0
 ## How long a single handshake dial may hang before it is called dead. A refused
 ## connection reports itself; a firewall that drops the packet says nothing at all.
 const DIAL_TIMEOUT := 5.0
+## How long a silent peer is treated as asleep instead of gone. An Android app in
+## the background has its main loop suspended and answers nothing until it comes
+## back, so asking it every three seconds would only fill a socket buffer that
+## nobody is reading.
+const IDLE_SILENCE := 8.0
+## A link that fell over is dialed again after this pause, then every retry.
+const RECONNECT_DELAY := 1.0
+const RECONNECT_RETRY := 3.0
 
 ## Folder name to absolute path. The name is what the two peers match on.
 var folders: Dictionary = {}
@@ -116,6 +124,13 @@ var _sending: Dictionary = {}
 var _receiving: Dictionary = {}
 ## Bytes of a message the socket did not take yet.
 var _write_left := PackedByteArray()
+## When the peer last said anything, and where to dial it again after a loss.
+var _peer_last_rx := 0
+var _peer_port := 0
+var _reconnect_at := 0
+var _reconnect_address := ""
+var _reconnect_port := 0
+var _reconnect_tries := 0
 ## Whether a manifest was asked for, so either side can start a round.
 var _awaiting_manifest := false
 ## When the application was paused, and how long it was away.
@@ -142,6 +157,13 @@ func _notification(what: int) -> void:
 		if _paused_at > 0:
 			_shift_deadlines(Time.get_ticks_msec() - _paused_at)
 		_paused_at = 0
+		# Back on screen: either the link survived the nap and gets a round right
+		# away, or it died while the app was suspended and is dialed again now
+		# instead of on some timer.
+		if _peer != null:
+			request_sync_now()
+		elif not _reconnect_address.is_empty():
+			_reconnect_at = Time.get_ticks_msec()
 
 
 func _shift_deadlines(elapsed: int) -> void:
@@ -149,6 +171,8 @@ func _shift_deadlines(elapsed: int) -> void:
 		return
 	if _peer_since > 0:
 		_peer_since += elapsed
+	if _peer_last_rx > 0:
+		_peer_last_rx += elapsed
 	if _consent_at > 0:
 		_consent_at += elapsed
 	for id: String in peers:
@@ -172,6 +196,7 @@ func _process(delta: float) -> void:
 	# Before _poll_peer, so the chunks appended here leave on this same frame.
 	_poll_send()
 	_poll_peer()
+	_poll_reconnect()
 	_poll_resync(delta)
 	_poll_timeouts()
 
@@ -217,6 +242,7 @@ func stop() -> void:
 		socket.disconnect_from_host()
 	_sweep_sockets.clear()
 	_scan_active = false
+	_reconnect_at = 0
 	_consent_at = 0
 	running = false
 	set_process(false)
@@ -542,7 +568,10 @@ func _poll_server() -> void:
 		# the peer list would show a device with no address, which is exactly the
 		# thing somebody needs when the connection keeps failing.
 		_peer_address = str(incoming.get_connected_host())
+		_peer_port = int(incoming.get_connected_port())
 		_peer_since = Time.get_ticks_msec()
+		_peer_last_rx = Time.get_ticks_msec()
+		_reconnect_at = 0
 		_initiator = false
 		_buffer = PackedByteArray()
 		_phase = "accepted"
@@ -671,6 +700,11 @@ func _poll_resync(delta: float) -> void:
 		return
 	if _phase != "done" or _awaiting_manifest:
 		return
+	# A peer that has said nothing for a while is asleep, not gone: an Android app
+	# in the background answers nothing at all, and every request typed into that
+	# silence is one more message it has to work through when it wakes up.
+	if Time.get_ticks_msec() - _peer_last_rx > int(IDLE_SILENCE * 1000.0):
+		return
 	_resync_left -= delta
 	if _resync_left > 0.0:
 		return
@@ -690,21 +724,28 @@ func _poll_consent() -> void:
 		_drop_peer("")
 
 
-func _open_peer(address: String, port: int, id: String, peer_label: String) -> void:
+func _open_peer(
+	address: String, port: int, id: String, peer_label: String, quiet := false
+) -> void:
 	_drop_peer("")
 	var socket := StreamPeerTCP.new()
 	if socket.connect_to_host(address, port) != OK:
-		log_line.emit("连接 %s:%d 失败" % [address, port])
+		if not quiet:
+			log_line.emit("连接 %s:%d 失败" % [address, port])
 		return
 	_peer = socket
 	_peer_id = id
 	_peer_label = peer_label
 	_peer_address = address
+	_peer_port = port
 	_peer_since = Time.get_ticks_msec()
+	_peer_last_rx = Time.get_ticks_msec()
+	_reconnect_at = 0
 	_initiator = true
 	_buffer = PackedByteArray()
 	_phase = "connecting"
-	log_line.emit("正在连接 %s:%d" % [address, port])
+	if not quiet:
+		log_line.emit("正在连接 %s:%d" % [address, port])
 
 
 ## Takes over a socket a sweep already dialed, so a connection that worked is not
@@ -715,11 +756,61 @@ func _adopt_peer(socket: StreamPeerTCP, address: String) -> void:
 	_peer_id = ""
 	_peer_label = ""
 	_peer_address = address
+	_peer_port = SYNC_PORT
 	_peer_since = Time.get_ticks_msec()
+	_peer_last_rx = Time.get_ticks_msec()
+	_reconnect_at = 0
 	_initiator = true
 	_buffer = PackedByteArray()
 	_phase = "connecting"
 	log_line.emit("已连上 %s:%d，等待对方确认" % [address, SYNC_PORT])
+
+
+## A link is dropped, but the address that worked is remembered: a phone that was
+## in the background, or a Wi-Fi hiccup, must not end the session for good.
+func _link_lost(reason: String) -> void:
+	var address := _peer_address
+	var port := _peer_port
+	# Only a port somebody is listening on is worth dialling. The dialer knows its
+	# own target; the side that accepted holds the peer's *ephemeral* port, and the
+	# beacon is the only other place that knows the listening one. Dialling a dead
+	# port would also hold the slot that a good incoming connection needs.
+	var dialable := _initiator
+	if peers.has(_peer_id):
+		var entry: Dictionary = peers[_peer_id]
+		var heard_port := int(entry.get("port", 0))
+		var heard_address := str(entry.get("address", ""))
+		if heard_port > 0 and not heard_address.is_empty():
+			address = heard_address
+			port = heard_port
+			dialable = true
+	if not dialable:
+		address = ""
+	_drop_peer(reason)
+	if address.is_empty() or port <= 0:
+		return
+	_reconnect_address = address
+	_reconnect_port = port
+	_reconnect_at = Time.get_ticks_msec() + int(RECONNECT_DELAY * 1000.0)
+	log_line.emit("连接断了，%d 秒后重连 %s:%d" % [int(RECONNECT_DELAY), address, port])
+
+
+## Retries the last working address until it answers again. The beacon cannot be
+## relied on here: a peer that is asleep sends nothing, and the point of this is
+## that nobody has to press anything.
+func _poll_reconnect() -> void:
+	if _peer != null or _reconnect_at == 0:
+		return
+	var now := Time.get_ticks_msec()
+	if now < _reconnect_at:
+		return
+	_reconnect_at = now + int(RECONNECT_RETRY * 1000.0)
+	_reconnect_tries += 1
+	if _reconnect_tries == 1 or _reconnect_tries % 10 == 0:
+		log_line.emit(
+			"重连 %s:%d（第 %d 次）" % [_reconnect_address, _reconnect_port, _reconnect_tries]
+		)
+	_open_peer(_reconnect_address, _reconnect_port, "", "", true)
 
 
 func _drop_peer(reason: String) -> void:
@@ -729,7 +820,9 @@ func _drop_peer(reason: String) -> void:
 	_peer_id = ""
 	_peer_label = ""
 	_peer_address = ""
+	_peer_port = 0
 	_peer_since = 0
+	_peer_last_rx = 0
 	_initiator = false
 	_phase = ""
 	_awaiting_manifest = false
@@ -756,20 +849,21 @@ func _poll_peer() -> void:
 	_peer.poll()
 	var state := _peer.get_status()
 	if state == StreamPeerTCP.STATUS_ERROR or state == StreamPeerTCP.STATUS_NONE:
-		_drop_peer("连接已断开")
+		_link_lost("连接已断开")
 		return
 	if state != StreamPeerTCP.STATUS_CONNECTED:
 		# A refused connection reports itself at once; one a firewall drops reports
 		# nothing at all, so the wait has to end here or the link looks alive for
 		# the rest of the session while nothing will ever arrive.
 		if Time.get_ticks_msec() - _peer_since > int(DIAL_TIMEOUT * 1000.0):
-			_drop_peer(
+			_link_lost(
 				"连接 %s 超时：对方没有应答，多半是它的防火墙拦了 TCP %d"
 				% [_peer_address, SYNC_PORT]
 			)
 		return
 	if _phase == "connecting" or _phase == "accepted":
 		_phase = "hello"
+		_reconnect_tries = 0
 		_outbox.push_front(
 			{
 				"t": "hello",
@@ -792,6 +886,7 @@ func _read_available() -> void:
 		if bytes.is_empty():
 			return
 		_buffer.append_array(bytes)
+		_peer_last_rx = Time.get_ticks_msec()
 	# One message per line, so a message split over packets is simply joined.
 	while true:
 		var newline := _buffer.find(10)
