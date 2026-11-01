@@ -299,7 +299,13 @@ func _build() -> void:
 	log_panel.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	log_panel.add_theme_constant_override("separation", SEPARATION)
 	panels.add_child(log_panel)
-	log_panel.add_child(_heading("日志"))
+	var log_head := HBoxContainer.new()
+	log_head.add_theme_constant_override("separation", SEPARATION)
+	log_panel.add_child(log_head)
+	var log_title := _heading("日志")
+	log_title.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	log_head.add_child(log_title)
+	log_head.add_child(_button("清空", _on_clear_log))
 	_log = RichTextLabel.new()
 	_log.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	_log.size_flags_vertical = Control.SIZE_EXPAND_FILL
@@ -561,6 +567,10 @@ func _on_connect_pressed() -> void:
 
 func _on_log(text: String) -> void:
 	LogStyle.append_to(_log, text)
+
+
+func _on_clear_log() -> void:
+	LogStyle.clear(_log)
 
 
 func _on_file_synced(path: String, direction: String) -> void:

@@ -25,6 +25,10 @@ var _path_edit: LineEdit
 var _address_edit: LineEdit
 var _start_button: Button
 var _browse_dialog: EditorFileDialog
+## The bar between the controls and the log, so the log can be given as much room
+## as the dock has.
+var _split: VSplitContainer
+var _split_placed := false
 var _rescan_left := 0.0
 
 
@@ -48,6 +52,11 @@ func _ready() -> void:
 
 
 func _process(delta: float) -> void:
+	# The dock has no size until the editor lays it out, so the divider is placed
+	# the first frame that size is known: the log gets the bottom 40 percent.
+	if not _split_placed and _split != null and _split.size.y > 60.0:
+		_split_placed = true
+		_split.split_offset = maxi(80, int(_split.size.y * 0.6))
 	if _rescan_left <= 0.0:
 		return
 	_rescan_left -= delta
@@ -59,19 +68,37 @@ func _process(delta: float) -> void:
 
 func _build() -> void:
 	size_flags_vertical = Control.SIZE_EXPAND_FILL
+	# Two halves with a bar between them, and the bar can be dragged. A dock is
+	# tall and narrow, and letting the controls above decide the log's height is
+	# what flattened it: here the controls scroll, so the log keeps its share.
+	_split = VSplitContainer.new()
+	_split.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	add_child(_split)
+
+	var scroll := ScrollContainer.new()
+	scroll.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+	_split.add_child(scroll)
+
+	var controls := VBoxContainer.new()
+	controls.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	controls.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	controls.add_theme_constant_override("separation", 4)
+	scroll.add_child(controls)
+
 	var title := Label.new()
 	title.text = "局域网同步"
 	title.add_theme_font_size_override("font_size", 15)
-	add_child(title)
+	controls.add_child(title)
 
 	_status = Label.new()
 	_status.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	add_child(_status)
+	controls.add_child(_status)
 
 	# The address this machine answers on, on its own row: it is the one string
 	# somebody types into the other device, so it must be copyable and present
 	# before anything is started.
-	add_child(_heading("本机地址（填到对方）"))
+	controls.add_child(_heading("本机地址（填到对方）"))
 	var endpoint_row := HBoxContainer.new()
 	_endpoint_edit = LineEdit.new()
 	_endpoint_edit.editable = false
@@ -81,12 +108,12 @@ func _build() -> void:
 	copy_button.text = "复制"
 	copy_button.pressed.connect(_on_copy_endpoint)
 	endpoint_row.add_child(copy_button)
-	add_child(endpoint_row)
+	controls.add_child(endpoint_row)
 
-	add_child(_heading("同步文件夹"))
+	controls.add_child(_heading("同步文件夹"))
 	_folders = ItemList.new()
 	_folders.custom_minimum_size = Vector2(0, 70)
-	add_child(_folders)
+	controls.add_child(_folders)
 	var add_row := HBoxContainer.new()
 	_name_edit = LineEdit.new()
 	_name_edit.placeholder_text = "名称（留空取目录名）"
@@ -108,7 +135,7 @@ func _build() -> void:
 	remove_button.text = "移除"
 	remove_button.pressed.connect(_on_remove_folder)
 	add_row.add_child(remove_button)
-	add_child(add_row)
+	controls.add_child(add_row)
 
 	var run_row := HBoxContainer.new()
 	_start_button = Button.new()
@@ -128,30 +155,48 @@ func _build() -> void:
 	connect_button.text = "按地址连接"
 	connect_button.pressed.connect(_on_connect_pressed)
 	run_row.add_child(connect_button)
-	add_child(run_row)
+	controls.add_child(run_row)
 
 	_address_edit = LineEdit.new()
 	_address_edit.placeholder_text = "地址 例 192.168.1.20:45990"
-	add_child(_address_edit)
+	controls.add_child(_address_edit)
 
-	add_child(_heading("附近设备"))
+	controls.add_child(_heading("附近设备"))
 	_peers = ItemList.new()
 	_peers.custom_minimum_size = Vector2(0, 50)
-	add_child(_peers)
+	controls.add_child(_peers)
 
 	# What the other side is offering, before anything is taken.
-	add_child(_heading("对方的文件（双击一行只同步这一个）"))
+	controls.add_child(_heading("对方的文件（双击一行只同步这一个）"))
 	_remote_files = ItemList.new()
 	_remote_files.custom_minimum_size = Vector2(0, 70)
 	_remote_files.item_activated.connect(_on_remote_file_activated)
-	add_child(_remote_files)
+	controls.add_child(_remote_files)
 
-	add_child(_heading("日志"))
+	var log_box := VBoxContainer.new()
+	log_box.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	log_box.custom_minimum_size = Vector2(0, 150)
+	log_box.add_theme_constant_override("separation", 2)
+	_split.add_child(log_box)
+
+	var log_head := HBoxContainer.new()
+	log_head.add_theme_constant_override("separation", 4)
+	log_box.add_child(log_head)
+	var log_title := _heading("日志")
+	log_title.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	log_title.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	log_head.add_child(log_title)
+	var clear_button := Button.new()
+	clear_button.text = "清空"
+	clear_button.tooltip_text = "清掉日志窗口里的内容，不影响同步"
+	clear_button.pressed.connect(_on_clear_log)
+	log_head.add_child(clear_button)
+
 	_log = RichTextLabel.new()
 	_log.size_flags_vertical = Control.SIZE_EXPAND_FILL
-	_log.custom_minimum_size = Vector2(0, 110)
+	_log.custom_minimum_size = Vector2(0, 120)
 	_log.scroll_following = true
-	add_child(_log)
+	log_box.add_child(_log)
 
 
 func _heading(text: String) -> Label:
@@ -356,6 +401,10 @@ func _on_connect_pressed() -> void:
 
 func _on_log(text: String) -> void:
 	LogStyle.append_to(_log, text)
+
+
+func _on_clear_log() -> void:
+	LogStyle.clear(_log)
 
 
 func _on_file_synced(path: String, direction: String) -> void:

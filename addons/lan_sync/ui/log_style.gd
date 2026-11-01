@@ -48,6 +48,15 @@ const LIST_WORDS := ["清单", "对方的"]
 
 
 ## Formats one line and appends it, trimming the oldest lines past the cap.
+## Empties the window. The log is a view of what happened, not a record kept for
+## later, so throwing it away is always safe and sometimes the only way to see
+## what comes next.
+static func clear(label: RichTextLabel) -> void:
+	if not is_instance_valid(label):
+		return
+	label.clear()
+
+
 static func append_to(label: RichTextLabel, text: String) -> void:
 	if not is_instance_valid(label):
 		return
