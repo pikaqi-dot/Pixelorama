@@ -89,6 +89,9 @@ const DEAD_DIAL_TTL := 20.0
 ## explanation, which reads exactly like "connected, and it has no files".
 const MANIFEST_RETRY := 4.0
 const MANIFEST_RETRIES := 2
+## A pull waits on the other side hashing every file before it can answer, so
+## silence there is work, not a fault. This is when the log says so, once.
+const MANIFEST_QUIET_HINT := 8.0
 ## How long a silent peer is treated as asleep instead of gone. An Android app in
 ## the background has its main loop suspended and answers nothing until it comes
 ## back, so asking it every three seconds would only fill a socket buffer that
@@ -205,6 +208,7 @@ var _has_plan := false
 ## again since, so silence from the other side becomes a line in the log.
 var _manifest_since := 0
 var _manifest_retries := 0
+var _manifest_hinted := false
 ## Whether a manifest was asked for, and whether it was asked for in order to
 ## pull: a pull overwrites, it does not negotiate which copy is newer.
 var _awaiting_manifest := false
@@ -570,6 +574,7 @@ func request_sync_now() -> void:
 	_awaiting_manifest = true
 	_manifest_since = Time.get_ticks_msec()
 	_manifest_retries = 0
+	_manifest_hinted = false
 	_pulling = true
 	_manual_round = true
 	_phase = "manifest"
@@ -594,6 +599,7 @@ func request_file(key: String) -> void:
 	_awaiting_manifest = true
 	_manifest_since = Time.get_ticks_msec()
 	_manifest_retries = 0
+	_manifest_hinted = false
 	_pulling = true
 	_manual_round = true
 	_phase = "manifest"
@@ -611,6 +617,7 @@ func list_peer_files() -> void:
 	_awaiting_manifest = true
 	_manifest_since = Time.get_ticks_msec()
 	_manifest_retries = 0
+	_manifest_hinted = false
 	_pulling = false
 	_phase = "manifest"
 
@@ -1700,9 +1707,19 @@ func _finish_received() -> void:
 ## request nobody answers used to leave the panel empty for the rest of the
 ## session, which is indistinguishable from "connected, and it has no files".
 func _poll_manifest_wait() -> void:
-	if not _awaiting_manifest or _phase != "manifest" or _pulling:
+	if not _awaiting_manifest or _phase != "manifest":
 		return
-	if Time.get_ticks_msec() - _manifest_since < int(MANIFEST_RETRY * 1000.0):
+	var waited := Time.get_ticks_msec() - _manifest_since
+	if _pulling:
+		# A pull is waiting on the other side *building* the manifest: it hashes
+		# every file and says nothing while it does, which for a folder of large
+		# files is minutes. Re-asking would only start that over, so this waits —
+		# and says why it is waiting, once.
+		if not _manifest_hinted and waited >= int(MANIFEST_QUIET_HINT * 1000.0):
+			_manifest_hinted = true
+			log_line.emit("对方还在整理文件清单（文件多、体积大时会慢），请稍等")
+		return
+	if waited < int(MANIFEST_RETRY * 1000.0):
 		return
 	_manifest_since = Time.get_ticks_msec()
 	_manifest_retries += 1
@@ -1719,9 +1736,17 @@ func _poll_manifest_wait() -> void:
 ## the other side is most likely asleep — but the half finished round is dropped,
 ## or the next one would never be asked for.
 func _poll_watchdog() -> void:
-	if _peer == null or _phase != "manifest" and _phase != "transfer":
+	# Only a transfer is watched here. Waiting for a manifest is not silence to
+	# be punished — the other side is hashing files, and [_poll_manifest_wait]
+	# owns that wait, with its own retries and its own words.
+	if _peer == null or _phase != "transfer":
 		return
 	if Time.get_ticks_msec() - _peer_last_rx < int(TRANSFER_SILENCE * 1000.0):
+		return
+	# Sending counts as being alive. The receiver says nothing while a file
+	# streams in, so one big file over a slow link looked exactly like a dead
+	# peer and the round was cancelled in the middle of it.
+	if not _sending.is_empty() or not _write_left.is_empty() or not _outbox.is_empty():
 		return
 	_close_transfers()
 	_outbox.clear()
@@ -1731,7 +1756,10 @@ func _poll_watchdog() -> void:
 	_expecting = 0
 	_received = 0
 	_phase = "done"
-	log_line.emit("传输中断，等对方回来再续")
+	log_line.emit(
+		"对方 %s 秒没有动静，这一轮停下了；再点「同步」会从头续上"
+		% int(TRANSFER_SILENCE)
+	)
 
 
 ## A link can die with a file half read. Both handles are closed here, or the
