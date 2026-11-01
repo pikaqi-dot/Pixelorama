@@ -54,19 +54,36 @@ const MAX_FILES := 4000
 const CONFIG_PATH := "user://lan_sync.cfg"
 const IGNORED_NAMES := [".godot", ".import", ".git", ".DS_Store", "Thumbs.db"]
 ## Probes sent per frame while scanning. A /24 is 254 addresses, so the sweep of
-## one network is finished in about a tenth of a second without ever blocking.
-const SCAN_BATCH := 24
+## one network is finished in a handful of frames without ever blocking.
+const SCAN_BATCH := 64
 ## Networks swept in one scan. A phone has one, a desktop with virtual adapters
 ## may have six, and probing all of them would only cost time.
 const SCAN_MAX_PREFIXES := 4
+## Virtual networks swept only after the real ones came back empty. Two is what
+## keeps the worst case — a peer that is nowhere — as short as one ordinary scan.
+const SCAN_FALLBACK_MAX := 2
 ## Dial attempts a sweep keeps open at once. Every address of a /24 is tried, but
-## only this many sockets exist at a time, so a phone never holds 254 of them.
-const SWEEP_WINDOW := 48
-## How long one sweep dial may stay unresolved before it is given up on.
-const SWEEP_TIMEOUT := 3.0
+## only this many sockets exist at a time, and the sweep cannot finish before the
+## last of them does, so this is what decides how long a scan takes: a /24 is two
+## rounds of 128 instead of three rounds of 96.
+const SWEEP_WINDOW := 128
+## How long one sweep dial may stay unresolved before it is given up on. A host
+## that answers does so in single-digit milliseconds and a host with the port
+## closed refuses at once, so this is only ever spent on addresses where nothing
+## is plugged in; 1.5 seconds finds every real machine and stops paying for the
+## empty rest of the subnet sooner.
+const SWEEP_TIMEOUT := 1.5
 ## How long a single handshake dial may hang before it is called dead. A refused
 ## connection reports itself; a firewall that drops the packet says nothing at all.
 const DIAL_TIMEOUT := 5.0
+## How long a connected socket may stay silent before it is called "not one of
+## us". Routers, printers and NAS boxes accept a connection on any port, and a
+## real peer answers the hello in milliseconds, so nothing honest takes this long.
+const HANDSHAKE_TIMEOUT := 4.0
+## How long an address that accepted a connection without answering the hello is
+## left alone. Long enough that a scan is not wasted redialling it, short enough
+## that a phone which was asleep — the usual reason — is dialled again soon.
+const DEAD_DIAL_TTL := 20.0
 ## How long a silent peer is treated as asleep instead of gone. An Android app in
 ## the background has its main loop suspended and answers nothing until it comes
 ## back, so asking it every three seconds would only fill a socket buffer that
@@ -117,9 +134,22 @@ var _scan_pending: Array[String] = []
 ## How many times a peer was heard while the current sweep was running. A peer
 ## that was already known still counts: it answered.
 var _scan_hits := 0
+## When the sweep began, so the report can say how long it took.
+var _scan_started := 0
 ## Addresses a sweep still has to dial, and the dials it is waiting on.
 var _sweep_queue: Array[String] = []
 var _sweep_sockets: Array[Dictionary] = []
+## Addresses known to listen on something other than the default port. A second
+## copy of the application on one machine takes the next free port, and dialling
+## only the default would never find it.
+var _sweep_ports: Dictionary = {}
+## Networks held back for the second round of a sweep, see [_fallback_prefixes].
+var _scan_fallback: Array[String] = []
+## This machine's own addresses, so a sweep never dials itself.
+var _scan_own: Dictionary = {}
+## Addresses a sweep already found to be "accepts a connection, is not a peer",
+## so the same subnet is not dialled to them twice in one scan.
+var _dead_dials: Dictionary = {}
 var _scan_active := false
 ## Where the current link came from, for the peer list: a hello does not carry it.
 var _peer_address := ""
@@ -279,10 +309,13 @@ func stop() -> void:
 	_drop_peer("")
 	_scan_pending.clear()
 	_sweep_queue.clear()
+	_scan_fallback.clear()
 	for attempt: Dictionary in _sweep_sockets:
 		var socket: StreamPeerTCP = attempt["socket"]
 		socket.disconnect_from_host()
 	_sweep_sockets.clear()
+	_sweep_ports.clear()
+	_dead_dials.clear()
 	_scan_active = false
 	_reconnect_at = 0
 	running = false
@@ -315,23 +348,53 @@ func scan() -> void:
 		return
 	_scan_pending.clear()
 	_sweep_queue.clear()
+	_scan_fallback.clear()
 	_scan_active = true
 	_scan_hits = 0
-	var own := {}
+	_scan_started = Time.get_ticks_msec()
+	# Pressing scan again while a sweep is still running must not leave the old
+	# dials holding the whole window: they point at addresses nobody answers and
+	# would each sit there until their timeout, which is most of a scan's cost.
+	for attempt: Dictionary in _sweep_sockets:
+		var pending_socket: StreamPeerTCP = attempt["socket"]
+		pending_socket.disconnect_from_host()
+	_sweep_sockets.clear()
+	_sweep_ports.clear()
+	if not _link_address.is_empty() and _link_port > 0:
+		_sweep_ports[_link_address] = _link_port
+	# Broadcast first. Every peer on the network answers a broadcast probe at once,
+	# so on a healthy network the list fills before the address-by-address dials
+	# have even started. The sweep below is for the networks where UDP is blocked.
+	_probe_broadcast()
+	_scan_own.clear()
 	for entry: Dictionary in local_ipv4_entries():
-		own[str(entry["address"])] = true
-	for prefix: String in _local_prefixes():
-		for host in range(1, 255):
-			var address := "%s%d" % [prefix, host]
-			# Dialling this very machine would pair it with itself.
-			if own.has(address):
-				continue
-			_scan_pending.append(address)
-			_sweep_queue.append(address)
+		_scan_own[str(entry["address"])] = true
+	# The networks this device really sits on are dialled first and the virtual
+	# adapters a desktop carries — Hyper-V, WSL, VPN tunnels — only if those came
+	# back empty. Sweeping both at once doubled the work and, worse, let the host
+	# of a virtual switch answer on the sync port and be adopted as the peer.
+	var primary := _local_prefixes()
+	_scan_fallback = _fallback_prefixes(primary)
+	_queue_scan_phase(primary)
+	if _sweep_queue.is_empty() and not _scan_fallback.is_empty():
+		_queue_scan_phase(_scan_fallback)
+		_scan_fallback.clear()
 	log_line.emit(
 		"正在扫描局域网（%d 个地址：UDP 探测 + TCP %d 直连）…"
 		% [_scan_pending.size(), SYNC_PORT]
 	)
+
+
+## Adds one group of networks to the sweep. This machine's own addresses are
+## skipped: dialling one of them would pair the application with itself.
+func _queue_scan_phase(prefixes: Array[String]) -> void:
+	for prefix: String in prefixes:
+		for host in range(1, 255):
+			var address := "%s%d" % [prefix, host]
+			if _scan_own.has(address):
+				continue
+			_scan_pending.append(address)
+			_sweep_queue.append(address)
 
 
 ## The IPv4 addresses this device answers on, for the status line. Somebody has to
@@ -605,10 +668,17 @@ func _broadcast() -> void:
 
 func _broadcast_targets() -> Array[String]:
 	var targets: Array[String] = ["255.255.255.255"]
-	for prefix: String in _local_prefixes():
+	var primary := _local_prefixes()
+	for prefix: String in primary:
 		var directed := "%s255" % prefix
 		if not targets.has(directed):
 			targets.append(directed)
+	# No peer ever sits behind a virtual switch, but one extra packet costs nothing
+	# and missing a network that does have one costs the whole scan.
+	for prefix: String in _fallback_prefixes(primary):
+		var fallback_target := "%s255" % prefix
+		if not targets.has(fallback_target):
+			targets.append(fallback_target)
 	return targets
 
 
@@ -648,6 +718,9 @@ func _remember_peer(id: String, peer_label: String, address: String, port: int) 
 		_scan_hits += 1
 	if not address.is_empty():
 		entry["address"] = address
+		# A device that said its name is a peer again, whatever a sweep made of
+		# the socket it once accepted and never answered on.
+		_dead_dials.erase(address)
 	if port > 0:
 		entry["port"] = port
 	# A beacon is the only word on which port the peer listens on, and it keeps
@@ -705,6 +778,21 @@ func _poll_server() -> void:
 		_phase = "accepted"
 
 
+## Asks every peer on every attached network to answer, in one packet per network
+## instead of 254. This is the difference between a scan that finds the other side
+## in under a second and one that waits for the next scheduled beacon.
+func _probe_broadcast() -> void:
+	if not _udp.is_bound():
+		return
+	var packet := "LANSYNC?|%d|%s|%s|%d" % [
+		PROTOCOL, device_id, label.replace("|", " "), sync_port
+	]
+	var bytes := packet.to_utf8_buffer()
+	for target: String in _broadcast_targets():
+		_udp.set_dest_address(target, DISCOVERY_PORT)
+		_udp.put_packet(bytes)
+
+
 ## Sends this device's beacon to one address, which is how a scan gets answered.
 func _reply_beacon(to_address: String) -> void:
 	var packet := "LANSYNC|%d|%s|%s|%d" % [
@@ -714,32 +802,65 @@ func _reply_beacon(to_address: String) -> void:
 	_udp.put_packet(packet.to_utf8_buffer())
 
 
-## The networks worth sweeping, best first. A desktop can easily carry half a
+## The networks worth sweeping first, best first. A desktop can easily carry half a
 ## dozen addresses from virtual adapters and VPNs, and sweeping all of them would
-## mean thousands of probes for one real network, so the home ranges come first
-## and the list is cut short.
+## mean thousands of probes for one real network, so the real ones come first and
+## the list is cut short. The rest go to [_fallback_prefixes] for a second round.
 func _local_prefixes() -> Array[String]:
-	var result: Array[String] = []
-	# The order the system hands out is the interface order, which puts the real
-	# adapter before the virtual ones, so it is kept rather than re-sorted: on this
-	# kind of machine 192.168.x is just as likely to be a Hyper-V switch as a home
-	# network.
-	for address: String in IP.get_local_addresses():
-		if address.begins_with("127.") or address.begins_with("169.254."):
+	var primary: Array[String] = []
+	for entry: Dictionary in local_ipv4_entries():
+		var address := str(entry.get("address", ""))
+		var prefix := _prefix_of(address)
+		if prefix.is_empty() or primary.has(prefix):
 			continue
 		var parts := address.split(".")
-		if parts.size() != 4:
-			continue
-		var second := int(parts[1])
 		# Carrier grade NAT, which is what a tunnel hands out, is never the LAN.
-		if int(parts[0]) == 100 and second >= 64 and second <= 127:
+		if int(parts[0]) == 100 and int(parts[1]) >= 64 and int(parts[1]) <= 127:
 			continue
-		var prefix := "%s.%s.%s." % [parts[0], parts[1], parts[2]]
-		if not result.has(prefix):
-			result.append(prefix)
-	if result.size() > SCAN_MAX_PREFIXES:
-		result.resize(SCAN_MAX_PREFIXES)
-	return result
+		# An address ending in .1 is the gateway of its own network; on a desktop
+		# that is usually a Hyper-V or WSL switch rather than the Wi-Fi, and the
+		# only host that answers there is the desktop itself. Held back, see below.
+		if address.ends_with(".1"):
+			continue
+		primary.append(prefix)
+	# The network of the last address that actually answered comes first: a peer
+	# that moved to another subnet would otherwise be pushed out by the prefix cap.
+	var known := _prefix_of(_link_address)
+	if not known.is_empty() and not primary.has(known):
+		primary.push_front(known)
+	if primary.size() > SCAN_MAX_PREFIXES:
+		primary.resize(SCAN_MAX_PREFIXES)
+	return primary
+
+
+## The networks only worth a look when the real ones came back silent: gateways of
+## virtual switches, tunnels, and whatever the prefix cap pushed off the front
+## list. Sweeping them is what found the neighbour an adapter cannot answer for,
+## but doing it up front meant dialling 500 addresses to find one peer.
+func _fallback_prefixes(primary: Array[String]) -> Array[String]:
+	var rest: Array[String] = []
+	for entry: Dictionary in local_ipv4_entries():
+		var address := str(entry.get("address", ""))
+		var prefix := _prefix_of(address)
+		if prefix.is_empty() or primary.has(prefix) or rest.has(prefix):
+			continue
+		var parts := address.split(".")
+		if int(parts[0]) == 100 and int(parts[1]) >= 64 and int(parts[1]) <= 127:
+			continue
+		rest.append(prefix)
+	if rest.size() > SCAN_FALLBACK_MAX:
+		rest.resize(SCAN_FALLBACK_MAX)
+	return rest
+
+
+## The /24 an address belongs to, or an empty string when it is not worth sweeping.
+static func _prefix_of(address: String) -> String:
+	if address.is_empty() or address.begins_with("127.") or address.begins_with("169.254."):
+		return ""
+	var parts := address.split(".")
+	if parts.size() != 4:
+		return ""
+	return "%s.%s.%s." % [parts[0], parts[1], parts[2]]
 
 
 ## One batch of probes per frame, so a sweep never blocks the drawing view.
@@ -772,20 +893,37 @@ func _report_scan() -> void:
 		return
 	_scan_active = false
 	scan_finished.emit()
+	var seconds := str(snappedf((Time.get_ticks_msec() - _scan_started) / 1000.0, 0.1))
 	# What the button is asking is "what is nearby", so the list is the answer.
 	# Comparing the count before and after said "no device replied" while the peer
 	# sat right there in the list, simply because it was known before the sweep.
 	if not peers.is_empty():
 		if _scan_hits > 0:
-			log_line.emit("扫描完成，附近 %d 台设备" % peers.size())
+			log_line.emit("扫描完成，附近 %d 台设备（%s 秒）" % [peers.size(), seconds])
 		else:
 			log_line.emit(
-				"扫描完成，附近 %d 台设备；这次没收到回应，是之前发现过的" % peers.size()
+				"扫描完成，附近 %d 台设备；这次没收到回应，是之前发现过的（%s 秒）"
+				% [peers.size(), seconds]
+			)
+		return
+	# A dial that connected is a result even before the peer has said its name:
+	# reporting silence while the link is up was the same mistake as above. A
+	# socket nobody has said hello on is still only a candidate, and saying so is
+	# what stops "已连上" from being printed for a printer with an open port.
+	if _peer != null:
+		if _peer_id.is_empty():
+			log_line.emit(
+				"扫描完成，%s:%d 接受了连接，正在握手确认（%s 秒）"
+				% [_peer_address, _peer_port, seconds]
+			)
+		else:
+			log_line.emit(
+				"扫描完成，已连上 %s:%d（%s 秒）" % [_peer_address, _peer_port, seconds]
 			)
 		return
 	# Silence has one usual cause on a desktop, and saying it here saves the
 	# person a long hunt: the system firewall answering for the other side.
-	log_line.emit("扫描完成，没有设备回应")
+	log_line.emit("扫描完成，没有设备回应（%s 秒）" % seconds)
 	log_line.emit(
 		"若对方是 Windows：它的防火墙要放行入站 UDP %d 与 TCP %d（本机地址 %s）"
 		% [DISCOVERY_PORT, SYNC_PORT, local_addresses()]
@@ -796,17 +934,39 @@ func _report_scan() -> void:
 ## that connects is not thrown away and re-dialed: it becomes the link, so the
 ## sweep and the handshake are the same connection.
 func _poll_sweep() -> void:
+	# Somebody answered a beacon during this scan, and a broadcast reaches every
+	# device on the network at once, so the dial half has nothing left to find.
+	if _scan_active and _scan_hits > 0:
+		_drop_pending_dials()
 	if _sweep_queue.is_empty() and _sweep_sockets.is_empty():
-		return
+		# The networks that matter came back empty, so the virtual adapters get
+		# their turn now instead of having been swept alongside them. The verdict
+		# itself is left to [_report_scan], one frame later.
+		if _scan_active and _scan_hits == 0 and not _scan_fallback.is_empty() \
+				and _peer == null:
+			_queue_scan_phase(_scan_fallback)
+			_scan_fallback.clear()
+			if not _sweep_queue.is_empty():
+				log_line.emit("主网段没找到设备，继续扫本机的虚拟网段…")
+				_probe_broadcast()
+		if _sweep_queue.is_empty():
+			return
 	var now := Time.get_ticks_msec()
 	var sent := 0
 	while not _sweep_queue.is_empty() \
 			and sent < SWEEP_WINDOW - _sweep_sockets.size():
 		var address: String = _sweep_queue.pop_back()
-		var socket := StreamPeerTCP.new()
-		if socket.connect_to_host(address, SYNC_PORT) != OK:
+		if _dead_dials.has(address) \
+				and now - int(_dead_dials[address]) < int(DEAD_DIAL_TTL * 1000.0):
 			continue
-		_sweep_sockets.append({"socket": socket, "address": address, "started": now})
+		var socket := StreamPeerTCP.new()
+		# A peer that once answered on a non-default port is dialled on that port.
+		var target_port := int(_sweep_ports.get(address, SYNC_PORT))
+		if socket.connect_to_host(address, target_port) != OK:
+			continue
+		_sweep_sockets.append(
+			{"socket": socket, "address": address, "started": now, "port": target_port}
+		)
 		sent += 1
 	var keep: Array[Dictionary] = []
 	for attempt: Dictionary in _sweep_sockets:
@@ -814,8 +974,13 @@ func _poll_sweep() -> void:
 		socket.poll()
 		var state := socket.get_status()
 		if state == StreamPeerTCP.STATUS_CONNECTED:
+			# Taken over as the link, but only the hello proves it is a peer; a
+			# device that merely accepts the connection is hung up by
+			# [_poll_peer] after [constant HANDSHAKE_TIMEOUT] and never dialled again.
 			if _peer == null:
-				_adopt_peer(socket, str(attempt["address"]))
+				_adopt_peer(
+					socket, str(attempt["address"]), int(attempt.get("port", SYNC_PORT))
+				)
 			else:
 				socket.disconnect_from_host()
 			continue
@@ -826,6 +991,17 @@ func _poll_sweep() -> void:
 			continue
 		keep.append(attempt)
 	_sweep_sockets = keep
+
+
+## Ends the dial half of a sweep early: nothing more has to be dialled once the
+## answer is in hand, and a queued address costs a socket until it times out.
+func _drop_pending_dials() -> void:
+	for attempt: Dictionary in _sweep_sockets:
+		var socket: StreamPeerTCP = attempt["socket"]
+		socket.disconnect_from_host()
+	_sweep_sockets.clear()
+	_sweep_queue.clear()
+	_scan_pending.clear()
 
 
 func _open_peer(
@@ -857,23 +1033,23 @@ func _open_peer(
 
 ## Takes over a socket a sweep already dialed, so a connection that worked is not
 ## hung up and tried again through the beacon path.
-func _adopt_peer(socket: StreamPeerTCP, address: String) -> void:
+func _adopt_peer(socket: StreamPeerTCP, address: String, port := SYNC_PORT) -> void:
 	_drop_peer("")
 	_peer = socket
 	_peer_id = ""
 	_peer_label = ""
 	_peer_address = address
-	_peer_port = SYNC_PORT
+	_peer_port = port
 	_peer_since = Time.get_ticks_msec()
 	_peer_last_rx = Time.get_ticks_msec()
 	_link_address = address
-	_link_port = SYNC_PORT
+	_link_port = port
 	_reconnect_at = 0
 	_reconnect_failures = 0
 	_initiator = true
 	_buffer = PackedByteArray()
 	_phase = "connecting"
-	log_line.emit("已连上 %s:%d，握手中…" % [address, SYNC_PORT])
+	log_line.emit("已连上 %s:%d，握手中…" % [address, port])
 
 
 ## A link is dropped, but the address that worked is remembered: a phone that was
@@ -977,6 +1153,20 @@ func _poll_peer() -> void:
 				% [_peer_address, SYNC_PORT]
 			)
 		return
+	# Connected is not the same as "one of us". A router, a printer and a NAS all
+	# accept a connection on any port, and holding that socket would keep the real
+	# peer out — one link at a time is the rule everywhere else.
+	if _phase == "connecting" or _phase == "accepted" or _phase == "hello":
+		if Time.get_ticks_msec() - _peer_since > int(HANDSHAKE_TIMEOUT * 1000.0):
+			var silent := _peer_address
+			var silent_port := _peer_port
+			if _peer_id.is_empty():
+				_dead_dials[silent] = Time.get_ticks_msec()
+			_drop_peer("")
+			log_line.emit(
+				"%s:%d 接受连接但不握手，不是同步端" % [silent, silent_port]
+			)
+			return
 	if _phase == "connecting" or _phase == "accepted":
 		_phase = "hello"
 		_reconnect_tries = 0
