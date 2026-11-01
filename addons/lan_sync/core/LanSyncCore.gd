@@ -44,6 +44,15 @@ const CHUNKS_PER_FRAME := 4
 ## happens once when two devices meet: a file saved ten seconds later has to
 ## travel too, and asking again is cheaper than reconnecting.
 const RESYNC_INTERVAL := 3.0
+## How long a round may go without hearing anything before it is abandoned. The
+## link is kept, because the other side is probably asleep; only the half finished
+## round is dropped, or the next one would never be asked for.
+const TRANSFER_SILENCE := 15.0
+## How long a computed hash is trusted. A round runs every three seconds, and
+## re-reading every file that often is the one cost worth avoiding — but a
+## filesystem timestamp only has one second of resolution, so the cache expires
+## instead of being trusted forever.
+const HASH_CACHE_TTL := 10.0
 ## Most files read from one folder. A pasted music library is not what this is for.
 const MAX_FILES := 4000
 const CONFIG_PATH := "user://lan_sync.cfg"
@@ -131,6 +140,9 @@ var _reconnect_at := 0
 var _reconnect_address := ""
 var _reconnect_port := 0
 var _reconnect_tries := 0
+## path -> {size, mtime, hash, checked}. Rounds run every three seconds; reading
+## every file that often would make an idle link cost as much as a busy one.
+var _hash_cache: Dictionary = {}
 ## Whether a manifest was asked for, so either side can start a round.
 var _awaiting_manifest := false
 ## When the application was paused, and how long it was away.
@@ -198,6 +210,7 @@ func _process(delta: float) -> void:
 	_poll_peer()
 	_poll_reconnect()
 	_poll_resync(delta)
+	_poll_watchdog()
 	_poll_timeouts()
 
 
@@ -438,11 +451,14 @@ func request_sync_now() -> void:
 
 func set_folder(folder_name: String, path: String) -> void:
 	folders[folder_name] = path
+	# Hashes are keyed by absolute path, and the folders just changed.
+	_hash_cache.clear()
 	save_config()
 
 
 func remove_folder(folder_name: String) -> void:
 	folders.erase(folder_name)
+	_hash_cache.clear()
 	save_config()
 
 
@@ -1087,6 +1103,10 @@ func _enqueue_file(key: String) -> void:
 	var path := _absolute(key)
 	if path.is_empty() or not FileAccess.file_exists(path):
 		return
+	# Already on its way, or already waiting: sending it twice would only make the
+	# receiver write the same bytes again.
+	if not _sending.is_empty() and str(_sending["key"]) == key:
+		return
 	for queued: Dictionary in _send_queue:
 		if str(queued["key"]) == key:
 			return
@@ -1204,26 +1224,58 @@ func _handle_file_end(message: Dictionary) -> void:
 	var declared := int(_receiving["size"])
 	_receiving = {}
 	if handle == null:
+		# Nothing landed, but the round still has to move on: a file that could not
+		# be written would otherwise leave the round parked in "transfer" and stop
+		# every later round for the rest of the session.
+		log_line.emit("%s 写入失败，已跳过" % key)
+		_finish_received()
 		return
 	handle.close()
 	if written != declared:
-		log_line.emit("%s 没有收全（%d/%d 字节）" % [key, written, declared])
+		log_line.emit("%s 没有收全（%d/%d 字节），已跳过" % [key, written, declared])
+		_finish_received()
 		return
+	_hash_cache.erase(path)
 	file_synced.emit(path, "in")
 	received_files += 1
 	log_line.emit("收到 %s（%s）" % [key, _size_text(written)])
-	# Counting only matters on the side that planned the round; the other side is
-	# answering, and for it every arriving file is simply good news.
+	_finish_received()
+
+
+## One file is done, whichever way it ended. Counting only matters on the side
+## that planned the round; the other side is answering, and for it every arriving
+## file is simply good news.
+func _finish_received() -> void:
 	if _phase != "transfer":
 		_note_peer("已同步")
 		return
 	_received += 1
-	if _received >= _expecting:
-		_outbox.append({"t": "done"})
-		_phase = "done"
-		_resync_left = RESYNC_INTERVAL
-		_note_peer("已同步")
-		_report_round()
+	if _received < _expecting:
+		return
+	_outbox.append({"t": "done"})
+	_phase = "done"
+	_resync_left = RESYNC_INTERVAL
+	_note_peer("已同步")
+	_report_round()
+
+
+## A round stops when the peer stops answering mid-transfer. The link is kept —
+## the other side is most likely asleep — but the half finished round is dropped,
+## or the next one would never be asked for.
+func _poll_watchdog() -> void:
+	if _peer == null or _phase != "manifest" and _phase != "transfer":
+		return
+	if Time.get_ticks_msec() - _peer_last_rx < int(TRANSFER_SILENCE * 1000.0):
+		return
+	_close_transfers()
+	_outbox.clear()
+	_write_left = PackedByteArray()
+	_awaiting_manifest = false
+	_expecting = 0
+	_received = 0
+	_phase = "done"
+	_resync_left = RESYNC_INTERVAL
+	log_line.emit("传输中断，等对方回来再续")
 
 
 ## A link can die with a file half read. Both handles are closed here, or the
@@ -1298,14 +1350,52 @@ func _scan(root: String, folder_name: String, manifest: Dictionary) -> void:
 					seen += 1
 					var relative := full.substr(root.length()).replace("\\", "/").lstrip("/")
 					var key := "%s/%s" % [folder_name, relative]
-					var size := _size_of(full)
-					manifest[key] = {
-						"mtime": FileAccess.get_modified_time(full),
-						"size": size,
-						"h": _file_hash(full),
-					}
+					manifest[key] = _describe_file(full)
 			entry = directory.get_next()
 		directory.list_dir_end()
+
+
+## What the other side needs to know about one file: when it changed, how big it
+## is, and what is in it. The hash is the expensive part, so a file that has not
+## changed since the last round reuses the one already computed.
+func _describe_file(path: String) -> Dictionary:
+	var mtime := FileAccess.get_modified_time(path)
+	var size := _size_of(path)
+	var cached: Variant = _hash_cache.get(path)
+	# Timestamp and size are both cheap and both have to agree: a save that keeps
+	# the size but not the content is caught by the timestamp, and one that lands
+	# in the same second but changes the size is caught by the size.
+	if cached is Dictionary and int(cached["mtime"]) == mtime \
+			and int(cached["size"]) == size \
+			and Time.get_ticks_msec() - int(cached["checked"]) < int(HASH_CACHE_TTL * 1000.0):
+		return {"mtime": mtime, "size": size, "h": str(cached["hash"])}
+	var described := _hash_and_size(path)
+	_hash_cache[path] = {
+		"mtime": mtime,
+		"size": int(described["size"]),
+		"hash": str(described["hash"]),
+		"checked": Time.get_ticks_msec(),
+	}
+	return {"mtime": mtime, "size": int(described["size"]), "h": str(described["hash"])}
+
+
+## Size and hash in one pass over the file, because two passes would read it twice.
+func _hash_and_size(path: String) -> Dictionary:
+	var handle := FileAccess.open(path, FileAccess.READ)
+	if handle == null:
+		return {"size": 0, "hash": ""}
+	var size := int(handle.get_length())
+	var context := HashingContext.new()
+	context.start(HashingContext.HASH_SHA256)
+	var read := 0
+	while read < size:
+		var chunk := handle.get_buffer(mini(CHUNK_BYTES, size - read))
+		if chunk.is_empty():
+			break
+		context.update(chunk)
+		read += chunk.size()
+	handle.close()
+	return {"size": size, "hash": context.finish().hex_encode()}
 
 
 func _size_of(path: String) -> int:
@@ -1317,25 +1407,6 @@ func _size_of(path: String) -> int:
 	return size
 
 
-## The content hash, read in blocks and folded as it goes. Loading a file to
-## compare it would put a copy of it in memory on both machines, which is the
-## one thing a file sync must never do.
-func _file_hash(path: String) -> String:
-	var handle := FileAccess.open(path, FileAccess.READ)
-	if handle == null:
-		return ""
-	var context := HashingContext.new()
-	context.start(HashingContext.HASH_SHA256)
-	var size := int(handle.get_length())
-	var read := 0
-	while read < size:
-		var chunk := handle.get_buffer(mini(CHUNK_BYTES, size - read))
-		if chunk.is_empty():
-			break
-		context.update(chunk)
-		read += chunk.size()
-	handle.close()
-	return context.finish().hex_encode()
 
 
 ## Turns a manifest key back into a real path. The first segment is the folder
