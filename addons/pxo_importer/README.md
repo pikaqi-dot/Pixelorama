@@ -35,6 +35,7 @@
 - 「帧」条：每帧的缩略图，缩略图宽度按帧的自身比例算（高图不会被塞进方框里留两条白边），点一下切换
 - 「图层（当前帧）」条：当前帧每一层的图，带层名，宽度同样按各自比例
 - 「播放」按钮：按工程的 fps 轮播各帧，大图跟着换
+- 「帧资源」按钮与「导出」菜单：生成 SpriteFrames / 精灵表 / 每帧 PNG / JSON，见下文
 - 「图块集」「地图」按钮：见下文，工程里没有图块集时是灰的
 
 下面依旧是属性列表。导入的资源在 Godot 里是**只读**的——它由 `.pxo` 生成，不能就地改；
@@ -42,19 +43,29 @@
 
 ## 导出成 Godot 自己的资源
 
-`.pxo` 导入出来的是只读资源，Godot 的动画编辑器、切片工具都打不开它。预览面板上有两个按钮，
-在 `.pxo` 旁边写出普通文件，之后就能用原生工具：
+`.pxo` 导入出来的是只读资源，Godot 的动画编辑器、切片工具都打不开它。预览面板上的按钮
+在 `.pxo` 旁边写出普通文件，之后就能用原生工具（和 Pixelorama 的导出面板是同一套产物）：
 
-| 按钮 | 产出 | 用来做什么 |
+| 按钮 / 菜单项 | 产出 | 用来做什么 |
 |---|---|---|
 | 帧资源 | `<名字>_spriteframes.tres` | 双击进 SpriteFrames 面板编辑；拖给 `AnimatedSprite2D` |
-| 精灵表 | `<名字>_sheet.png` | `Sprite2D` 设 `hframes`/`vframes` 切片；`TileSet` 当图集 |
+| 导出 → 单行精灵表 | `<名字>_sheet.png` | `Sprite2D` 设 `hframes=帧数`、`vframes=1` 切片；`TileSet` 当图集 |
+| 导出 → 精灵表（每行 4 帧） | 同上 | 帧多时排成网格，`hframes=4`、`vframes=ceil(帧数/4)` |
+| 导出 → 每帧一张 PNG | `<名字>_0001.png`、`<名字>_0002.png`… | 交给别的工具，或自己建 `AtlasTexture` / `AnimationPlayer` |
+| 导出 → 每帧 PNG + JSON | 上面的 PNG + `<名字>_frames.json` | 帧尺寸、fps、每帧停留时间与文件名、标签范围，脚本可以直接读 |
 | 图块集 | `<名字>_tileset.tres` | 拖到 `TileMapLayer` 的 Tile Set 上；TileSet 面板里能改，地形已连好 |
 | 地图 | `<名字>_tilemap.tscn` | 打开就是一个 `Node2D`，每层图块一个 `TileMapLayer`，格子已经摆好 |
 
 - 帧资源内嵌图像，不依赖 `.pxo`，可以随便改；重新点按钮会覆盖它（它就是从 `.pxo` 派生的）。
-- 精灵表按**帧尺寸**（不是画布尺寸）横向排一行，第 N 格就是第 N 帧。想换行数就在代码里调
-  `PxoExport.export_sheet(project, path, columns)`。
+- **帧资源里的动画名就是 Pixelorama 的标签**：工程里给帧划了 `idle`、`walk` 这些 tag，
+  导入后 `SpriteFrames` 里就是同名动画，各自包含自己那段帧；没被任何标签覆盖的帧放进 `untagged`。
+  工程没有标签时，仍然是单个 `default` 动画（和以前一样）。
+- 精灵表按**帧尺寸**（不是画布尺寸）排格，第 N 格就是第 N 帧。单行以外的排版在代码里调
+  `PxoExport.export_sheet(project, path, columns)`（每行几帧）或 `... , 0, rows`（每列几帧）。
+- 想要「裁掉四周空白」「整张放大」也在同一个函数上：
+  `PxoExport.export_sheet(project, path, 0, 0, true)` 会统一裁到**所有帧内容的并集**（不会逐帧裁，
+  所以播放时不会抖），最后一个参数是倍数（最近邻放大）。
+- 每帧 PNG 写进 `.pxo` 所在目录，文件名从 `_0001` 起补零，位数/分隔符可在 `export_frames()` 里调。
 - 地图导出的是**当前选中的那一帧**，`TileSet` 内嵌在 `.tscn` 里，所以那个场景是单文件、拖进哪个项目都能用。
   想多帧都成地图，就逐帧点一次（或按下面的 API 自己生成）。
 
@@ -78,7 +89,8 @@ $AnimatedSprite2D.play()
 ```
 
 `sprite_frames` 是导入时按帧合成好的，速度取自工程的 `fps`，每帧的停留时间也按
-Pixelorama 里的设置保留。
+Pixelorama 里的设置保留。工程里有动画标签时，标签就是动画名（`idle`、`walk`…），
+没被标签覆盖的帧归到 `untagged`。
 
 ### 单层：只要角色，不要背景
 
@@ -103,7 +115,8 @@ var idle: Dictionary = project.get_tag("idle")   # {name, from, to, color}
 
 ### 自己拼一份 SpriteFrames
 
-当工程是运行时拼出来的、而不是导入的，`build_sprite_frames()` 会重新生成一份。
+当工程是运行时拼出来的、而不是导入的，`build_sprite_frames()` 会重新生成一份：
+不带参数时按标签拆动画，带一个名字（`build_sprite_frames("all")`）则强制做成一个包含全部帧的动画。
 
 ### 图块：当成 TileMap 用
 

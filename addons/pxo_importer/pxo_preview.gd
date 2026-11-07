@@ -13,6 +13,11 @@ const CAPTION_HEIGHT := 26
 ## the picture to judge by, because a sprite bouncing two pixels between frames is
 ## invisible at 96 px.
 const STAGE_HEIGHT := 192
+## Ids of the 「导出」 menu, in the order the items are added.
+const MENU_SHEET := 0
+const MENU_SHEET_GRID := 1
+const MENU_FRAMES := 2
+const MENU_FRAMES_JSON := 3
 
 const ExportScript := preload("res://addons/pxo_importer/pxo_export.gd")
 const ReaderScript := preload("res://addons/pxo_importer/pxo_reader.gd")
@@ -70,11 +75,22 @@ func _build() -> void:
 	frames_button.tooltip_text = "生成 SpriteFrames 资源：可在 SpriteFrames 面板里编辑，直接给 AnimatedSprite2D 用"
 	frames_button.pressed.connect(_on_export_sprite_frames)
 	controls.add_child(frames_button)
-	var sheet_button := Button.new()
-	sheet_button.text = "精灵表"
-	sheet_button.tooltip_text = "把所有帧拼成一张 PNG：Sprite2D 用 hframes/vframes 切片，TileSet 当图集"
-	sheet_button.pressed.connect(_on_export_sheet)
-	controls.add_child(sheet_button)
+	# The rest of Pixelorama's export tab: a grid sheet, one PNG per frame, and
+	# the JSON that describes the animation for anything that is not an
+	# AnimatedSprite2D. All of them are written next to the .pxo.
+	var export_menu := MenuButton.new()
+	export_menu.text = "导出"
+	export_menu.tooltip_text = (
+		"精灵表（单行 / 每行 4 帧）、每帧一张 PNG、以及描述帧与标签的 JSON"
+		+ "\n非破坏性：只写派生文件，不动 .pxo"
+	)
+	var menu := export_menu.get_popup()
+	menu.add_item("单行精灵表", MENU_SHEET)
+	menu.add_item("精灵表（每行 4 帧）", MENU_SHEET_GRID)
+	menu.add_item("每帧一张 PNG", MENU_FRAMES)
+	menu.add_item("每帧 PNG + JSON", MENU_FRAMES_JSON)
+	menu.id_pressed.connect(_on_export_menu)
+	controls.add_child(export_menu)
 
 	# The tile side only means something for a project that has tilesets, and a
 	# greyed-out button says "not this project" better than a file that comes out
@@ -244,13 +260,62 @@ func _on_export_sprite_frames() -> void:
 	_reported(path, err, "双击它就能在 SpriteFrames 面板里编辑")
 
 
-## Writes the grid image next to the `.pxo`.
-func _on_export_sheet() -> void:
+## The export menu: what to write, all of it next to the `.pxo`.
+func _on_export_menu(id: int) -> void:
+	match id:
+		MENU_SHEET:
+			_on_export_sheet()
+		MENU_SHEET_GRID:
+			_on_export_sheet(4)
+		MENU_FRAMES:
+			_export_frame_files(false)
+		MENU_FRAMES_JSON:
+			_export_frame_files(true)
+		_:
+			return
+
+
+## Writes the grid image next to the `.pxo`. [param columns] is frames per row;
+## 0 keeps the single row `hframes = frame_count` expects.
+func _on_export_sheet(columns := 0) -> void:
 	if project == null:
 		return
 	var path := ExportScript.default_sheet_path(project.source_path)
-	var err: Error = ExportScript.export_sheet(project, path)
-	_reported(path, err, "Sprite2D 设 hframes=%d、vframes=1 即可切片" % project.frames.size())
+	var err: Error = ExportScript.export_sheet(project, path, columns)
+	var hint := "Sprite2D 设 hframes=%d、vframes=1 即可切片" % project.frames.size()
+	if columns > 0:
+		hint = "每行 %d 帧：Sprite2D 设 hframes=%d、vframes=%d" % [
+			columns, columns, ceili(float(project.frames.size()) / float(columns))
+		]
+	_reported(path, err, hint)
+
+
+## One PNG per frame, `<base>_0001.png` …, and optionally the JSON that describes
+## them. Written into the folder the `.pxo` lives in, like Pixelorama's own
+## 「图像」 tab.
+func _export_frame_files(with_json: bool) -> void:
+	if project == null:
+		return
+	var source := ExportScript.local_path(project.source_path)
+	var directory := source.get_base_dir()
+	var base := source.get_file()
+	var err: Error = ExportScript.export_frames(project, directory, base)
+	if err != OK:
+		_reported(directory, err, "")
+		return
+	var note := "%s/%s_0001.png …（%d 个文件）" % [
+		directory, base, project.frames.size()
+	]
+	if with_json:
+		var json_path := directory.path_join(base + "_frames.json")
+		var json_err: Error = ExportScript.export_json(project, json_path, base)
+		if json_err != OK:
+			_note.text = "PNG 已写出，但 JSON 生成失败（错误 %d）" % json_err
+			if Engine.is_editor_hint():
+				EditorInterface.get_resource_filesystem().scan()
+			return
+		note += " + " + json_path.get_file()
+	_reported(note, OK, "每帧一张 PNG，从 %s_0001.png 开始" % base)
 
 
 ## Writes the TileSet resource next to the `.pxo`.

@@ -149,17 +149,69 @@ func build_tile_map(frame_index := 0) -> Node2D:
 ## Builds a fresh [SpriteFrames] from [member frames]. [member sprite_frames]
 ## already holds one made the same way, so this is only needed when the project
 ## was assembled by hand rather than imported.
-func build_sprite_frames(animation_name := "default") -> SpriteFrames:
+##
+## Called with no name, Pixelorama's animation tags become the Godot animation
+## names — the tags are how frames are grouped in the editor, and a game wants the
+## same groups instead of one long "default". Frames no tag covers go into an
+## "untagged" animation, the way Pixelorama's own sheet export gives them their
+## own row. A project without tags still gets a single "default".
+##
+## Passing a name forces one animation holding every frame.
+func build_sprite_frames(animation_name := "") -> SpriteFrames:
 	var out := SpriteFrames.new()
-	if animation_name != "default":
+	if not animation_name.is_empty():
 		out.remove_animation("default")
 		out.add_animation(animation_name)
-	out.set_animation_speed(animation_name, max(0.001, fps))
-	for frame: PxoFrame in frames:
+		_fill_animation(out, animation_name, 0, frames.size() - 1)
+		return out
+	if tags.is_empty():
+		_fill_animation(out, "default", 0, frames.size() - 1)
+		return out
+	out.remove_animation("default")
+	var covered := {}
+	for tag: Dictionary in tags:
+		var name := str(tag.get("name", "")).strip_edges()
+		if name.is_empty():
+			name = "tag_%d" % out.get_animation_names().size()
+		if out.has_animation(name):
+			name = "%s_%d" % [name, out.get_animation_names().size()]
+		var first := int(tag.get("from", 0))
+		var last := int(tag.get("to", first))
+		out.add_animation(name)
+		_fill_animation(out, name, first, last)
+		for index in range(maxi(first, 0), mini(last, frames.size() - 1) + 1):
+			covered[index] = true
+	# Frames outside every tag would otherwise be unreachable from the SpriteFrames
+	# panel, so they get an animation of their own rather than disappearing.
+	var loose: Array[int] = []
+	for index in frames.size():
+		if not covered.has(index):
+			loose.append(index)
+	if not loose.is_empty():
+		var loose_name := "untagged"
+		if out.has_animation(loose_name):
+			loose_name = "untagged_%d" % out.get_animation_names().size()
+		out.add_animation(loose_name)
+		out.set_animation_speed(loose_name, maxf(0.001, fps))
+		out.set_animation_loop(loose_name, true)
+		for index in loose:
+			var frame := frames[index]
+			if frame == null or frame.composite == null:
+				continue
+			out.add_frame(loose_name, frame.composite, frame.duration)
+	return out
+
+
+## One animation covering [param from]..[param to] inclusive, at the project's
+## speed. A per-frame hold rides along with each frame, because that is what
+## Pixelorama stores: at the default 1.0 the animation speed alone decides.
+func _fill_animation(out: SpriteFrames, name: String, from: int, to: int) -> void:
+	out.set_animation_speed(name, maxf(0.001, fps))
+	out.set_animation_loop(name, true)
+	from = maxi(from, 0)
+	to = mini(to, frames.size() - 1)
+	for index in range(from, to + 1):
+		var frame := frames[index]
 		if frame == null or frame.composite == null:
 			continue
-		# A per-frame hold is what Pixelorama stores, so it is what a game should
-		# see: the duration rides along with the frame. At the default 1.0 the
-		# animation speed alone decides, which is the usual case.
-		out.add_frame(animation_name, frame.composite, frame.duration)
-	return out
+		out.add_frame(name, frame.composite, frame.duration)
