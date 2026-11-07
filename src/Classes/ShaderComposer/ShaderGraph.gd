@@ -1305,6 +1305,15 @@ func _paint_rows(state: Dictionary, from_row: int, to_row: int) -> void:
 	var size: Vector2i = state["size"]
 	var threads := _paint_threads()
 	var rows := to_row - from_row
+	var field: PackedByteArray = state.get("field_data", PackedByteArray())
+	# The per-pixel evaluator reads the project and writes the shared caches
+	# (`_source_cache`, `_bounds_cache`), and a Dictionary written from two
+	# workers at once is how this used to take the whole application down on a
+	# phone. Only a branch that is one pre-drawn picture may be spread over
+	# threads; everything else keeps to one.
+	if field.is_empty():
+		_paint_into(state, state["image"], 0, from_row, to_row)
+		return
 	if threads > 1 and rows >= PARALLEL_MIN_ROWS and size.x * rows >= PARALLEL_MIN_PIXELS:
 		_paint_rows_parallel(state, from_row, to_row, threads)
 		return
@@ -1366,7 +1375,9 @@ func _paint_rows_parallel(
 	var size: Vector2i = state["size"]
 	_warm_caches(size)
 	var rows := to_row - from_row
-	var count: int = mini(threads, rows)
+	if rows <= 0:
+		return
+	var count: int = maxi(1, mini(threads, rows))
 	var step: int = int(ceilf(float(rows) / float(count)))
 	var bands: Array = []
 	var start := from_row
@@ -1384,6 +1395,11 @@ func _paint_rows_parallel(
 		false,
 		"shader composer rows"
 	)
+	if group < 0:
+		# The pool refused the task; painting the rows here is slow but correct,
+		# and waiting on a group that never started is not.
+		_paint_into(state, state["image"], 0, from_row, to_row)
+		return
 	WorkerThreadPool.wait_for_group_task_completion(group)
 	var target: Image = state["image"]
 	for index in count:
@@ -2751,6 +2767,9 @@ static func _path_point_at(flat: PackedVector2Array, t: float) -> Dictionary:
 ## graph editor and by the picture in the side panel. It evaluates the node the
 ## same way the generator does, and paints it in the colour the branch carries.
 func preview_node(node_id: String, size: Vector2i) -> Image:
+	# A thumbnail of zero size would ask the engine for a zero sized image; one
+	# pixel is the smallest thing that can be built and returned.
+	size = Vector2i(maxi(size.x, 1), maxi(size.y, 1))
 	_resolve_animations()
 	# The colour is the one the branch carries: a node that owns a colour paints
 	# with it, and every node downstream inherits it, which is what makes a colour
@@ -2778,6 +2797,12 @@ func preview_node(node_id: String, size: Vector2i) -> Image:
 		)
 	else:
 		bytes = _preview_into(node_id, size, tint, fade, alpha_cut, field_data, 0, 0, size.y)
+	# create_from_data copies size.x * size.y * 4 bytes without checking the block
+	# it was given, so a short block reads past its end. Padding is transparent and
+	# leaves a visible hole instead of taking the application down.
+	var expected := size.x * size.y * 4
+	if bytes.size() != expected:
+		bytes.resize(expected)
 	return Image.create_from_data(size.x, size.y, false, Image.FORMAT_RGBA8, bytes)
 
 
@@ -2868,6 +2893,11 @@ func _preview_parallel(
 	field_data: PackedByteArray,
 	threads: int
 ) -> PackedByteArray:
+	# Same reason as the generator: only a node that already holds its picture can
+	# be painted from several threads, because the evaluator reads the project and
+	# writes caches no two threads may share.
+	if field_data.is_empty():
+		return _preview_into(node_id, size, tint, fade, alpha_cut, field_data, 0, 0, size.y)
 	_warm_caches(size)
 	var count: int = mini(threads, size.y)
 	var step: int = int(ceilf(float(size.y) / float(count)))
@@ -2889,6 +2919,10 @@ func _preview_parallel(
 		false,
 		"shader composer preview"
 	)
+	if group < 0:
+		# No thread pool on this platform, or it refused the task: one thread is
+		# slow but correct, and waiting on a task that was never created is not.
+		return _preview_into(node_id, size, tint, fade, alpha_cut, field_data, 0, 0, size.y)
 	WorkerThreadPool.wait_for_group_task_completion(group)
 	var bytes := PackedByteArray()
 	var expected: int = size.x * size.y * 4
@@ -2997,23 +3031,33 @@ func _raster_field(node_id: String, size: Vector2i) -> Image:
 	if bool(node.get("bypass", false)):
 		# A bypassed node hands its input through, so it owns no picture.
 		return null
+	var field: Image = null
 	match str(node["type"]):
 		"path":
-			return _path_image(node, params, size)
+			field = _path_image(node, params, size)
 		"tree":
-			return _tree_image(node, params, size)
+			field = _tree_image(node, params, size)
 		"particles":
-			return _particles_image(node, params, size)
+			field = _particles_image(node, params, size)
 		"scatter":
-			return _scatter_image(node, params, size, 0)
+			field = _scatter_image(node, params, size, 0)
 		"model3d":
-			return _model_image(node, params, size)
+			field = _model_image(node, params, size)
 		"pixel_art":
 			# The picture of the layer itself, colours kept. Without this the node
 			# went through the value evaluator, which only knows brightness, and a
 			# drawing that never touched a colour node came out grey.
-			return _pixel_art_image(node, params, size)
-	return null
+			field = _pixel_art_image(node, params, size)
+	# Both paint loops read four bytes per pixel. A picture in another format would
+	# be read past its last byte, which the engine does without a bounds check — a
+	# crash, not a script error. Converting here keeps the assumption true for
+	# every node type, including the ones added later.
+	if field == null or field.is_empty():
+		return null
+	if field.get_format() != Image.FORMAT_RGBA8:
+		field = field.duplicate()
+		field.convert(Image.FORMAT_RGBA8)
+	return field
 
 
 ## Rasterises the stroke of a path node at [param size] and caches it, so the
