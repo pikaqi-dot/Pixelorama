@@ -292,7 +292,14 @@ func update_recent_projects_submenu() -> void:
 	var reversed_recent_projects := recent_projects.duplicate()
 	reversed_recent_projects.reverse()
 	for project in reversed_recent_projects:
-		recent_projects_submenu.add_item(project.get_file())
+		# Android's file dialog hands back percent-encoded names, and that is what
+		# got remembered. Decoding before taking the last segment is what turns
+		# "%E4%B8%AD%E6%96%87.pxo" back into "中文.pxo" — and it also splits on the
+		# %2F inside a content:// URI, so the segment really is the file name.
+		var readable := str(project).uri_decode()
+		var index := recent_projects_submenu.item_count
+		recent_projects_submenu.add_item(readable.get_file())
+		recent_projects_submenu.set_item_tooltip(index, readable)
 
 
 func _setup_edit_menu() -> void:

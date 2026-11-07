@@ -575,9 +575,13 @@ func load_last_project(using_previous_session := false) -> void:
 func load_recent_project_file(path: String) -> void:
 	if OS.get_name() == "Web":
 		return
-	# Check if file still exists on disk
-	if FileAccess.file_exists(path):  # If yes then load the file
-		OpenSave.handle_loading_file(path)
+	# The recent list keeps whatever the dialog returned, and on Android that is a
+	# percent-encoded name ("%E4%B8%AD.pxo" for "中.pxo"); the file on disk has the
+	# decoded one, so the remembered path has to be resolved before it is opened.
+	var resolved := OpenSave.resolve_path(path)
+	# A content:// URI cannot be asked about, so it is tried rather than refused.
+	if FileAccess.file_exists(resolved) or resolved.begins_with("content://"):
+		OpenSave.handle_loading_file(resolved)
 	else:
 		# If file doesn't exist on disk then warn user about this
 		Global.popup_error("Cannot find project file.")

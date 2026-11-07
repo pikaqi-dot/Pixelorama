@@ -1348,6 +1348,20 @@ func _on_Autosave_timeout() -> void:
 		save_pxo_file(project.backup_path, true, project)
 
 
+## The path a remembered file really lives at.
+##
+## On Android the file dialog hands back percent-encoded names — "%E4%B8%AD.pxo"
+## for "中.pxo" — and one of those is what ends up in the recent list and in
+## `last_project_path`. The file on disk carries the decoded name, so the encoded
+## form is a path that does not exist; decoding it is the whole fix. Everything
+## else (a Windows path, a plain "user://x.pxo") is returned untouched.
+static func resolve_path(path: String) -> String:
+	if path.is_empty() or FileAccess.file_exists(path):
+		return path
+	var decoded := path.uri_decode()
+	return decoded if not decoded.is_empty() else path
+
+
 func save_project_to_recent_list(path: String) -> void:
 	var top_menu_container := Global.top_menu_container
 	if path.get_file().substr(0, 7) == "backup-" or path == "":
