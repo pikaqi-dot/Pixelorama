@@ -4183,8 +4183,15 @@ func _mask_value(node: Dictionary, uv: Vector2, size: Vector2i, depth: int) -> f
 	return clampf(_eval(mask_id, uv, size, depth + 1), 0.0, 1.0)
 
 
-## Average of the bright samples around [param uv], used by glow and bloom. Only
-## samples above [param tolerance] contribute, and the ring falloff softens them.
+## Brightest sample around [param uv], used by glow and bloom. A sample above
+## [param tolerance] contributes its value scaled by how far out it sits, and the
+## strongest one wins.
+##
+## This used to be the average over *every* sample, which made a bigger radius
+## dimmer: the extra rings were mostly empty and dividing by all of them diluted
+## the few bright ones, so 「范围」 changed almost nothing on screen — the one
+## parameter the node is named after. The maximum keeps the halo as bright as its
+## source and lets the radius decide only how far it reaches.
 func _halo(
 	node: Dictionary,
 	uv: Vector2,
@@ -4194,19 +4201,21 @@ func _halo(
 	tolerance: float
 ) -> float:
 	var rings := maxi(int(ceil(radius_px)), 1)
-	var total := 0.0
-	var samples := 0
+	var brightest := 0.0
 	for ring in range(1, rings + 1):
 		var falloff := 1.0 - float(ring) / float(rings + 1)
 		for index in 8:
-			var offset := Vector2.from_angle(TAU * float(index) / 8.0) * float(ring)
+			# Each ring is rotated half a step from the one before, so the eight
+			# directions do not line up into visible spokes as the radius grows.
+			var angle := TAU * (float(index) + float(ring) * 0.5) / 8.0
+			var offset := Vector2.from_angle(angle) * float(ring)
 			var value := clampf(
 				_eval(_input_id(node, 0), uv + offset, size, depth + 1), 0.0, 1.0
 			)
-			samples += 1
-			if value > tolerance:
-				total += value * falloff
-	return clampf(total / float(maxi(samples, 1)), 0.0, 1.0)
+			if value <= tolerance:
+				continue
+			brightest = maxf(brightest, value * falloff)
+	return clampf(brightest, 0.0, 1.0)
 
 
 static func _stamp_disc(
