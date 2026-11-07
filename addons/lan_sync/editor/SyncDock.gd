@@ -19,6 +19,9 @@ const DEFAULT_DIR := "res://lan_shared"
 const PAGE_DIR := "user://lan_shared"
 ## After a file lands, the editor needs a moment before a scan picks it up.
 const RESCAN_DELAY := 0.5
+## Rows of the right-click menu: one action per kind of row.
+const MENU_FILE := 1
+const MENU_FOLDER := 2
 
 var _core: Node
 var _folders: ItemList
@@ -26,6 +29,15 @@ var _peers: ItemList
 ## A tree rather than a list: the shared folders can be nested, and one item per
 ## folder keeps a deep share readable.
 var _file_tree: Tree
+## The right-click menu and the row it was opened on: the same two actions as a
+## double-click, for when a double-click is awkward (or eaten by a rebuild).
+var _row_menu: PopupMenu
+var _menu_item: TreeItem
+## The last row turned into a pull and when: a double-click reaches both the
+## tree's own activation and the click handler below, and the second one must not
+## queue the same file again.
+var _last_sync_target := ""
+var _last_sync_msec := 0
 ## What the file tree is currently showing, so a double-click knows which row it
 ## was: the other side's copies, this side's own, and which is newer.
 var _rows: Array[Dictionary] = []
@@ -207,7 +219,10 @@ func _build() -> void:
 	files_title.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	files_title.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
 	files_title.tooltip_text = (
-		FileMarks.LEGEND + "\n双击文件只同步它；双击文件夹同步整段（含子文件夹）"
+		FileMarks.LEGEND
+		+ "\n双击文件 = 强制用对方的覆盖本机（本机较新也会被覆盖）"
+		+ "\n双击文件夹 = 同步整段（含子文件夹）"
+		+ "\n右键 = 同样的两个动作，不想用双击时走这里"
 	)
 	files_head.add_child(files_title)
 	# Checking again is cheap and never transfers anything, so it gets a button
@@ -226,7 +241,12 @@ func _build() -> void:
 	_file_tree.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	_file_tree.custom_minimum_size = Vector2(0, 90)
 	_file_tree.item_activated.connect(_on_file_activated)
+	_file_tree.gui_input.connect(_on_file_tree_input)
 	files_box.add_child(_file_tree)
+
+	_row_menu = PopupMenu.new()
+	_row_menu.id_pressed.connect(_on_row_menu_pressed)
+	add_child(_row_menu)
 
 	var log_box := VBoxContainer.new()
 	log_box.size_flags_horizontal = Control.SIZE_EXPAND_FILL
@@ -352,8 +372,69 @@ func _on_refresh_files() -> void:
 ## a folder takes everything under it, at any depth — the cheap way to refresh one
 ## section of a nested share. A row the other side does not have cannot be pulled,
 ## and says so instead of asking for a file that is not there.
+##
+## This is also the way to force a copy: a click on one row is a deliberate
+## choice, so the core pulls it whatever the two timestamps say. A local file
+## that is newer is replaced, which is the whole point of the gesture.
 func _on_file_activated() -> void:
-	var item := _file_tree.get_selected()
+	_sync_row_item(_file_tree.get_selected())
+
+
+## Enter on a selected row reaches [method _on_file_activated], but a double-click
+## only does when it managed to select the row first. A click that lands while the
+## list is being redrawn selects nothing, and the row under the pointer is then
+## the only thing that still knows what was asked for, so the double-click is read
+## from the click position instead of from the selection.
+func _on_file_tree_input(event: InputEvent) -> void:
+	if not (event is InputEventMouseButton):
+		return
+	var mouse := event as InputEventMouseButton
+	if not mouse.pressed:
+		return
+	if mouse.button_index == MOUSE_BUTTON_RIGHT:
+		var target := _file_tree.get_item_at_position(mouse.position)
+		if target == null:
+			return
+		_open_row_menu(target, mouse.global_position)
+		_file_tree.accept_event()
+		return
+	if mouse.button_index != MOUSE_BUTTON_LEFT or not mouse.double_click:
+		return
+	var item := _file_tree.get_item_at_position(mouse.position)
+	if item == null:
+		return
+	_sync_row_item(item)
+	_file_tree.accept_event()
+
+
+## The same two actions behind the right button. A file row gets the forced copy,
+## a folder row gets the whole subtree; anything else has no action and no menu.
+func _open_row_menu(item: TreeItem, at: Vector2) -> void:
+	var meta: Variant = item.get_metadata(0)
+	if not meta is Dictionary:
+		return
+	_menu_item = item
+	_row_menu.clear()
+	if (meta as Dictionary).has("folder"):
+		_row_menu.add_item("同步这个文件夹（用对方的覆盖本机）", MENU_FOLDER)
+	else:
+		_row_menu.add_item("强制用对方的覆盖本机", MENU_FILE)
+	# `reset_size` is what turns the items into a height; a popup asked for with
+	# no size at all opens as an empty sliver.
+	_row_menu.reset_size()
+	_row_menu.popup(Rect2i(Vector2i(at), _row_menu.size))
+
+
+func _on_row_menu_pressed(_id: int) -> void:
+	if _menu_item == null or not is_instance_valid(_menu_item):
+		return
+	_sync_row_item(_menu_item)
+
+
+## Turns one row into a pull: a folder row takes everything under its prefix, a
+## file row takes that key and nothing else. The row's own metadata carries where
+## it points, so a rebuilt list cannot send the request to the wrong entry.
+func _sync_row_item(item: TreeItem) -> void:
 	if item == null:
 		return
 	var meta: Variant = item.get_metadata(0)
@@ -361,7 +442,11 @@ func _on_file_activated() -> void:
 		return
 	var info: Dictionary = meta
 	if info.has("folder"):
-		_core.call("request_folder", str(info["folder"]))
+		var prefix := str(info["folder"])
+		if _repeat_gesture(prefix):
+			return
+		_on_log("同步 %s 下的全部文件（用对方的覆盖本机）" % prefix.trim_suffix("/"))
+		_core.call("request_folder", prefix)
 		_refresh_status()
 		return
 	var index := int(info.get("index", -1))
@@ -374,8 +459,22 @@ func _on_file_activated() -> void:
 	if int(row.get("state", 0)) == LanSyncCore.FileState.LOCAL_ONLY:
 		_on_log("对方没有 %s，没法从这里拉；要给它，就在它那边点「同步」" % key)
 		return
+	if _repeat_gesture(key):
+		return
+	_on_log("强制用对方的覆盖 %s" % key)
 	_core.call("request_file", key)
 	_refresh_status()
+
+
+## True when this is the same gesture arriving a second time. A double-click is
+## both an activation and a click on a row, and the duplicate would only answer
+## 「正在同步，稍等」 in the log, which reads like a failure.
+func _repeat_gesture(target: String) -> bool:
+	var now := Time.get_ticks_msec()
+	var repeat := target == _last_sync_target and now - _last_sync_msec < 600
+	_last_sync_target = target
+	_last_sync_msec = now
+	return repeat
 
 
 func _refresh_status() -> void:
