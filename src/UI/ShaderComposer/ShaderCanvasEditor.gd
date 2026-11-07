@@ -2,8 +2,8 @@ extends Control
 ## Small drawing window for a canvas node. It is the size of the canvas instead
 ## of the whole editor, and it only offers what a material needs: a pencil, an
 ## eraser, a fill and two shapes, all in white. The palette belongs to the main
-## drawing view, not here. The same tools can also be picked from a dial that two
-## quick taps open on the board, which is what a thumb needs while drawing.
+## drawing view, not here. The same tools can also be picked from a dial that the
+## toolbar opens, which is what a thumb needs while drawing.
 
 signal finished
 ## The canvas got a different size, so the window around it has to be re-fitted.
@@ -95,7 +95,7 @@ func _ready() -> void:
 	# same window needs. It goes through the undo stack like a stroke.
 	toolbar.add_child(_make_button("清空", _clear_canvas, "把整张画布擦成透明，可撤销"))
 	toolbar.add_child(
-		_make_button("拨盘设置…", _open_dial_config, "选择双击画布时拨盘上给出哪些工具")
+		_make_button("拨盘设置…", _open_dial_config, "选择拨盘上给出哪些工具")
 	)
 	_status = Label.new()
 	_status.add_theme_font_size_override("font_size", 13)
@@ -114,8 +114,6 @@ func _ready() -> void:
 			_dirty = true
 			_update_status()
 	)
-	# Two quick taps on the board ask for the tool dial instead of painting.
-	_board.dial_requested.connect(_on_dial_requested)
 	column.add_child(_board)
 	# Brush size row: the arrows step by exactly one pixel, the slider covers
 	# everything in between.
@@ -152,8 +150,8 @@ func _ready() -> void:
 		+ "「清空」把整张画布擦成透明；「改尺寸」只改边框，"
 		+ "已经画好的像素留在原处、保持原来的大小，不会被拉伸，"
 		+ "所以小画布上画的元素放进大画布的散布里还是那么大。"
-		+ "双击画布打开工具拨盘：按在某个圆上再松手选工具，"
-		+ "点空白处或中间的圆关闭；「拨盘…」决定哪些工具上盘。"
+		+ "「◎ 拨盘」打开工具拨盘：按在某个圆上再松手选工具，"
+		+ "点空白处或中间的圆关闭；「拨盘设置…」决定哪些工具上盘。"
 	)
 	hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	hint.add_theme_font_size_override("font_size", 13)
@@ -320,22 +318,6 @@ func _undo_last() -> void:
 		size_changed.emit()
 
 
-## Takes back the stroke the first tap of a double tap left behind, so opening the
-## dial never costs a pixel. It is the same step 撤销 would remove.
-func _drop_last_stroke() -> void:
-	if _undo.is_empty() or not is_instance_valid(_board):
-		return
-	var before := image_size()
-	var snapshot: Image = _undo.pop_back()
-	_board.set_image(snapshot)
-	_board.last_stroke_was_tap = false
-	_dirty = bool(_undo_dirty.pop_back()) if not _undo_dirty.is_empty() else false
-	_sync_size_fields()
-	_update_status()
-	if image_size() != before:
-		size_changed.emit()
-
-
 ## Empties the whole canvas. The step is remembered, so 撤销 brings the picture
 ## back, and a second element can be drawn on the same canvas afterwards.
 func _clear_canvas() -> void:
@@ -465,26 +447,14 @@ func _update_status() -> void:
 	]
 
 
-## A double tap on the board asks for the tool dial. The first tap of the gesture
-## already put a dot down, so that step is taken back: opening the dial never
-## costs a pixel.
-func _on_dial_requested(_position: Vector2) -> void:
-	if not is_instance_valid(_board):
-		return
-	if _board.last_stroke_was_tap:
-		_drop_last_stroke()
-	# A stroke without its release would otherwise keep the board busy and eat the
-	# next tap, which on a touch screen is the usual way the dial stops opening.
-	_board._cancel_stroke()
-	_open_dial(_position)
-
-
-## Shows the dial at the tap, or moves it there when it is already built. The
-## board stops listening to the raw touch stream while it is up, because that
-## stream reaches it even through a control drawn on top.
+## Shows the dial in the middle of the board. The board stops listening to the raw
+## touch stream while it is up, because that stream reaches it even through a
+## control drawn on top — and a stroke that never got its release is dropped here,
+## or it would eat the first tap after the dial closes.
 func _open_dial(where: Vector2) -> void:
 	if not is_instance_valid(_board):
 		return
+	_board._cancel_stroke()
 	if not is_instance_valid(_dial):
 		_dial = Dial.new()
 		_dial.picked.connect(_on_dial_picked)
@@ -500,8 +470,9 @@ func _open_dial(where: Vector2) -> void:
 	_board.set_process_input(false)
 
 
-## Opens the dial from the toolbar, for the times a gesture is awkward: a mouse
-## whose double click speed is very slow, or a screen being drawn on with a pen.
+## Opens the dial from the toolbar. It used to open on a double click as well,
+## which is gone: a double click is an easy mistake to make while drawing, and the
+## button is always in the same place.
 func _open_dial_at_center() -> void:
 	if not is_instance_valid(_board):
 		return
@@ -585,7 +556,7 @@ func _open_dial_config() -> void:
 	box.add_child(title)
 	var hint := Label.new()
 	hint.text = (
-		"双击画布打开拨盘，按在圆上再松手选工具；点空白处或中间的圆关闭。"
+		"「◎ 拨盘」打开拨盘，按在圆上再松手选工具；点空白处或中间的圆关闭。"
 		+ "最多 %d 个，至少要留一个。改动只影响拨盘，工具栏上的按钮一直都在。"
 		% DIAL_MAX_SLOTS
 	)
@@ -656,31 +627,12 @@ func _on_size_slider_changed(value: float, readout: Label) -> void:
 class Board extends Control:
 	signal stroke_started
 	signal stroke_finished
-	## Two quick taps, close together, are one gesture: a request for the dial.
-	## The position is in board coordinates, where the finger landed.
-	signal dial_requested(position: Vector2)
-
-	## A second tap is only part of the same gesture when it lands this close in
-	## time and space. A finger on a phone is much less precise than a mouse, so
-	## both numbers are generous: half a second and about a fingertip apart still
-	## counts, anything slower or farther away draws as usual. A mouse does not
-	## need the timer at all: the engine flags a real double click, and that flag
-	## follows the double click speed set in the system.
-	const DIAL_TAP_MSEC := 600
-	const DIAL_TAP_DISTANCE := 28.0
-	## A touch press and the mouse press emulated from it arrive as two events for
-	## one finger. Anything this close is treated as the same press, not a pair.
-	const DIAL_SAME_PRESS_MSEC := 60
 
 	## 0 pencil, 1 eraser, 2 fill, 3 rectangle, 4 circle.
 	var tool := 0
 	## Side of the square brush the pencil and the eraser stamp, in pixels.
 	var brush_size := 1
 	var image: Image
-	## True when the last stroke left a mark without moving, which is exactly what
-	## the first tap of a double tap is. The editor takes that mark back when the
-	## dial opens, so the gesture never costs a pixel.
-	var last_stroke_was_tap := false
 
 	var _scale := 1.0
 	var _origin := Vector2.ZERO
@@ -689,12 +641,6 @@ class Board extends Control:
 	var _start := Vector2i.ZERO
 	var _end := Vector2i.ZERO
 	var _shaping := false
-	var _tap_msec := -10000
-	var _tap_position := Vector2.ZERO
-	var _stroke_moved := false
-	## Swallows the taps that follow a gesture, so the mouse event emulated from a
-	## touch cannot open the dial a second time.
-	var _dial_cooldown_msec := 0
 
 	func _ready() -> void:
 		mouse_filter = Control.MOUSE_FILTER_STOP
@@ -790,11 +736,6 @@ class Board extends Control:
 	func _gui_input(event: InputEvent) -> void:
 		if event is InputEventMouseButton and event.button_index == MOUSE_BUTTON_LEFT:
 			if event.pressed:
-				# The gesture check runs before anything is painted, so the second
-				# tap of a double tap never leaves a mark of its own.
-				if _begins_dial_gesture(event.position, event.double_click):
-					accept_event()
-					return
 				var pixel := _to_pixel(event.position)
 				if pixel.x < 0:
 					return
@@ -812,14 +753,6 @@ class Board extends Control:
 			_continue_stroke(pixel)
 			accept_event()
 			return
-		# Some platforms hand a finger to the control under it instead of the raw
-		# touch stream. Painting is already handled there, so only the gesture is
-		# read here; the timer makes the two paths agree on what one tap is.
-		if event is InputEventScreenTouch:
-			var touch := event as InputEventScreenTouch
-			if touch.pressed and _begins_dial_gesture(touch.position):
-				accept_event()
-			return
 
 
 	## Touch does not always arrive as emulated mouse events inside a popup, so
@@ -831,12 +764,6 @@ class Board extends Control:
 		if event is InputEventScreenTouch:
 			var touch := make_input_local(event) as InputEventScreenTouch
 			if touch.pressed:
-				# The gesture is read before anything else, even while a stroke is
-				# still open: a finger that left the window can leave one behind,
-				# and then every later tap would be swallowed and the dial would
-				# never open again.
-				if _begins_dial_gesture(touch.position):
-					return
 				if _pressed:
 					return
 				var pixel := _to_pixel(touch.position)
@@ -851,49 +778,11 @@ class Board extends Control:
 				_continue_stroke(pixel)
 
 
-	## Records every press and reports true when this one completes a double tap.
-	## A drag clears the record, so a stroke that happens to end where it started
-	## can never arm a second tap, and the short cooldown stops the mouse event
-	## emulated from a touch from opening the dial twice. [param double_click] is
-	## the engine's own verdict for a mouse, which honours the system setting
-	## instead of a timer this script invented.
-	func _begins_dial_gesture(position: Vector2, double_click := false) -> bool:
-		var now := Time.get_ticks_msec()
-		if now < _dial_cooldown_msec:
-			return false
-		# One finger can arrive twice: once as a touch and once as the mouse press
-		# emulated from it. That is one press, not the second half of a pair.
-		var same_press := (
-			now - _tap_msec < DIAL_SAME_PRESS_MSEC
-			and position.distance_to(_tap_position) <= 2.0
-		)
-		if same_press and not double_click:
-			return false
-		var double_tap := (
-			double_click
-			or (
-				now - _tap_msec <= DIAL_TAP_MSEC
-				and position.distance_to(_tap_position) <= DIAL_TAP_DISTANCE
-			)
-		)
-		_tap_position = position
-		if double_tap:
-			# A new pair starts right away: a third tap must not reopen the dial.
-			_tap_msec = -10000
-			_dial_cooldown_msec = now + DIAL_TAP_MSEC
-			dial_requested.emit(position)
-			return true
-		_tap_msec = now
-		return false
-
-
 	func _begin_stroke(pixel: Vector2i) -> void:
 		stroke_started.emit()
-		_stroke_moved = false
 		if tool == 2:
 			_flood_fill(pixel)
 			_refresh()
-			last_stroke_was_tap = true
 			stroke_finished.emit()
 			return
 		_pressed = true
@@ -909,9 +798,6 @@ class Board extends Control:
 
 
 	func _continue_stroke(pixel: Vector2i) -> void:
-		_stroke_moved = true
-		# A drag is a stroke, never the first half of a double tap.
-		_tap_msec = -10000
 		if _shaping:
 			_end = pixel
 			queue_redraw()
@@ -922,11 +808,11 @@ class Board extends Control:
 
 
 	## Drops a stroke that never got its release, which a finger leaving the
-	## window can cause. The dial takes this path when it opens on that finger.
+	## window can cause. Opening the dial takes this path, so the stale stroke
+	## cannot eat the first tap after the dial closes.
 	func _cancel_stroke() -> void:
 		_pressed = false
 		_shaping = false
-		last_stroke_was_tap = false
 		queue_redraw()
 
 
@@ -937,7 +823,6 @@ class Board extends Control:
 			_rasterise_shape()
 			_shaping = false
 		_pressed = false
-		last_stroke_was_tap = not _stroke_moved
 		_refresh()
 		stroke_finished.emit()
 		queue_redraw()
