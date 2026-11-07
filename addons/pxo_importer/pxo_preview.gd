@@ -127,12 +127,13 @@ func _strip(title: String) -> HBoxContainer:
 func _refresh() -> void:
 	if project == null:
 		return
-	_info.text = "画布 %d×%d · %d 帧 · %s fps · %d 层\n%s%s%s" % [
+	_info.text = "画布 %d×%d · %d 帧 · %s fps · %d 层%s\n%s%s%s" % [
 		project.canvas_size.x,
 		project.canvas_size.y,
 		project.frames.size(),
 		str(project.fps),
 		project.layer_names.size(),
+		_frame_line(),
 		"、".join(project.layer_names),
 		_tileset_line(),
 		_shader_line(),
@@ -256,6 +257,22 @@ func _no_tiles_reason() -> String:
 	if _is_stale():
 		return "这个资源是旧版导入器导入的：右键 .pxo → 重新导入，图块信息才会进来"
 	return "这个 .pxo 里没有图块集：Pixelorama 里没建 TileMap 图层，只有普通图层"
+
+
+## " · 帧 12×17（原点 2,-3）", or "" when a frame is exactly the canvas.
+##
+## The canvas is what Pixelorama shows; a cel drawn past its edge is still part of
+## the drawing. Saying the frame size out loud is what makes "the sprite is taller
+## than the canvas" visible instead of looking like the import changed something.
+func _frame_line() -> String:
+	if project == null:
+		return ""
+	var size := project.frame_size()
+	if size == project.canvas_size and project.frame_rect.position == Vector2i.ZERO:
+		return ""
+	return " · 帧 %d×%d（原点 %d,%d）" % [
+		size.x, size.y, project.frame_rect.position.x, project.frame_rect.position.y
+	]
 
 
 ## "· 1 个图块集 53 块（16×16）· 图块层 1 个", or a line saying why there is none.

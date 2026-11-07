@@ -26,7 +26,12 @@ const OPACITY_PIXEL_LIMIT := 262144
 ## What this reader puts into the resource. An imported resource from an older
 ## number is missing whatever was added since, so the panel can say "re-import"
 ## instead of quietly showing nothing.
-const READER_VERSION := 3
+##
+## 4: frames are no longer clipped to the canvas. A cel drawn past the edge used
+## to lose that part of the picture, so a sprite taller than the canvas came out
+## shorter and moved up. Frames now cover the whole drawing, and every layer
+## records where its image sits (see [member PxoFrame.layer_offsets]).
+const READER_VERSION := 4
 
 
 ## Reads [param path] into a [PxoProject]. Returns null when the file is not a
@@ -110,11 +115,18 @@ static func _build(zip: ZIPReader, path: String, options: Dictionary) -> PxoProj
 	if not shader_names.is_empty():
 		push_warning(_shader_warning(shader_names, keep_shader))
 
+	# The whole drawing, canvas included. A cel can be taller or wider than the
+	# canvas — Pixelorama only clips it on screen — and cutting it at the canvas
+	# edge would hand back a frame that is shorter than the one that was drawn.
+	var frame_rect := _frame_rect(dict, project.canvas_size, keep_shader, wanted)
+	project.frame_rect = frame_rect
+
 	var frame_defs: Array = dict.get("frames", [])
 	var frame_index := 1
 	for frame_def: Dictionary in frame_defs:
 		var frame := PxoFrame.new()
 		frame.duration = float(frame_def.get("duration", 1.0))
+		frame.frame_origin = frame_rect.position
 		var cel_defs: Array = frame_def.get("cels", [])
 		var images: Array[Image] = []
 		# Where each cel sits on the canvas and how opaque it is on its own, in
@@ -131,6 +143,9 @@ static func _build(zip: ZIPReader, path: String, options: Dictionary) -> PxoProj
 			var image := _cel_image(zip, project.canvas_size, format, frame_index, cel_index, cel_def, layer_def, wanted)
 			images.append(image)
 			offsets.append(_cel_offset(cel_def))
+			# The frame image starts at frame_rect's corner, so a layer's own
+			# image has to be shifted by the same amount to line up with it.
+			frame.layer_offsets.append(_cel_offset(cel_def) - frame_rect.position)
 			cel_opacities.append(clampf(float(cel_def.get("opacity", 1.0)), 0.0, 1.0))
 			cel_index += 1
 
@@ -148,8 +163,8 @@ static func _build(zip: ZIPReader, path: String, options: Dictionary) -> PxoProj
 				tile_layer_def = layer_defs[cell_cel]
 			frame.tile_cells.append(_cel_cells(tile_cel_def, tile_layer_def))
 		frame.composite = _composite_texture(
-			zip, project.canvas_size, format, frame_index, images, layer_defs,
-			offsets, cel_opacities, not keep_shader
+			zip, project.canvas_size, frame_rect, format, frame_index, images,
+			layer_defs, offsets, cel_opacities, not keep_shader
 		)
 		project.frames.append(frame)
 		frame_index += 1
@@ -201,6 +216,64 @@ static func _tileset_meta(tileset_def: Dictionary) -> Dictionary:
 		"terrain_names": terrain_names,
 		"tile_bits": bits,
 	}
+
+
+## The rectangle every frame has to cover: the canvas, grown to hold whatever the
+## cels of any frame draw outside it.
+##
+## One rectangle for the whole project, not one per frame: a per-frame box would
+## make the frames different sizes and an AnimatedSprite2D would wobble as it
+## played. Only the layers that actually reach the composite are counted, so a
+## hidden or filtered layer cannot stretch the frames either.
+static func _frame_rect(
+	dict: Dictionary, canvas_size: Vector2i, keep_shader: bool, wanted: PackedStringArray
+) -> Rect2i:
+	var bounds := Rect2i(Vector2i.ZERO, canvas_size)
+	var layer_defs: Array = dict.get("layers", [])
+	var frame_defs: Array = dict.get("frames", [])
+	for frame_def: Dictionary in frame_defs:
+		var cel_defs: Array = frame_def.get("cels", [])
+		for cel_index in cel_defs.size():
+			var layer_def: Dictionary = {}
+			if cel_index < layer_defs.size():
+				layer_def = layer_defs[cel_index]
+			if not _cel_draws(layer_def, wanted, not keep_shader):
+				continue
+			bounds = bounds.merge(_cel_rect(cel_defs[cel_index], canvas_size))
+	return bounds
+
+
+## Whether this cel's pixels reach the composite: a pixel or tilemap layer, on a
+## visible layer, that the import options did not throw away, and not a shader
+## layer when those are being skipped.
+static func _cel_draws(
+	layer_def: Dictionary, wanted: PackedStringArray, skip_shader: bool
+) -> bool:
+	var layer_type := int(layer_def.get("type", LAYER_PIXEL))
+	if layer_type != LAYER_PIXEL and layer_type != LAYER_TILEMAP:
+		return false
+	if not bool(layer_def.get("visible", true)):
+		return false
+	if not wanted.is_empty() and not wanted.has(str(layer_def.get("name", ""))):
+		return false
+	if skip_shader and _is_shader_layer(layer_def):
+		return false
+	return true
+
+
+## How big one cel's picture is. Pixelorama writes the size on the cel, as
+## [code]"Vector2i(32, 32)"[/code]; a cel without one covers the whole canvas.
+static func _cel_image_size(cel_def: Dictionary, canvas_size: Vector2i) -> Vector2i:
+	if cel_def.has("image_size"):
+		var parsed: Variant = str_to_var(str(cel_def["image_size"]))
+		if parsed is Vector2i and parsed.x > 0 and parsed.y > 0:
+			return parsed
+	return canvas_size
+
+
+## Where one cel's picture sits on the canvas, as a rectangle.
+static func _cel_rect(cel_def: Dictionary, canvas_size: Vector2i) -> Rect2i:
+	return Rect2i(_cel_offset(cel_def), _cel_image_size(cel_def, canvas_size))
 
 
 ## Where the tiles of one layer sit: a cell position to [code]{index, flip_h,
@@ -289,12 +362,7 @@ static func _cel_image(
 		return null
 	if not wanted.is_empty() and not wanted.has(str(layer_def.get("name", ""))):
 		return null
-	var size := canvas_size
-	if cel_def.has("image_size"):
-		# Pixelorama writes this as a var_to_str() string, e.g. "Vector2i(32, 32)".
-		var parsed: Variant = str_to_var(str(cel_def["image_size"]))
-		if parsed is Vector2i and parsed.x > 0 and parsed.y > 0:
-			size = parsed
+	var size := _cel_image_size(cel_def, canvas_size)
 	var entry := "image_data/frames/%d/layer_%d" % [frame_index, cel_index]
 	if not zip.file_exists(entry):
 		return null
@@ -371,9 +439,15 @@ static func _blend_clipped(canvas: Image, image: Image, offset: Vector2i) -> voi
 ## the visible pixel layers are stacked here, at the position Pixelorama gives each
 ## cel, which covers normal layers but not the exotic blend modes — those need
 ## Pixelorama's own compositor.
+##
+## The picture is [param frame_rect] in size, not [param canvas_size]: the canvas
+## is only the part Pixelorama shows, and a cel drawn past its edge is still part
+## of the frame. Everything is shifted by [code]frame_rect.position[/code] so a
+## drawing that hangs off the top-left keeps its place instead of sliding in.
 static func _composite_texture(
 	zip: ZIPReader,
 	canvas_size: Vector2i,
+	frame_rect: Rect2i,
 	format: int,
 	frame_index: int,
 	images: Array[Image],
@@ -392,9 +466,11 @@ static func _composite_texture(
 			)
 			if image != null and not image.is_empty():
 				image.convert(Image.FORMAT_RGBA8)
-				return ImageTexture.create_from_image(image)
+				return ImageTexture.create_from_image(_place_canvas(image, frame_rect))
 
-	var composite := Image.create(canvas_size.x, canvas_size.y, false, Image.FORMAT_RGBA8)
+	var composite := Image.create(
+		frame_rect.size.x, frame_rect.size.y, false, Image.FORMAT_RGBA8
+	)
 	composite.fill(Color(0, 0, 0, 0))
 	for layer_index in images.size():
 		var image := images[layer_index]
@@ -413,8 +489,28 @@ static func _composite_texture(
 		var opacity := float(layer_def.get("opacity", 1.0))
 		if layer_index < cel_opacities.size():
 			opacity *= cel_opacities[layer_index]
-		_blend_clipped(composite, _fade(image, clampf(opacity, 0.0, 1.0)), offset)
+		_blend_clipped(
+			composite, _fade(image, clampf(opacity, 0.0, 1.0)), offset - frame_rect.position
+		)
 	return ImageTexture.create_from_image(composite)
+
+
+## A canvas-sized picture dropped into the frame rectangle at the place the canvas
+## occupies in it. Part of it can hang outside when the frame is smaller than the
+## canvas, and that part is cut, exactly like the canvas edge cuts a cel.
+static func _place_canvas(canvas_image: Image, frame_rect: Rect2i) -> Image:
+	var out := Image.create(frame_rect.size.x, frame_rect.size.y, false, Image.FORMAT_RGBA8)
+	out.fill(Color(0, 0, 0, 0))
+	var origin := -frame_rect.position
+	var target := Rect2i(origin, canvas_image.get_size()).intersection(
+		Rect2i(Vector2i.ZERO, frame_rect.size)
+	)
+	if target.size.x <= 0 or target.size.y <= 0:
+		return out
+	out.blit_rect(
+		canvas_image, Rect2i(target.position - origin, target.size), target.position
+	)
+	return out
 
 
 ## Applies a layer's opacity to a copy, or hands the image back untouched when

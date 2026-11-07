@@ -103,7 +103,10 @@ static func export_tile_map(project: PxoProject, frame_index: int, path: String)
 static func build_sheet(project: PxoProject, columns := 0) -> Image:
 	if project == null or project.frames.is_empty():
 		return null
-	var cell := project.canvas_size
+	# The cell is the frame, not the canvas: a frame covers whatever the cels draw,
+	# which can be taller or wider than the canvas. Using the canvas here would cut
+	# the very part that was just kept.
+	var cell := project.frame_size()
 	if cell.x <= 0 or cell.y <= 0:
 		return null
 	var count := project.frames.size()
@@ -121,8 +124,8 @@ static func build_sheet(project: PxoProject, columns := 0) -> Image:
 			continue
 		frame_image.convert(Image.FORMAT_RGBA8)
 		var target := Vector2i((index % columns) * cell.x, (index / columns) * cell.y)
-		# A frame smaller than the canvas sits in its top-left corner, the same
-		# way the importer composites it.
+		# A frame from an older import can still be canvas-sized; it sits in the
+		# cell's top-left corner rather than overrunning it.
 		var used := Vector2i(
 			mini(frame_image.get_width(), cell.x), mini(frame_image.get_height(), cell.y)
 		)

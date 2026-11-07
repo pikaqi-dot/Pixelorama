@@ -14,7 +14,10 @@ const ReaderScript := preload("res://addons/pxo_importer/pxo_reader.gd")
 ## differ; without it a resource built by an older reader keeps being loaded, and
 ## the new fields look like they were never there (greyed-out buttons, empty
 ## tile lists).
-const FORMAT_VERSION := 3
+##
+## 4: frames cover the whole drawing instead of being clipped to the canvas, so a
+## sprite taller than its canvas is no longer cut and shifted.
+const FORMAT_VERSION := 4
 
 
 func _get_format_version() -> int:

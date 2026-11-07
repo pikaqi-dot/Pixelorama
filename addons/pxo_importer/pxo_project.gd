@@ -21,8 +21,19 @@ extends Resource
 ## add_child(project.build_tile_map(0))
 ## [/codeblock]
 
-## Canvas size of the project, in pixels.
+## Canvas size of the project, in pixels. The canvas is what Pixelorama shows:
+## anything a cel draws past its edge is clipped there, but it is still part of
+## the picture.
 @export var canvas_size: Vector2i = Vector2i.ZERO
+## The rectangle every frame image covers, in canvas coordinates. It is the
+## canvas grown to hold whatever the cels draw outside it, so a frame whose
+## drawing is taller than the canvas keeps its full height instead of being cut
+## at the canvas edge. Computed once for the whole project, so every frame is
+## the same size and an AnimatedSprite2D does not jump between them.
+##
+## Empty on resources imported before this field existed; [method frame_size]
+## falls back to [member canvas_size] for those.
+@export var frame_rect: Rect2i = Rect2i()
 ## Frames per second the project was authored at.
 @export var fps: float = 12.0
 ## The Image format the pixels are stored in, kept so the tile images can be read
@@ -58,6 +69,14 @@ extends Resource
 
 func frame_count() -> int:
 	return frames.size()
+
+
+## The size of every frame image: [member frame_rect] when the reader recorded
+## it, and the canvas otherwise (a resource imported by an older reader).
+func frame_size() -> Vector2i:
+	if frame_rect.size.x > 0 and frame_rect.size.y > 0:
+		return frame_rect.size
+	return canvas_size
 
 
 func get_frame(index: int) -> PxoFrame:

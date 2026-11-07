@@ -30,7 +30,7 @@
 
 在文件系统面板里选中或双击 `.pxo`，Inspector 顶部会出现预览：
 
-- 一行信息：画布尺寸、帧数、fps、层名；有图块集时还会列出图块数量、单块尺寸和图块层
+- 一行信息：画布尺寸、帧数、fps、层名；帧比画布大时还会写出帧尺寸与原点（如 `· 帧 16×19（原点 0,-3）`），有图块集时再列出图块数量、单块尺寸和图块层
 - 「帧」条：每帧的合成图，点一下切换
 - 「图层（当前帧）」条：当前帧每一层的图，带层名
 - 「播放」按钮：按工程的 fps 轮播各帧
@@ -52,7 +52,7 @@
 | 地图 | `<名字>_tilemap.tscn` | 打开就是一个 `Node2D`，每层图块一个 `TileMapLayer`，格子已经摆好 |
 
 - 帧资源内嵌图像，不依赖 `.pxo`，可以随便改；重新点按钮会覆盖它（它就是从 `.pxo` 派生的）。
-- 精灵表按画布尺寸横向排一行，第 N 格就是第 N 帧。想换行数就在代码里调
+- 精灵表按**帧尺寸**（不是画布尺寸）横向排一行，第 N 格就是第 N 帧。想换行数就在代码里调
   `PxoExport.export_sheet(project, path, columns)`。
 - 地图导出的是**当前选中的那一帧**，`TileSet` 内嵌在 `.tscn` 里，所以那个场景是单文件、拖进哪个项目都能用。
   想多帧都成地图，就逐帧点一次（或按下面的 API 自己生成）。
@@ -155,21 +155,36 @@ Shader Composer 的图层在 `.pxo` 里存的是**一张静态烘焙的图**，�
   再重新导入。这时导入器直接用 `.pxo` 自带的 `image_data/final_images/<帧号>`，那是 Pixelorama
   自己算出来的最终画面，混合模式也一并正确。
 
-另外，合成时会按每个 cel 的 `offset` 摆放（图层被移动 / 缩放过也能对上位置），超出画布的部分裁掉。
+另外，合成时会按每个 cel 的 `offset` 摆放（图层被移动 / 缩放过也能对上位置）。
+
+**画布不等于帧**：画布只决定 Pixelorama 里「看得到哪一块」，cel 画到画布外面并不会消失。所以导入器取
+**所有帧、所有参与合成的 cel 的并集，再并上画布**作为帧的矩形（`PxoProject.frame_rect`），这个矩形
+**整个工程共用**——每帧尺寸一致，`AnimatedSprite2D` 播起来不会上下跳。结果是：
+
+- 内容没超出画布时，帧就是画布，和以前一样；
+- 有 cel 超出画布时（比如 16×16 画布上画了 12×17 的角色），帧会扩到 16×19，**完整保留**那 17 行，
+  不会像以前那样把超出的部分裁掉、看起来「矮了一截、整体偏下」。
+
+`PxoFrame.frame_origin` 是这个矩形左上角在画布坐标里的位置，`PxoFrame.layer_offsets` 是每层图像
+相对帧左上角的位置——单独取某一层的图来用时，按它摆放才不会偏。用 `project.frame_size()` 拿到帧尺寸
+（老资源没有这个字段时自动回退到画布尺寸）。
 
 ## 资源长什么样
 
 ```
 PxoProject (Resource)
-├── canvas_size : Vector2i
+├── canvas_size : Vector2i               # Pixelorama 的画布（只是可见范围）
+├── frame_rect : Rect2i                  # 整帧覆盖的范围：画布 ∪ 所有帧画到画布外的内容
 ├── fps : float
 ├── color_mode : int                     # 像素的 Image.Format，读图块时沿用
 ├── layer_names : PackedStringArray      # 从下到上
 ├── shader_layer_names : PackedStringArray  # 着色器图层，默认不参与帧合成
 ├── frames : Array[PxoFrame]
 │   └── PxoFrame
-│       ├── composite : Texture2D        # 该帧合成图
+│       ├── composite : Texture2D        # 该帧合成图，尺寸 = frame_size()
+│       ├── frame_origin : Vector2i      # composite 左上角在画布坐标里的位置
 │       ├── layer_images : Array[Texture2D]
+│       ├── layer_offsets : Array[Vector2i]  # 每层图像相对 composite 左上角的位置
 │       ├── tile_cells : Array[Dictionary]  # 每层的图块摆放：Vector2i → {index, flip_h, flip_v, transpose}
 │       └── duration : float
 ├── tags : Array[Dictionary]             # {name, from, to, color}
@@ -194,10 +209,10 @@ PxoProject (Resource)
 
 导入器的取舍：
 
-- 合成帧优先用 `final_images`（那是 Pixelorama 自己画的，混合模式完全正确）；
-  没有时按可见层的 alpha 叠加，并应用层的 `opacity`。
-  非 NORMAL 的混合模式在这种回退路径下不参与计算——需要精确效果时，在 Pixelorama
-  里勾上「包含合成图」再保存。
+- 合成帧优先用 `final_images`（那是 Pixelorama 自己画的，混合模式完全正确）；它是画布大小，
+  放进帧矩形里时按 `frame_rect` 的位置对齐。没有 `final_images` 时按可见层的 alpha 叠加，
+  并应用层的 `opacity`。非 NORMAL 的混合模式在这种回退路径下不参与计算——需要精确效果时，
+  在 Pixelorama 里勾上「包含合成图」再保存。
 - 组图层、3D 图层、音频图层不带像素，对应的 `layer_images` 位置是 `null`；TileMap 图层有像素
   （`.pxo` 存了它渲染后的样子），所以合成帧里图块也在，`tile_cells` 里则是它的每格索引。
 - 图块集的名字、单块尺寸、地形颜色与自动图块位都记在 `project.tilesets` 里，单块图片**不**放进
