@@ -35,6 +35,9 @@ var _browse_dialog: EditorFileDialog
 ## as the dock has.
 var _split: VSplitContainer
 var _split_placed := false
+## The bar between the file list and the log.
+var _bottom: HSplitContainer
+var _bottom_placed := false
 var _rescan_left := 0.0
 
 
@@ -65,6 +68,10 @@ func _process(delta: float) -> void:
 	if not _split_placed and _split != null and _split.size.y > 60.0:
 		_split_placed = true
 		_split.split_offset = maxi(80, int(_split.size.y * 0.6))
+	# Same for the bar between the files and the log: half each until dragged.
+	if not _bottom_placed and _bottom != null and _bottom.size.x > 60.0:
+		_bottom_placed = true
+		_bottom.split_offset = maxi(60, int(_bottom.size.x * 0.5))
 	if _rescan_left <= 0.0:
 		return
 	_rescan_left -= delta
@@ -174,18 +181,32 @@ func _build() -> void:
 	_peers.custom_minimum_size = Vector2(0, 50)
 	controls.add_child(_peers)
 
+	# The other side's files and the log sit side by side, the way the in-app page
+	# has them: both are read while a sync runs, and stacking them in a narrow dock
+	# only ever gave one of them a usable height. The bar between them drags.
+	_bottom = HSplitContainer.new()
+	_bottom.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	_bottom.custom_minimum_size = Vector2(0, 150)
+	_split.add_child(_bottom)
+
 	# What the other side is offering, before anything is taken.
-	controls.add_child(_heading("对方的文件（双击一行只同步这一个）"))
+	var files_box := VBoxContainer.new()
+	files_box.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	files_box.add_theme_constant_override("separation", 2)
+	_bottom.add_child(files_box)
+	var files_title := _heading("对方的文件")
+	files_title.tooltip_text = "双击一行只同步这一个"
+	files_box.add_child(files_title)
 	_remote_files = ItemList.new()
-	_remote_files.custom_minimum_size = Vector2(0, 70)
+	_remote_files.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	_remote_files.custom_minimum_size = Vector2(0, 90)
 	_remote_files.item_activated.connect(_on_remote_file_activated)
-	controls.add_child(_remote_files)
+	files_box.add_child(_remote_files)
 
 	var log_box := VBoxContainer.new()
-	log_box.size_flags_vertical = Control.SIZE_EXPAND_FILL
-	log_box.custom_minimum_size = Vector2(0, 150)
+	log_box.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	log_box.add_theme_constant_override("separation", 2)
-	_split.add_child(log_box)
+	_bottom.add_child(log_box)
 
 	var log_head := HBoxContainer.new()
 	log_head.add_theme_constant_override("separation", 4)
@@ -202,7 +223,7 @@ func _build() -> void:
 
 	_log = RichTextLabel.new()
 	_log.size_flags_vertical = Control.SIZE_EXPAND_FILL
-	_log.custom_minimum_size = Vector2(0, 120)
+	_log.custom_minimum_size = Vector2(0, 90)
 	_log.scroll_following = true
 	log_box.add_child(_log)
 
