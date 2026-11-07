@@ -2243,31 +2243,40 @@ func _eval(node_id: String, uv: Vector2, size: Vector2i, depth: int) -> float:
 	elif node_type == "glow":
 		# Bright samples bleed outwards, and the result keeps the brighter of the
 		# two, so the shape itself stays crisp.
-		var glow_source := clampf(_eval(_input_id(node, 0), uv, size, depth + 1), 0.0, 1.0)
+		# The branch is fetched as a field once per pixel: the source value and
+		# every halo sample are read out of it instead of walking the graph again
+		# for each of them.
+		var glow_field := _field_of(node, 0, size, depth)
+		var glow_source := _field_uv(glow_field, uv, size)
 		var glow_halo := _halo(
 			node,
 			uv,
 			size,
 			depth,
 			clampf(float(params.get("size", 3.0)), 0.5, 16.0),
-			clampf(float(params.get("tolerance", 0.35)), 0.0, 1.0)
+			clampf(float(params.get("tolerance", 0.35)), 0.0, 1.0),
+			glow_field
 		)
 		glow_halo *= maxf(float(params.get("strength", 1.5)), 0.0)
-		glow_halo *= _mask_value(node, uv, size, depth)
+		# Read the mask out of its cached field: one evaluation per pixel instead of
+		# one per pixel per sample.
+		glow_halo *= _mask_at(node, uv, size, depth)
 		return clampf(maxf(glow_source, glow_halo), 0.0, 1.0)
 	elif node_type == "bloom":
 		# Same halo, but added to the source, so highlights blow out.
-		var bloom_source := clampf(_eval(_input_id(node, 0), uv, size, depth + 1), 0.0, 1.0)
+		var bloom_field := _field_of(node, 0, size, depth)
+		var bloom_source := _field_uv(bloom_field, uv, size)
 		var bloom_halo := _halo(
 			node,
 			uv,
 			size,
 			depth,
 			clampf(float(params.get("size", 3.0)), 0.5, 16.0),
-			clampf(float(params.get("tolerance", 0.5)), 0.0, 1.0)
+			clampf(float(params.get("tolerance", 0.5)), 0.0, 1.0),
+			bloom_field
 		)
 		bloom_halo *= maxf(float(params.get("strength", 1.0)), 0.0)
-		bloom_halo *= _mask_value(node, uv, size, depth)
+		bloom_halo *= _mask_at(node, uv, size, depth)
 		return clampf(bloom_source + bloom_halo, 0.0, 1.0)
 	elif node_type == "color_adjust":
 		# Value space grading: exposure, contrast, brightness, gamma, then mix.
@@ -4144,9 +4153,12 @@ func _field_of(
 	var source_id := _input_id(node, slot)
 	if source_id.is_empty() or size.x <= 0 or size.y <= 0:
 		return PackedFloat32Array()
-	var key := "%s|%d|%d" % [source_id, size.x, size.y]
-	var cached: Variant = _field_cache.get(key, null)
-	if cached != null:
+	# Two levels instead of one formatted string: the halo asks for its field on
+	# every pixel, and building a "%s|%d|%d" key per call cost more than reading
+	# the field it was looking for.
+	var by_size: Dictionary = _field_cache.get(source_id, {})
+	if by_size.has(size):
+		var cached: Variant = by_size[size]
 		var field_value: PackedFloat32Array = cached
 		return field_value
 	var field := PackedFloat32Array()
@@ -4158,7 +4170,8 @@ func _field_of(
 				_eval(source_id, Vector2(float(x), float(y)), size, depth + 1), 0.0, 1.0
 			)
 			index += 1
-	_field_cache[key] = field
+	by_size[size] = field
+	_field_cache[source_id] = by_size
 	return field
 
 
@@ -4170,9 +4183,17 @@ func _mask_at(node: Dictionary, uv: Vector2, size: Vector2i, depth: int) -> floa
 	var mask := _field_of(node, 1, size, depth)
 	if mask.is_empty():
 		return 1.0
+	return _field_uv(mask, uv, size)
+
+
+## Value at [param uv] of a field already built by [method _field_of]. An empty
+## field (no input, or no canvas) reads as zero.
+func _field_uv(field: PackedFloat32Array, uv: Vector2, size: Vector2i) -> float:
+	if field.is_empty():
+		return 0.0
 	var px := clampi(int(uv.x), 0, size.x - 1)
 	var py := clampi(int(uv.y), 0, size.y - 1)
-	return mask[py * size.x + px]
+	return field[py * size.x + px]
 
 
 ## Value of the optional mask on the second input, 1 when nothing is connected.
@@ -4198,9 +4219,22 @@ func _halo(
 	size: Vector2i,
 	depth: int,
 	radius_px: float,
-	tolerance: float
+	tolerance: float,
+	field := PackedFloat32Array()
 ) -> float:
+	var source_id := _input_id(node, 0)
+	if source_id.is_empty():
+		return 0.0
 	var rings := maxi(int(ceil(radius_px)), 1)
+	# The branch is evaluated once per pixel into a field, and the halo is read out
+	# of it. Sampling the evaluator at every offset ran the whole upstream branch
+	# again for each sample — 96 times per output pixel at the widest radius — which
+	# is what made this node crawl. The values are the same ones the evaluator
+	# returns at those pixels, so the picture does not change. The caller hands the
+	# field over because it needs the same one for the source pixel itself.
+	if field.is_empty():
+		field = _field_of(node, 0, size, depth)
+	var has_field := not field.is_empty()
 	var brightest := 0.0
 	for ring in range(1, rings + 1):
 		var falloff := 1.0 - float(ring) / float(rings + 1)
@@ -4209,9 +4243,27 @@ func _halo(
 			# directions do not line up into visible spokes as the radius grows.
 			var angle := TAU * (float(index) + float(ring) * 0.5) / 8.0
 			var offset := Vector2.from_angle(angle) * float(ring)
-			var value := clampf(
-				_eval(_input_id(node, 0), uv + offset, size, depth + 1), 0.0, 1.0
-			)
+			var sample_x := int(uv.x + offset.x)
+			var sample_y := int(uv.y + offset.y)
+			var value: float
+			if (
+				has_field
+				and sample_x >= 0
+				and sample_y >= 0
+				and sample_x < size.x
+				and sample_y < size.y
+			):
+				value = field[sample_y * size.x + sample_x]
+			else:
+				# Outside the canvas the branch has to answer for itself, exactly as
+				# it did when every sample was an evaluation of its own.
+				value = clampf(
+					_eval(
+						source_id, Vector2(float(sample_x), float(sample_y)), size, depth + 1
+					),
+					0.0,
+					1.0
+				)
 			if value <= tolerance:
 				continue
 			brightest = maxf(brightest, value * falloff)
