@@ -105,6 +105,22 @@ const RECONNECT_RETRY := 3.0
 ## only answers a sweep, and dialling a dead address forever would never find it.
 const RECONNECT_SCAN_AFTER := 3
 
+## How one file of the shared folders compares between the two sides. The panels
+## turn these into a tick and exclamation marks; the numbers are what they switch
+## on, so the two of them cannot disagree.
+enum FileState {
+	## Both sides have it, same modification time: a sync would do nothing.
+	SAME,
+	## Both sides have it, the other side's copy is newer.
+	REMOTE_NEWER,
+	## Both sides have it, this side's copy is newer — a pull would overwrite it.
+	REMOTE_OLDER,
+	## Only the other side has it; a sync would create it here.
+	REMOTE_ONLY,
+	## Only this side has it; the other side never sees it.
+	LOCAL_ONLY,
+}
+
 ## Folder name to absolute path. The name is what the two peers match on.
 var folders: Dictionary = {}
 ## What this peer calls itself in the other side's list.
@@ -123,6 +139,12 @@ var peer_files: Array[String] = []
 var peer_entries: Array[Dictionary] = []
 ## Keys a pull is narrowed to. Empty means "everything on the other side".
 var _pull_keys: Array[String] = []
+## This side's files, key -> {mtime, size}. Timestamps only: the panel needs to
+## know what is newer, not what the bytes are, and hashing is the expensive part.
+var local_entries: Dictionary = {}
+## Seconds until the marks are checked again, and how long that check took.
+var _marks_left := 0.0
+var _marks_cost := 0
 
 var _udp := PacketPeerUDP.new()
 var _server := TCPServer.new()
@@ -285,6 +307,7 @@ func _process(delta: float) -> void:
 	_poll_reconnect()
 	_poll_watchdog()
 	_poll_timeouts()
+	_poll_marks(delta)
 
 
 # Public API.
@@ -645,6 +668,90 @@ func count_files(path: String) -> int:
 	return total
 
 
+## Every file of every shared folder with just its timestamp and size. No hashing:
+## the panel only needs to know what is newer, and this runs whenever the list is
+## redrawn.
+func refresh_local_entries() -> void:
+	var started := Time.get_ticks_msec()
+	local_entries.clear()
+	for folder_name: String in folders:
+		var root := str(folders[folder_name])
+		if root.is_empty() or not DirAccess.dir_exists_absolute(real_path(root)):
+			continue
+		var pending: Array[String] = [root]
+		var seen := 0
+		while not pending.is_empty() and seen < MAX_FILES:
+			var current: String = pending.pop_back()
+			var directory := DirAccess.open(current)
+			if directory == null:
+				continue
+			directory.list_dir_begin()
+			var entry := directory.get_next()
+			while not entry.is_empty() and seen < MAX_FILES:
+				var skip := entry.begins_with(".") or IGNORED_NAMES.has(entry)
+				var full := current.path_join(entry)
+				if not skip:
+					if directory.current_is_dir():
+						pending.append(full)
+					else:
+						seen += 1
+						var relative := full.substr(root.length()).replace("\\", "/").lstrip("/")
+						local_entries["%s/%s" % [folder_name, relative]] = {
+							"mtime": FileAccess.get_modified_time(full),
+							"size": _size_of(full),
+						}
+				entry = directory.get_next()
+			directory.list_dir_end()
+	_marks_cost = Time.get_ticks_msec() - started
+
+
+## One row per file of either side, sorted, each with a [enum FileState] saying how
+## the two copies compare. This is what the file lists draw.
+func compare_entries() -> Array[Dictionary]:
+	refresh_local_entries()
+	var remote_keys := {}
+	var rows: Array[Dictionary] = []
+	for entry: Dictionary in peer_entries:
+		var key := str(entry.get("key", ""))
+		if key.is_empty():
+			continue
+		remote_keys[key] = true
+		rows.append(_row_for(key, int(entry.get("mtime", 0))))
+	for key: String in local_entries:
+		if remote_keys.has(key):
+			continue
+		rows.append(_row_for(key, -1))
+	rows.sort_custom(
+		func(a: Dictionary, b: Dictionary) -> bool: return str(a["key"]) < str(b["key"])
+	)
+	return rows
+
+
+## One row of [method compare_entries]. A negative [param remote_mtime] means the
+## other side does not have the file at all.
+func _row_for(key: String, remote_mtime: int) -> Dictionary:
+	var row := {
+		"key": key,
+		"remote_mtime": remote_mtime,
+		"local_mtime": -1,
+		"state": FileState.REMOTE_ONLY,
+	}
+	if not local_entries.has(key):
+		return row
+	var local: Dictionary = local_entries[key]
+	var local_mtime := int(local.get("mtime", 0))
+	row["local_mtime"] = local_mtime
+	if remote_mtime < 0:
+		row["state"] = FileState.LOCAL_ONLY
+	elif local_mtime == remote_mtime:
+		row["state"] = FileState.SAME
+	elif remote_mtime > local_mtime:
+		row["state"] = FileState.REMOTE_NEWER
+	else:
+		row["state"] = FileState.REMOTE_OLDER
+	return row
+
+
 func set_folder(folder_name: String, path: String) -> void:
 	folders[folder_name] = path
 	# Hashes are keyed by absolute path, and the folders just changed.
@@ -768,6 +875,51 @@ func _remember_peer(id: String, peer_label: String, address: String, port: int) 
 	if added:
 		peers_changed.emit()
 		log_line.emit("发现 %s（%s）" % [peer_label, address])
+
+
+## Keeps the marks honest: a file edited while the list is open has to turn its
+## tick into an exclamation without anybody pressing anything. Only the keys
+## already listed are re-checked — one stat per file, not a walk of the folders —
+## and the pause between checks grows with the folder and with how long the last
+## full read took.
+func _poll_marks(delta: float) -> void:
+	if _peer == null:
+		return
+	_marks_left -= delta
+	if _marks_left > 0.0:
+		return
+	_marks_left = clampf(
+		2.0 + float(local_entries.size()) / 400.0 + float(_marks_cost) / 200.0, 2.0, 30.0
+	)
+	if _refresh_known_mtimes():
+		peer_files_changed.emit()
+
+
+## Re-reads the timestamp and size of every known local file. True when one of them
+## moved, which is the panels' cue to redraw.
+func _refresh_known_mtimes() -> bool:
+	var changed := false
+	var gone: Array[String] = []
+	for key: String in local_entries:
+		var path := _absolute(key)
+		if path.is_empty():
+			continue
+		var mtime := FileAccess.get_modified_time(path)
+		if mtime <= 0:
+			# Deleted, or its folder went away: it is no longer part of this side,
+			# and the row has to say so.
+			gone.append(key)
+			continue
+		var size := _size_of(path)
+		var entry: Dictionary = local_entries[key]
+		if int(entry.get("mtime", 0)) != mtime or int(entry.get("size", -1)) != size:
+			entry["mtime"] = mtime
+			entry["size"] = size
+			changed = true
+	for key: String in gone:
+		local_entries.erase(key)
+		changed = true
+	return changed
 
 
 func _poll_timeouts() -> void:

@@ -6,6 +6,7 @@ extends VBoxContainer
 
 const CoreScript := preload("res://addons/lan_sync/core/LanSyncCore.gd")
 const LogStyle := preload("res://addons/lan_sync/ui/log_style.gd")
+const FileMarks := preload("res://addons/lan_sync/ui/file_marks.gd")
 ## Folder shared out of the box. Both sides default to the same name, so a fresh
 ## install on either end lines up without any setup at all.
 const DEFAULT_NAME := "shared"
@@ -23,6 +24,9 @@ var _core: Node
 var _folders: ItemList
 var _peers: ItemList
 var _remote_files: ItemList
+## What the file list is currently showing, so a double-click knows which row it
+## was: the other side's copies, this side's own, and which is newer.
+var _rows: Array[Dictionary] = []
 var _log: RichTextLabel
 var _status: Label
 var _endpoint_edit: LineEdit
@@ -194,8 +198,8 @@ func _build() -> void:
 	files_box.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	files_box.add_theme_constant_override("separation", 2)
 	_bottom.add_child(files_box)
-	var files_title := _heading("对方的文件")
-	files_title.tooltip_text = "双击一行只同步这一个"
+	var files_title := _heading("两边的文件")
+	files_title.tooltip_text = FileMarks.LEGEND + "\n双击一行只同步这一个"
 	files_box.add_child(files_title)
 	_remote_files = ItemList.new()
 	_remote_files.size_flags_vertical = Control.SIZE_EXPAND_FILL
@@ -293,16 +297,20 @@ func _refresh_remote_files() -> void:
 	if not is_instance_valid(_remote_files):
 		return
 	_remote_files.clear()
-	if _core.peer_entries.is_empty():
+	# Both sides, each row marked: same time, one side newer, or missing over
+	# there. The core does the comparing so the phone shows the same marks.
+	_rows = _core.call("compare_entries")
+	if _rows.is_empty():
 		# Which of the three it is decides what to do about it, so the box says it
 		# instead of one sentence covering all of them.
 		_remote_files.add_item(_empty_remote_text())
 		_remote_files.set_item_disabled(0, true)
 		return
-	for entry: Dictionary in _core.peer_entries:
-		_remote_files.add_item(
-			"%s · %s" % [str(entry.get("key", "")), _mtime_text(int(entry.get("mtime", 0)))]
-		)
+	for index in _rows.size():
+		var row: Dictionary = _rows[index]
+		_remote_files.add_item(FileMarks.text(row))
+		_remote_files.set_item_custom_fg_color(index, FileMarks.color(int(row["state"])))
+		_remote_files.set_item_tooltip(index, FileMarks.tooltip(row))
 
 
 ## Why the other side's list is empty: no link, a link still waiting for the list
@@ -315,27 +323,19 @@ func _empty_remote_text() -> String:
 	return "（对方的共享目录里没有文件）"
 
 
-## A modification time as it reads in a file manager.
-func _mtime_text(mtime: int) -> String:
-	if mtime <= 0:
-		return "时间未知"
-	var when := Time.get_datetime_dict_from_unix_time(mtime)
-	return "%02d-%02d %02d:%02d:%02d" % [
-		int(when["month"]),
-		int(when["day"]),
-		int(when["hour"]),
-		int(when["minute"]),
-		int(when["second"]),
-	]
-
-
 ## Double-clicking one row takes that file and nothing else, so a single stale
-## project can be replaced without touching the rest of the folder.
+## project can be replaced without touching the rest of the folder. A row the
+## other side does not have cannot be pulled — the click says so instead of asking
+## for a file that is not there.
 func _on_remote_file_activated(index: int) -> void:
-	if index < 0 or index >= _core.peer_entries.size():
+	if index < 0 or index >= _rows.size():
 		return
-	var key := str(_core.peer_entries[index].get("key", ""))
+	var row: Dictionary = _rows[index]
+	var key := str(row.get("key", ""))
 	if key.is_empty():
+		return
+	if int(row.get("state", 0)) == LanSyncCore.FileState.LOCAL_ONLY:
+		_on_log("对方没有 %s，没法从这里拉；要给它，就在它那边点「同步」" % key)
 		return
 	_core.call("request_file", key)
 	_refresh_status()
@@ -477,4 +477,8 @@ func _on_clear_log() -> void:
 func _on_file_synced(path: String, direction: String) -> void:
 	_rescan_left = RESCAN_DELAY
 	_refresh_folders()
+	# The marks are one file out of date from here on unless the list is rebuilt:
+	# what just arrived is no longer "missing here", and what just left is no
+	# longer "missing there".
+	_refresh_remote_files()
 	_on_log("%s %s" % ["收到" if direction == "in" else "发出", path.get_file()])
