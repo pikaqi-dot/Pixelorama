@@ -1422,9 +1422,13 @@ func _paint_into(
 	for y in range(from_row, to_row):
 		var row_start: int = y * row_bytes
 		for x in size.x:
+			var pixel := Color(0.0, 0.0, 0.0, 0.0)
 			var value: float
 			if has_field:
-				value = float(field_data[row_start + x * 4]) / 255.0
+				pixel = _field_pixel(field_data, row_start + x * 4)
+				# A picture is not one channel: reading red made a red leaf dark
+				# and a grey one bright, so coverage is the brightest channel.
+				value = maxf(maxf(pixel.r, pixel.g), pixel.b)
 			else:
 				value = clampf(_eval(source, Vector2(x, y), size, 0), 0.0, 1.0)
 			if transparent and value <= alpha_cut:
@@ -1432,7 +1436,11 @@ func _paint_into(
 				continue
 			var color: Color
 			if tint == null:
-				if use_ramp:
+				if has_field:
+					# The node drew this picture itself, colours and transparency
+					# included. Drawing it in grey was throwing them away.
+					color = pixel
+				elif use_ramp:
 					# Graphs saved before the colour moved into the nodes keep
 					# their three stop ramp, so old artwork still looks the same.
 					var step := floori(value * steps)
@@ -1445,9 +1453,23 @@ func _paint_into(
 				# which is what keeps soft edges and glows readable.
 				var base: Color = tint
 				color = Color(base.r * value, base.g * value, base.b * value, 1.0)
-			if transparent and alpha_from_value:
+				if has_field:
+					color.a = pixel.a
+			if transparent and alpha_from_value and tint != null:
 				color.a = value
 			image.set_pixel(x, y - offset, color)
+
+
+## One RGBA pixel out of a raster field's byte block.
+static func _field_pixel(data: PackedByteArray, at: int) -> Color:
+	if at < 0 or at + 3 >= data.size():
+		return Color(0.0, 0.0, 0.0, 0.0)
+	return Color(
+		float(data[at]) / 255.0,
+		float(data[at + 1]) / 255.0,
+		float(data[at + 2]) / 255.0,
+		float(data[at + 3]) / 255.0
+	)
 
 
 ## Colour a branch carries, or null when it carries none. A node that owns a
@@ -2781,21 +2803,25 @@ func _preview_into(
 	for y in range(from_row, to_row):
 		var row_start: int = (y - offset) * row_bytes
 		for x in size.x:
-			var value := (
-				float(field_data[y * row_bytes + x * 4]) / 255.0
-				if has_field
-				else clampf(_eval(node_id, Vector2(x, y), size, 0), 0.0, 1.0)
-			)
+			var pixel := Color(0.0, 0.0, 0.0, 0.0)
+			var value: float
+			if has_field:
+				pixel = _field_pixel(field_data, y * row_bytes + x * 4)
+				value = maxf(maxf(pixel.r, pixel.g), pixel.b)
+			else:
+				value = clampf(_eval(node_id, Vector2(x, y), size, 0), 0.0, 1.0)
 			if value <= alpha_cut:
 				continue
 			var color: Color
 			if tint == null:
-				color = Color(value, value, value, 1.0)
+				# A node that draws its own picture keeps its colours in the
+				# thumbnail; only a bare value field is grey.
+				color = pixel if has_field else Color(value, value, value, 1.0)
 			else:
 				var base: Color = tint
 				color = Color(base.r * value, base.g * value, base.b * value, 1.0)
 			if fade:
-				color.a = value
+				color.a = pixel.a if (has_field and tint == null) else value
 			# to_rgba32 packs red in the highest byte, so it is written out in the
 			# RGBA order the image expects.
 			var packed := color.to_rgba32()
@@ -2982,6 +3008,11 @@ func _raster_field(node_id: String, size: Vector2i) -> Image:
 			return _scatter_image(node, params, size, 0)
 		"model3d":
 			return _model_image(node, params, size)
+		"pixel_art":
+			# The picture of the layer itself, colours kept. Without this the node
+			# went through the value evaluator, which only knows brightness, and a
+			# drawing that never touched a colour node came out grey.
+			return _pixel_art_image(node, params, size)
 	return null
 
 
@@ -3818,6 +3849,27 @@ func _canvas_image(
 		2:
 			return painting_image(node, params)
 	return _source_image(node, params)
+
+
+## The canvas node as a picture at [param size]: its layer (or painting) cropped and
+## stretched the way the node samples it, colours kept. A canvas read through its
+## transparency is coverage rather than a picture, so those stay on the value path
+## and keep the mask meaning they were given.
+func _pixel_art_image(node: Dictionary, params: Dictionary, size: Vector2i) -> Image:
+	if int(params.get("source", 0)) == 1:
+		# A stroke drawn from a path paints its own colour in the evaluator.
+		return null
+	if int(params.get("channel", 0)) != 0:
+		return null
+	var source := _canvas_image(node, params, size, 0)
+	if source == null or source.is_empty():
+		return null
+	var crop := source_crop(params, Vector2i(source.get_width(), source.get_height()))
+	var picture := source.get_region(crop)
+	picture.convert(Image.FORMAT_RGBA8)
+	if picture.get_width() != size.x or picture.get_height() != size.y:
+		picture.resize(maxi(size.x, 1), maxi(size.y, 1), Image.INTERPOLATE_NEAREST)
+	return picture
 
 
 ## Node behind the brush input of a scatter node, or an empty dictionary. The
