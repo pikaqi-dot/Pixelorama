@@ -30,6 +30,11 @@ extends Resource
 @export var color_mode: int = 4
 ## Layer names, in Pixelorama's own order (bottom to top).
 @export var layer_names: PackedStringArray = PackedStringArray()
+## The layers that Pixelorama draws with a shader graph (the Shader Composer).
+## Their cels only hold a static bake of it, which is not what the editor shows, so
+## they are named here instead of being believed. Skipped from [member
+## PxoFrame.composite] unless the import option asks for them.
+@export var shader_layer_names: PackedStringArray = PackedStringArray()
 ## Every frame of the drawing tab, in order.
 @export var frames: Array[PxoFrame] = []
 ## Animation tags: a name, the frame range it covers, and its colour.
@@ -94,6 +99,11 @@ func get_tag(tag_name: String) -> Dictionary:
 ## buttons for a plain sprite.
 func has_tilesets() -> bool:
 	return not tilesets.is_empty()
+
+
+## Whether any layer is a shader layer, whose picture only Pixelorama can make.
+func has_shader_layers() -> bool:
+	return not shader_layer_names.is_empty()
 
 
 ## The names of the tilemap layers, for a menu or a log line.

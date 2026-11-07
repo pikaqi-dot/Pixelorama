@@ -26,7 +26,7 @@ const OPACITY_PIXEL_LIMIT := 262144
 ## What this reader puts into the resource. An imported resource from an older
 ## number is missing whatever was added since, so the panel can say "re-import"
 ## instead of quietly showing nothing.
-const READER_VERSION := 2
+const READER_VERSION := 3
 
 
 ## Reads [param path] into a [PxoProject]. Returns null when the file is not a
@@ -73,9 +73,13 @@ static func _build(zip: ZIPReader, path: String, options: Dictionary) -> PxoProj
 	project.color_mode = format
 	var layer_defs: Array = dict.get("layers", [])
 	var names := PackedStringArray()
+	var shader_names := PackedStringArray()
 	for layer_def: Dictionary in layer_defs:
 		names.append(str(layer_def.get("name", "")))
+		if _is_shader_layer(layer_def):
+			shader_names.append(str(layer_def.get("name", "")))
 	project.layer_names = names
+	project.shader_layer_names = shader_names
 
 	# The tilesets: name, tile size, terrain colours and the autotile bits. Only
 	# the metadata is kept here — the tile images stay in the `.pxo` and are read
@@ -99,6 +103,12 @@ static func _build(zip: ZIPReader, path: String, options: Dictionary) -> PxoProj
 		)
 
 	var wanted := _wanted_layers(options)
+	# A shader layer's cel is a static bake of a graph that Pixelorama evaluates
+	# live, so stacking it puts a frozen, often wrong picture over everything else.
+	# It is left out of the composite unless the import options ask for it.
+	var keep_shader := bool(options.get("import_shader_layers", false))
+	if not shader_names.is_empty():
+		push_warning(_shader_warning(shader_names, keep_shader))
 
 	var frame_defs: Array = dict.get("frames", [])
 	var frame_index := 1
@@ -107,6 +117,11 @@ static func _build(zip: ZIPReader, path: String, options: Dictionary) -> PxoProj
 		frame.duration = float(frame_def.get("duration", 1.0))
 		var cel_defs: Array = frame_def.get("cels", [])
 		var images: Array[Image] = []
+		# Where each cel sits on the canvas and how opaque it is on its own, in
+		# the same order as `images`: Pixelorama keeps both on the cel, not the
+		# layer, so a moved or half-faded cel would otherwise be pasted wrong.
+		var offsets: Array[Vector2i] = []
+		var cel_opacities: Array[float] = []
 		var cel_index := 1
 		for cel_def: Dictionary in cel_defs:
 			var layer_index := cel_index - 1
@@ -115,6 +130,8 @@ static func _build(zip: ZIPReader, path: String, options: Dictionary) -> PxoProj
 				layer_def = layer_defs[layer_index]
 			var image := _cel_image(zip, project.canvas_size, format, frame_index, cel_index, cel_def, layer_def, wanted)
 			images.append(image)
+			offsets.append(_cel_offset(cel_def))
+			cel_opacities.append(clampf(float(cel_def.get("opacity", 1.0)), 0.0, 1.0))
 			cel_index += 1
 
 		for image: Image in images:
@@ -130,7 +147,10 @@ static func _build(zip: ZIPReader, path: String, options: Dictionary) -> PxoProj
 			if cell_cel < layer_defs.size():
 				tile_layer_def = layer_defs[cell_cel]
 			frame.tile_cells.append(_cel_cells(tile_cel_def, tile_layer_def))
-		frame.composite = _composite_texture(zip, project.canvas_size, format, frame_index, images, layer_defs)
+		frame.composite = _composite_texture(
+			zip, project.canvas_size, format, frame_index, images, layer_defs,
+			offsets, cel_opacities, not keep_shader
+		)
 		project.frames.append(frame)
 		frame_index += 1
 
@@ -292,19 +312,75 @@ static func _cel_image(
 	return image
 
 
+## A layer drawn by a shader graph — the Shader Composer's layers. The graph lives
+## in the layer's own metadata and cannot be run from here; its cel only holds a
+## static bake of it.
+static func _is_shader_layer(layer_def: Dictionary) -> bool:
+	var meta: Variant = layer_def.get("metadata", {})
+	return meta is Dictionary and (meta as Dictionary).has("shader_graph")
+
+
+## What to tell the person importing, once, about the shader layers in this file.
+static func _shader_warning(names: PackedStringArray, keep: bool) -> String:
+	var list := ", ".join(names)
+	if keep:
+		return (
+			"PXO: 按选项把 %d 个着色器图层（%s）也合成了；它们的像素是静态烘焙，"
+			% [names.size(), list]
+			+ "Pixelorama 里是实时算的，画面可能对不上"
+		)
+	return (
+		"PXO: %d 个着色器图层（%s）没有参与合成：它们的像素只是静态烘焙，"
+		% [names.size(), list]
+		+ "Pixelorama 里是实时算出来的。想让帧和编辑器完全一致，"
+		+ "在 Pixelorama 保存时勾上「包含合成图」再重新保存。"
+	)
+
+
+## Where a cel's picture sits on the canvas. Pixelorama stores it on the cel as
+## "(12, -4)"; a layer that was resized or moved has a picture smaller than the
+## canvas, and blitting it at (0, 0) would slide the whole layer into the corner.
+static func _cel_offset(cel_def: Dictionary) -> Vector2i:
+	var parsed: Variant = str_to_var(str(cel_def.get("offset", "(0, 0)")))
+	if parsed is Vector2i:
+		return parsed
+	if parsed is Vector2:
+		return Vector2i(parsed)
+	var text := str(cel_def.get("offset", "")).strip_edges()
+	var parts := text.trim_prefix("(").trim_suffix(")").split(",")
+	if parts.size() == 2:
+		return Vector2i(int(parts[0].strip_edges()), int(parts[1].strip_edges()))
+	return Vector2i.ZERO
+
+
+## Blends one cel into the canvas, cutting off whatever hangs outside it: a cel can
+## be smaller than the canvas, moved partly off it, or both.
+static func _blend_clipped(canvas: Image, image: Image, offset: Vector2i) -> void:
+	var target := Rect2i(offset, image.get_size()).intersection(
+		Rect2i(Vector2i.ZERO, canvas.get_size())
+	)
+	if target.size.x <= 0 or target.size.y <= 0:
+		return
+	canvas.blend_rect(image, Rect2i(target.position - offset, target.size), target.position)
+
+
 ## The frame as it should look, flattened.
 ##
 ## A `.pxo` may already carry the flattened frame, in which case that is used
 ## verbatim: it is what Pixelorama itself drew, blend modes and all. Otherwise
-## the visible pixel layers are stacked here, which covers normal layers but not
-## the exotic blend modes — those need Pixelorama's own compositor.
+## the visible pixel layers are stacked here, at the position Pixelorama gives each
+## cel, which covers normal layers but not the exotic blend modes — those need
+## Pixelorama's own compositor.
 static func _composite_texture(
 	zip: ZIPReader,
 	canvas_size: Vector2i,
 	format: int,
 	frame_index: int,
 	images: Array[Image],
-	layer_defs: Array
+	layer_defs: Array,
+	offsets: Array[Vector2i],
+	cel_opacities: Array[float],
+	skip_shader: bool
 ) -> Texture2D:
 	var baked := "image_data/final_images/%d" % frame_index
 	if zip.file_exists(baked):
@@ -329,10 +405,15 @@ static func _composite_texture(
 			layer_def = layer_defs[layer_index]
 		if not bool(layer_def.get("visible", true)):
 			continue
+		if skip_shader and _is_shader_layer(layer_def):
+			continue
+		var offset := Vector2i.ZERO
+		if layer_index < offsets.size():
+			offset = offsets[layer_index]
 		var opacity := float(layer_def.get("opacity", 1.0))
-		composite.blend_rect(
-			_fade(image, opacity), Rect2i(Vector2i.ZERO, image.get_size()), Vector2i.ZERO
-		)
+		if layer_index < cel_opacities.size():
+			opacity *= cel_opacities[layer_index]
+		_blend_clipped(composite, _fade(image, clampf(opacity, 0.0, 1.0)), offset)
 	return ImageTexture.create_from_image(composite)
 
 

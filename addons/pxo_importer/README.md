@@ -137,8 +137,25 @@ add_child(project.build_tile_map(0))   # 参数是第几帧
 | --- | --- | --- |
 | `import_composite_only` | 关 | 只保留合成后的每帧图像，丢掉分层图，资源更小 |
 | `layer_filter` | 空 | 逗号分隔的层名，只导入这些层；留空表示全部 |
+| `import_shader_layers` | 关 | 让着色器图层参与帧合成。默认不参与，原因见下 |
 
 改了选项后点「重新导入」。
+
+## 着色器图层与「帧看起来不一样」
+
+Shader Composer 的图层在 `.pxo` 里存的是**一张静态烘焙的图**，而 Pixelorama 编辑时是**实时**算的
+（跟着时间、跟着画布状态变）。导入器没法跑那张图，所以：
+
+- 默认把着色器图层排除在「帧合成图」之外，只保留它们的原样层图（`layer_images` 里照旧有一张，
+  可以在「图层」里单独看）。
+- 导入时会 `push_warning` 说明是哪几个图层被跳过了；检查器的信息里也会写一行。
+- 勾上 `import_shader_layers` 可以把它们硬合成进去 —— 但那是**某一时刻的烘焙画面**，通常和编辑器对不上，
+  所以默认关闭。
+- 想要**逐像素完全一致**：在 Pixelorama 里保存时勾上「包含合成图」（导出面板的 `include_blended_images`），
+  再重新导入。这时导入器直接用 `.pxo` 自带的 `image_data/final_images/<帧号>`，那是 Pixelorama
+  自己算出来的最终画面，混合模式也一并正确。
+
+另外，合成时会按每个 cel 的 `offset` 摆放（图层被移动 / 缩放过也能对上位置），超出画布的部分裁掉。
 
 ## 资源长什么样
 
@@ -148,6 +165,7 @@ PxoProject (Resource)
 ├── fps : float
 ├── color_mode : int                     # 像素的 Image.Format，读图块时沿用
 ├── layer_names : PackedStringArray      # 从下到上
+├── shader_layer_names : PackedStringArray  # 着色器图层，默认不参与帧合成
 ├── frames : Array[PxoFrame]
 │   └── PxoFrame
 │       ├── composite : Texture2D        # 该帧合成图

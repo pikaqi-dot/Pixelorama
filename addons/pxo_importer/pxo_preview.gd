@@ -127,7 +127,7 @@ func _strip(title: String) -> HBoxContainer:
 func _refresh() -> void:
 	if project == null:
 		return
-	_info.text = "画布 %d×%d · %d 帧 · %s fps · %d 层\n%s%s" % [
+	_info.text = "画布 %d×%d · %d 帧 · %s fps · %d 层\n%s%s%s" % [
 		project.canvas_size.x,
 		project.canvas_size.y,
 		project.frames.size(),
@@ -135,6 +135,7 @@ func _refresh() -> void:
 		project.layer_names.size(),
 		"、".join(project.layer_names),
 		_tileset_line(),
+		_shader_line(),
 	]
 	for child in _frames_row.get_children():
 		child.queue_free()
@@ -283,6 +284,25 @@ func _tileset_line() -> String:
 	if not layers.is_empty():
 		tail = " · 图块层 %d 个：%s" % [layers.size(), "、".join(layers)]
 	return "\n图块集 %d 个：%s%s" % [project.tilesets.size(), "；".join(counts), tail]
+
+
+## A line about the Shader Composer layers this file has, or "" when it has none.
+##
+## Their pixels are only a static bake of a graph Pixelorama evaluates live, so
+## the preview (and the imported frames) legitimately differ from the editor —
+## saying so here stops that from looking like a bug.
+func _shader_line() -> String:
+	if project == null:
+		return ""
+	if _is_stale():
+		return ""
+	if not project.has_shader_layers():
+		return ""
+	return (
+		"\n着色器图层 %d 个（%s）没有参与帧合成：像素只是静态烘焙，"
+		% [project.shader_layer_names.size(), "、".join(project.shader_layer_names)]
+		+ "与编辑器的实时效果不同。要逐像素一致，请在 Pixelorama 保存时勾上「包含合成图」"
+	)
 
 
 func _reported(path: String, err: Error, hint: String) -> void:

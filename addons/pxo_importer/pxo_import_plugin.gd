@@ -14,7 +14,7 @@ const ReaderScript := preload("res://addons/pxo_importer/pxo_reader.gd")
 ## differ; without it a resource built by an older reader keeps being loaded, and
 ## the new fields look like they were never there (greyed-out buttons, empty
 ## tile lists).
-const FORMAT_VERSION := 2
+const FORMAT_VERSION := 3
 
 
 func _get_format_version() -> int:
@@ -73,6 +73,17 @@ func _get_import_options(path: String, preset_index: int) -> Array[Dictionary]:
 			"default_value": "",
 			"property_hint": PROPERTY_HINT_NONE,
 			"hint_string": "逗号分隔的层名；留空表示导入全部图层",
+			"usage": PROPERTY_USAGE_DEFAULT,
+		},
+		{
+			# Shader Composer layers only carry a static bake of a graph that
+			# Pixelorama evaluates live, so mixing them into the frames usually
+			# looks wrong. Off by default; the per-layer images are kept either
+			# way, so switching this on only changes the flattened frames.
+			"name": "import_shader_layers",
+			"default_value": false,
+			"property_hint": PROPERTY_HINT_NONE,
+			"hint_string": "着色器图层参与帧合成（默认不参与：其像素是静态烘焙，通常与编辑器不一致）",
 			"usage": PROPERTY_USAGE_DEFAULT,
 		},
 	]
