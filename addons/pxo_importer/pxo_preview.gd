@@ -9,6 +9,10 @@ extends VBoxContainer
 
 const THUMB := 96
 const CAPTION_HEIGHT := 26
+## How tall the frame being looked at is drawn. The strips are thumbnails; this is
+## the picture to judge by, because a sprite bouncing two pixels between frames is
+## invisible at 96 px.
+const STAGE_HEIGHT := 192
 
 const ExportScript := preload("res://addons/pxo_importer/pxo_export.gd")
 const ReaderScript := preload("res://addons/pxo_importer/pxo_reader.gd")
@@ -17,6 +21,7 @@ var project: PxoProject
 
 var _note: Label
 var _info: Label
+var _stage: TextureRect
 var _frames_row: HBoxContainer
 var _layers_row: HBoxContainer
 var _play: Button
@@ -101,6 +106,16 @@ func _build() -> void:
 	_timer.timeout.connect(_next_frame)
 	add_child(_timer)
 
+	# One picture, at a size where the drawing's position inside the frame can be
+	# judged. Every frame is the same size, so what moves between them is the art
+	# itself — which is exactly the motion a person expects to see.
+	_stage = TextureRect.new()
+	_stage.custom_minimum_size = Vector2(0, STAGE_HEIGHT)
+	_stage.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+	_stage.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
+	_stage.texture_filter = CanvasItem.TEXTURE_FILTER_NEAREST
+	add_child(_stage)
+
 	_frames_row = _strip("帧")
 	_layers_row = _strip("图层（当前帧）")
 	_refresh()
@@ -143,7 +158,8 @@ func _refresh() -> void:
 	_frame_buttons.clear()
 	var index := 0
 	for frame: PxoFrame in project.frames:
-		var button := _thumb_button(frame.composite if frame != null else null, "%d" % index)
+		var texture: Texture2D = frame.composite if frame != null else null
+		var button := _thumb_button(texture, "%d" % index, _thumb_width(texture))
 		button.toggle_mode = true
 		button.pressed.connect(_show_frame.bind(index))
 		_frames_row.add_child(button)
@@ -159,22 +175,40 @@ func _show_frame(index: int) -> void:
 	for i in _frame_buttons.size():
 		if is_instance_valid(_frame_buttons[i]):
 			_frame_buttons[i].set_pressed_no_signal(i == _current)
+	var frame: PxoFrame = project.frames[_current]
+	if _stage != null:
+		_stage.texture = frame.composite if frame != null else null
 	for child in _layers_row.get_children():
 		child.queue_free()
-	var frame: PxoFrame = project.frames[_current]
 	for layer_index in project.layer_names.size():
 		var texture: Texture2D = null
 		if frame != null:
 			texture = frame.get_layer_image(layer_index)
-		_layers_row.add_child(_thumb_button(texture, project.layer_names[layer_index]))
+		_layers_row.add_child(
+			_thumb_button(texture, project.layer_names[layer_index], _thumb_width(texture))
+		)
+
+
+## How wide a thumbnail has to be for the picture to fill it: a tall sprite in a
+## square box is shown floating between two empty bands, which reads as "the size
+## is wrong". Width follows the height of one thumbnail through the picture's own
+## proportions, floored at half a thumbnail so the button stays clickable and
+## capped at three so a wide sheet does not push everything off screen.
+func _thumb_width(texture: Texture2D) -> int:
+	if texture == null:
+		return THUMB
+	var size := texture.get_size()
+	if size.y <= 0.0:
+		return THUMB
+	return clampi(roundi(THUMB * size.x / size.y), THUMB / 2, THUMB * 3)
 
 
 ## One thumbnail with a caption under it. A null texture still gets a frame, so
 ## a layer without pixels (a group, a tilemap) is visible as such instead of
 ## silently missing.
-func _thumb_button(texture: Texture2D, caption: String) -> Button:
+func _thumb_button(texture: Texture2D, caption: String, width := THUMB) -> Button:
 	var button := Button.new()
-	button.custom_minimum_size = Vector2(THUMB + 8, THUMB + CAPTION_HEIGHT)
+	button.custom_minimum_size = Vector2(width + 8, THUMB + CAPTION_HEIGHT)
 	button.tooltip_text = caption
 	var column := VBoxContainer.new()
 	column.mouse_filter = Control.MOUSE_FILTER_IGNORE
@@ -183,7 +217,7 @@ func _thumb_button(texture: Texture2D, caption: String) -> Button:
 	button.add_child(column)
 	var picture := TextureRect.new()
 	picture.texture = texture
-	picture.custom_minimum_size = Vector2(THUMB, THUMB)
+	picture.custom_minimum_size = Vector2(width, THUMB)
 	picture.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
 	picture.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
 	# Pixel art: nearest keeps the grid visible at every zoom.
