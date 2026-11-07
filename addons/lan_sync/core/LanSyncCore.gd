@@ -1763,11 +1763,15 @@ func _finish_file() -> void:
 		return
 	var handle: FileAccess = _sending["handle"]
 	handle.close()
-	_outbox.append({"t": "file_end", "key": _sending["key"]})
+	var key := str(_sending["key"])
+	_outbox.append({"t": "file_end", "key": key})
 	sent_files += 1
 	_sending = {}
 	# No summary here: several files are served one after another, and a line per
 	# file would read like several separate syncs. The summary comes with `done`.
+	# The panels do get told, one file at a time: on the side that handed a file
+	# over, "only here" is no longer true the moment it has left.
+	file_synced.emit(_absolute(key), "out")
 
 
 ## The pull's summary waits until everything this side had to hand over has left.
