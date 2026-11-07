@@ -422,6 +422,9 @@ func _empty_remote_text() -> String:
 
 ## The 「刷新」 button: both halves of the marks are read again.
 func _on_refresh_files() -> void:
+	if _core == null or not _core.has_method("refresh_file_list"):
+		_on_log("刷新不可用：同步核心还没准备好")
+		return
 	_core.call("refresh_file_list")
 	_refresh_remote_files()
 

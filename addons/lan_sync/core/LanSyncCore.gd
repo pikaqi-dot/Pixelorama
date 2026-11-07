@@ -726,24 +726,29 @@ func refresh_local_entries() -> void:
 ## The local half comes first — half of every mark is this side's own timestamps,
 ## and those change without a single byte arriving (saving in Pixelorama). The
 ## remote half is the other side's list, which is only re-sent when it is asked for.
+## Every press says which of the two it got to, so a press never looks like nothing.
 func refresh_file_list() -> void:
 	refresh_local_entries()
 	peer_files_changed.emit()
+	var count := local_entries.size()
 	if _peer == null:
-		log_line.emit("还没连上：只刷新了本机这侧的文件状态")
+		log_line.emit("还没连上：只重读了本机这 %d 个文件的时间戳" % count)
 		return
-	var was_waiting := _awaiting_manifest
+	if _awaiting_manifest or _phase == "manifest" or _phase == "transfer":
+		log_line.emit("本机 %d 个文件已重读；对方的清单正在路上，回来就显示" % count)
+		return
 	list_peer_files()
-	if not was_waiting and _awaiting_manifest:
-		log_line.emit("正在向对方要最新清单…")
-	else:
-		log_line.emit("对方清单正在更新中，稍等片刻再刷新")
+	log_line.emit("本机 %d 个文件已重读；正在向对方要最新清单…" % count)
 
 
 ## One row per file of either side, sorted, each with a [enum FileState] saying how
 ## the two copies compare. This is what the file lists draw.
 func compare_entries() -> Array[Dictionary]:
 	refresh_local_entries()
+	# Read again is also the moment to forget "these are the bytes a sync moved":
+	# a file that has been saved since is not those bytes any more, and a record
+	# kept alive would keep the row green through any number of refreshes.
+	_prune_known_same()
 	var remote_keys := {}
 	var rows: Array[Dictionary] = []
 	for entry: Dictionary in peer_entries:
@@ -848,6 +853,30 @@ func _reconcile_known_same(remote: Dictionary) -> void:
 		if not hash.is_empty() and hash == str(_known_same[key].get("h", "")):
 			_known_same[key]["pending"] = false
 		else:
+			stale.append(key)
+	for key: String in stale:
+		_known_same.erase(key)
+
+
+## Drops the records this side's own folder has moved on from. Reading the folder
+## again is the cheapest moment to do it, and doing it here is what makes 「刷新」
+## honest straight away instead of up to half a minute later: a file saved since
+## the sync is no longer the bytes that were moved, whatever the other side says.
+func _prune_known_same() -> void:
+	if _known_same.is_empty():
+		return
+	var stale: Array[String] = []
+	for key: String in _known_same:
+		var local: Variant = local_entries.get(key)
+		if not local is Dictionary:
+			stale.append(key)
+			continue
+		var record: Dictionary = _known_same[key]
+		var entry: Dictionary = local
+		if int(record.get("mtime", -1)) != int(entry.get("mtime", -2)):
+			stale.append(key)
+			continue
+		if int(record.get("size", -1)) != int(entry.get("size", -2)):
 			stale.append(key)
 	for key: String in stale:
 		_known_same.erase(key)
@@ -1723,6 +1752,10 @@ func _show_remote(remote: Dictionary) -> void:
 				"h": str(entry.get("h", "")),
 			}
 		)
+	# A fresh list is also the only evidence about whether a pair a sync just made
+	# identical is still identical: it either confirms the record or shows that one
+	# of the two copies has moved on since.
+	_reconcile_known_same(remote)
 	peer_files_changed.emit()
 	if keys.is_empty():
 		log_line.emit(

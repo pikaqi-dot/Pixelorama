@@ -337,6 +337,13 @@ func _empty_remote_text() -> String:
 
 ## The 「刷新」 button: both halves of the marks are read again.
 func _on_refresh_files() -> void:
+	if not _core.has_method("refresh_file_list"):
+		# Editing the addon's scripts while the editor is open hot-reloads them, and
+		# the instance this dock holds is then an older one that does not have every
+		# method. Saying so beats a button that quietly does nothing.
+		_on_log("插件脚本刚被热重载过，这个按钮暂时用不了：在 项目设置 → 插件 里关掉再打开 Lan Sync")
+		_refresh_remote_files()
+		return
 	_core.call("refresh_file_list")
 	_refresh_remote_files()
 
