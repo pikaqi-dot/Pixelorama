@@ -27,6 +27,8 @@ _tmp_*
 
 # Export build output
 /build/
+# Godot writes its export progress here while an export runs
+/_export.log
 
 # LAN sync default shared folder, filled by whatever the phone sends
 /lan_shared/
