@@ -8,6 +8,7 @@ signal page_closed()
 
 const CoreScript := preload("res://addons/lan_sync/core/LanSyncCore.gd")
 const LogStyle := preload("res://addons/lan_sync/ui/log_style.gd")
+const FileMarks := preload("res://addons/lan_sync/ui/file_marks.gd")
 ## Folder shared out of the box, named the same way the editor dock names its
 ## own, so a fresh build and a fresh dock line up with no setup at all.
 const DEFAULT_NAME := "shared"
@@ -24,6 +25,9 @@ var _core: Node
 var _folders: ItemList
 var _peers: ItemList
 var _remote_files: ItemList
+## What the file list is showing, so a double-click knows which row it was: the
+## other side's copies, this side's own, and which of them is newer.
+var _rows: Array[Dictionary] = []
 var _log: RichTextLabel
 var _status: Label
 var _endpoint_edit: LineEdit
@@ -284,9 +288,21 @@ func _build() -> void:
 	files_panel.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	files_panel.add_theme_constant_override("separation", SEPARATION)
 	panels.add_child(files_panel)
-	# What the other side is offering, before anything is taken: a pull is a
-	# decision, and a decision needs a list to look at.
-	files_panel.add_child(_heading("对方的文件（双击一行只同步这一个）"))
+	# Both sides, marked: a pull is a decision, and a decision needs to see which
+	# copy is the newer one before it is made.
+	var files_head := HBoxContainer.new()
+	files_head.add_theme_constant_override("separation", SEPARATION)
+	files_panel.add_child(files_head)
+	var files_title := _heading("两边的文件")
+	files_title.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	files_title.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	files_title.tooltip_text = FileMarks.LEGEND + "\n双击一行只同步这一个"
+	files_head.add_child(files_title)
+	# Reads both halves of the marks again and transfers nothing, so it is always
+	# safe to press — the phone equivalent of "did it really update?".
+	var refresh_button := _button("刷新", _on_refresh_files)
+	refresh_button.tooltip_text = "重读本机文件时间戳，并向对方要一次最新清单"
+	files_head.add_child(refresh_button)
 	_remote_files = ItemList.new()
 	_remote_files.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	_remote_files.size_flags_vertical = Control.SIZE_EXPAND_FILL
@@ -375,18 +391,23 @@ func _refresh_remote_files() -> void:
 	if not is_instance_valid(_remote_files):
 		return
 	_remote_files.clear()
-	if _core.peer_entries.is_empty():
+	# Both sides, each row marked: same time, one side newer, or missing over
+	# there. The comparing happens in the core, so the phone and the editor dock
+	# cannot show different marks for the same folder.
+	_rows = _core.call("compare_entries")
+	if _rows.is_empty():
 		# Which of the three it is decides what to do about it, so the box says it
 		# instead of one sentence covering all of them.
 		_remote_files.add_item(_empty_remote_text())
 		_remote_files.set_item_disabled(0, true)
 		return
-	for entry: Dictionary in _core.peer_entries:
-		# The timestamp is the whole point of the column: it is how a person
-		# decides which copy is the one worth keeping.
-		_remote_files.add_item(
-			"%s · %s" % [str(entry.get("key", "")), _mtime_text(int(entry.get("mtime", 0)))]
-		)
+	for index in _rows.size():
+		var row: Dictionary = _rows[index]
+		# The mark and the colour carry the whole message; the timestamp next to
+		# them is what a person checks before deciding.
+		_remote_files.add_item(FileMarks.text(row))
+		_remote_files.set_item_custom_fg_color(index, FileMarks.color(int(row["state"])))
+		_remote_files.set_item_tooltip(index, FileMarks.tooltip(row))
 
 
 ## Why the other side's list is empty: no link, a link still waiting for the list
@@ -399,28 +420,25 @@ func _empty_remote_text() -> String:
 	return "（对方的共享目录里没有文件）"
 
 
-## A modification time as it reads in a file manager.
-func _mtime_text(mtime: int) -> String:
-	if mtime <= 0:
-		return "时间未知"
-	var when := Time.get_datetime_dict_from_unix_time(mtime)
-	return "%02d-%02d %02d:%02d:%02d" % [
-		int(when["month"]),
-		int(when["day"]),
-		int(when["hour"]),
-		int(when["minute"]),
-		int(when["second"]),
-	]
+## The 「刷新」 button: both halves of the marks are read again.
+func _on_refresh_files() -> void:
+	_core.call("refresh_file_list")
+	_refresh_remote_files()
 
 
 ## One row was double-clicked: take that file and nothing else. A whole-folder
 ## sync is the button; this is for replacing the one project or image that is
-## out of date without disturbing the rest.
+## out of date without disturbing the rest. A row the other side does not have
+## cannot be pulled, and says so instead of asking for a file that is not there.
 func _on_remote_file_activated(index: int) -> void:
-	if index < 0 or index >= _core.peer_entries.size():
+	if index < 0 or index >= _rows.size():
 		return
-	var key := str(_core.peer_entries[index].get("key", ""))
+	var row: Dictionary = _rows[index]
+	var key := str(row.get("key", ""))
 	if key.is_empty():
+		return
+	if int(row.get("state", 0)) == LanSyncCore.FileState.LOCAL_ONLY:
+		_on_log("对方没有 %s，没法从这里拉；要给它，就在它那边点「同步」" % key)
 		return
 	_core.call("request_file", key)
 	_refresh_status()
@@ -588,6 +606,10 @@ func _on_clear_log() -> void:
 func _on_file_synced(path: String, direction: String) -> void:
 	_on_log("%s %s" % ["收到" if direction == "in" else "发出", path.get_file()])
 	_refresh_folders()
+	# The marks are one file out of date from here on unless the list is rebuilt:
+	# what just arrived is no longer "missing here", and what just left is no
+	# longer "missing over there".
+	_refresh_remote_files()
 
 
 func _on_close_pressed() -> void:

@@ -705,6 +705,26 @@ func refresh_local_entries() -> void:
 	_marks_cost = Time.get_ticks_msec() - started
 
 
+## The button behind "refresh": read this side's timestamps again and ask the other
+## side for a fresh list. Nothing is transferred, so it is always safe to press.
+##
+## The local half comes first — half of every mark is this side's own timestamps,
+## and those change without a single byte arriving (saving in Pixelorama). The
+## remote half is the other side's list, which is only re-sent when it is asked for.
+func refresh_file_list() -> void:
+	refresh_local_entries()
+	peer_files_changed.emit()
+	if _peer == null:
+		log_line.emit("还没连上：只刷新了本机这侧的文件状态")
+		return
+	var was_waiting := _awaiting_manifest
+	list_peer_files()
+	if not was_waiting and _awaiting_manifest:
+		log_line.emit("正在向对方要最新清单…")
+	else:
+		log_line.emit("对方清单正在更新中，稍等片刻再刷新")
+
+
 ## One row per file of either side, sorted, each with a [enum FileState] saying how
 ## the two copies compare. This is what the file lists draw.
 func compare_entries() -> Array[Dictionary]:

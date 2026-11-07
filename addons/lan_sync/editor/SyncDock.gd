@@ -198,9 +198,21 @@ func _build() -> void:
 	files_box.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	files_box.add_theme_constant_override("separation", 2)
 	_bottom.add_child(files_box)
+	var files_head := HBoxContainer.new()
+	files_head.add_theme_constant_override("separation", 4)
+	files_box.add_child(files_head)
 	var files_title := _heading("两边的文件")
+	files_title.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	files_title.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
 	files_title.tooltip_text = FileMarks.LEGEND + "\n双击一行只同步这一个"
-	files_box.add_child(files_title)
+	files_head.add_child(files_title)
+	# Checking again is cheap and never transfers anything, so it gets a button
+	# instead of asking anybody to remember that the list also updates itself.
+	var refresh_button := Button.new()
+	refresh_button.text = "刷新"
+	refresh_button.tooltip_text = "重读本机文件时间戳，并向对方要一次最新清单"
+	refresh_button.pressed.connect(_on_refresh_files)
+	files_head.add_child(refresh_button)
 	_remote_files = ItemList.new()
 	_remote_files.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	_remote_files.custom_minimum_size = Vector2(0, 90)
@@ -321,6 +333,12 @@ func _empty_remote_text() -> String:
 	if bool(_core.get("_awaiting_manifest")):
 		return "（已连上，正在等对方回文件清单…）"
 	return "（对方的共享目录里没有文件）"
+
+
+## The 「刷新」 button: both halves of the marks are read again.
+func _on_refresh_files() -> void:
+	_core.call("refresh_file_list")
+	_refresh_remote_files()
 
 
 ## Double-clicking one row takes that file and nothing else, so a single stale
