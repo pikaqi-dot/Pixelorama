@@ -20,6 +20,10 @@ const DOWNLOADS_SUBDIR := "Pixelorama"
 const ROW_HEIGHT := 34
 const MARGIN := 8
 const SEPARATION := 5
+## The line under the lists. Its colour follows the mark of the selected row, so
+## the message and the row it is about read as one thing.
+const COLOR_HINT := Color(0.68, 0.72, 0.8)
+const HINT_NO_SELECTION := "点选上面的文件看它的详情；双击一行只同步这一个"
 
 var _core: Node
 var _folders: ItemList
@@ -28,6 +32,14 @@ var _remote_files: ItemList
 ## What the file list is showing, so a double-click knows which row it was: the
 ## other side's copies, this side's own, and which of them is newer.
 var _rows: Array[Dictionary] = []
+## The line under the lists: what the tapped row is, both copies' time and size,
+## and what pressing 「同步」 would do to it. Switching tabs is how the drawing
+## tab is reached now, so the slot at the bottom is free for this.
+var _selection_info: RichTextLabel
+## The key of the selected row, kept across a redraw: a manifest arriving rebuilds
+## the list, and losing the selection would make the line below fall back to its
+## hint for no reason.
+var _selected_key := ""
 var _log: RichTextLabel
 var _status: Label
 var _endpoint_edit: LineEdit
@@ -308,6 +320,7 @@ func _build() -> void:
 	_remote_files.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	_remote_files.custom_minimum_size = Vector2(0, 96)
 	_remote_files.item_activated.connect(_on_remote_file_activated)
+	_remote_files.item_selected.connect(_on_remote_file_selected)
 	files_panel.add_child(_remote_files)
 
 	var log_panel := VBoxContainer.new()
@@ -330,7 +343,18 @@ func _build() -> void:
 	_log.add_theme_font_size_override("normal_font_size", 11)
 	log_panel.add_child(_log)
 
-	column.add_child(_button("返回绘画", _on_close_pressed))
+	# Where the drawing tab is reached from the tab bar, so this slot is spent on
+	# information instead of a way back: the selected file, both copies' details,
+	# and what a sync would do with it.
+	_selection_info = RichTextLabel.new()
+	_selection_info.bbcode_enabled = false
+	_selection_info.fit_content = false
+	_selection_info.scroll_active = true
+	_selection_info.custom_minimum_size = Vector2(0, 72)
+	_selection_info.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_selection_info.add_theme_font_size_override("normal_font_size", 11)
+	column.add_child(_selection_info)
+	_show_file_info(-1)
 
 
 func _on_folder_toggle(pressed: bool) -> void:
@@ -400,6 +424,8 @@ func _refresh_remote_files() -> void:
 		# instead of one sentence covering all of them.
 		_remote_files.add_item(_empty_remote_text())
 		_remote_files.set_item_disabled(0, true)
+		_selected_key = ""
+		_show_file_info(-1)
 		return
 	for index in _rows.size():
 		var row: Dictionary = _rows[index]
@@ -408,6 +434,85 @@ func _refresh_remote_files() -> void:
 		_remote_files.add_item(FileMarks.text(row))
 		_remote_files.set_item_custom_fg_color(index, FileMarks.color(int(row["state"])))
 		_remote_files.set_item_tooltip(index, FileMarks.tooltip(row))
+	_restore_selection()
+
+
+## A tap on a row: the line below spells out what the one-line mark could not.
+func _on_remote_file_selected(index: int) -> void:
+	if index < 0 or index >= _rows.size():
+		_selected_key = ""
+		_show_file_info(-1)
+		return
+	_selected_key = str(_rows[index].get("key", ""))
+	_show_file_info(index)
+
+
+## The list was rebuilt from a fresh compare (a manifest arrived, 刷新 was pressed,
+## a file landed): put the selection back on the same key, so the information line
+## keeps describing the file the person was looking at instead of resetting.
+func _restore_selection() -> void:
+	if _selected_key.is_empty():
+		_show_file_info(-1)
+		return
+	for index in _rows.size():
+		if str(_rows[index].get("key", "")) == _selected_key:
+			_remote_files.select(index)
+			_show_file_info(index)
+			return
+	# The file is gone from both sides since it was selected: nothing to describe.
+	_selected_key = ""
+	_show_file_info(-1)
+
+
+## What the information line says. The wording comes from the same place as the
+## row tooltip, so the phone cannot explain a mark differently from the dock; the
+## sizes are added because a row has no room for them.
+func _show_file_info(index: int) -> void:
+	if not is_instance_valid(_selection_info):
+		return
+	if index < 0 or index >= _rows.size():
+		_selection_info.text = HINT_NO_SELECTION
+		_selection_info.add_theme_color_override("default_color", COLOR_HINT)
+		return
+	var row: Dictionary = _rows[index]
+	var key := str(row.get("key", ""))
+	var local_size := _entry_size(_core.get("local_entries"), key)
+	var remote_size := _entry_size(_core.get("peer_entries"), key)
+	_selection_info.text = "%s\n大小：本机 %s · 对方 %s" % [
+		FileMarks.tooltip(row), _bytes_text(local_size), _bytes_text(remote_size)
+	]
+	_selection_info.add_theme_color_override("default_color", FileMarks.color(int(row["state"])))
+
+
+## The size of one key in [param entries], which is a key -> {size} dictionary on
+## this side (local_entries) and an array of {key, size} rows on the other
+## (peer_entries). -1 means "that side does not have it".
+func _entry_size(entries: Variant, key: String) -> int:
+	if entries is Dictionary:
+		var dictionary: Dictionary = entries
+		if not dictionary.has(key):
+			return -1
+		var local: Variant = dictionary[key]
+		if local is Dictionary:
+			return int((local as Dictionary).get("size", -1))
+		return -1
+	if entries is Array:
+		for entry: Variant in entries:
+			if not entry is Dictionary:
+				continue
+			if str((entry as Dictionary).get("key", "")) == key:
+				return int((entry as Dictionary).get("size", -1))
+	return -1
+
+
+func _bytes_text(bytes: int) -> String:
+	if bytes < 0:
+		return "没有"
+	if bytes < 1024:
+		return "%d B" % bytes
+	if bytes < 1024 * 1024:
+		return "%.1f KB" % (bytes / 1024.0)
+	return "%.1f MB" % (bytes / (1024.0 * 1024.0))
 
 
 ## Why the other side's list is empty: no link, a link still waiting for the list
@@ -615,5 +720,3 @@ func _on_file_synced(path: String, direction: String) -> void:
 	_refresh_remote_files()
 
 
-func _on_close_pressed() -> void:
-	page_closed.emit()
