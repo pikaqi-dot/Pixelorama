@@ -4210,8 +4210,13 @@ static func _stamp_segment(
 ## image directly would treat a one pixel cel as the whole artwork.
 func _source_image(node: Dictionary, params: Dictionary) -> Image:
 	var key := str(node["id"])
-	if _source_cache.has(key):
-		return _source_cache[key]
+	# One picture per node, tagged with the frame and layer it was read from. A
+	# plain per-node cache meant changing 「帧号」 kept handing back the frame that
+	# was read first, so the number moved and nothing on screen followed it.
+	var signature := _source_signature(params)
+	var cached: Variant = _source_cache.get(key)
+	if cached is Dictionary and int((cached as Dictionary).get("signature", 0)) == signature:
+		return (cached as Dictionary).get("image", null)
 	var cel := source_cel(node)
 	var image: Image = null
 	var project = Global.current_project
@@ -4223,12 +4228,34 @@ func _source_image(node: Dictionary, params: Dictionary) -> Image:
 				image = source
 			else:
 				image = _compose_cel(source, cel.offset, canvas)
-	_source_cache[key] = image
+	_source_cache[key] = {"signature": signature, "image": image}
 	return image
+
+
+## What makes one read of a node's source different from the next: the source
+## kind, and the frame and layer it looks at. Used as the cache tag instead of a
+## per-value key, so a frame number that keeps changing replaces one picture
+## rather than piling up one per value — a phone cannot hold hundreds of
+## canvas-sized images.
+static func _source_signature(params: Dictionary) -> int:
+	return hash(
+		[
+			int(params.get("source", 0)),
+			int(params.get("frame_mode", 0)),
+			int(params.get("frame", 0)),
+			int(params.get("layer", 0)),
+		]
+	)
 
 
 ## Draws a cel image onto a transparent canvas sized picture at [param offset],
 ## which is how the drawing area shows it.
+##
+## The cel is clipped to the canvas first, because a cel that was dragged past an
+## edge has a negative offset — and Image.blend_rect walks the destination pixel
+## buffer without bounds checks, so a negative destination is an out-of-bounds
+## write in the engine itself. On Android that is a crash of the whole app, not a
+## script error, which is why reading such a frame used to kill the process.
 static func _compose_cel(source: Image, offset: Vector2i, canvas: Vector2i) -> Image:
 	var composed := Image.create_empty(
 		maxi(canvas.x, 1), maxi(canvas.y, 1), false, Image.FORMAT_RGBA8
@@ -4238,7 +4265,14 @@ static func _compose_cel(source: Image, offset: Vector2i, canvas: Vector2i) -> I
 	if source.get_format() != Image.FORMAT_RGBA8:
 		layer = source.duplicate()
 		layer.convert(Image.FORMAT_RGBA8)
-	composed.blend_rect(layer, Rect2i(Vector2i.ZERO, layer.get_size()), offset)
+	var target := Rect2i(offset, layer.get_size()).intersection(
+		Rect2i(Vector2i.ZERO, composed.get_size())
+	)
+	if target.size.x <= 0 or target.size.y <= 0:
+		return composed
+	composed.blend_rect(
+		layer, Rect2i(target.position - offset, target.size), target.position
+	)
 	return composed
 
 
@@ -4257,7 +4291,12 @@ func source_cel(node: Dictionary) -> BaseCel:
 			var frame_count: int = project.frames.size()
 			frame_index = clampi(int(floorf(time * float(frame_count))), 0, frame_count - 1)
 	var layer_index := clampi(int(params.get("layer", 0)), 0, project.layers.size() - 1)
-	var cel = project.frames[frame_index].cels[layer_index]
+	var frame: Frame = project.frames[frame_index]
+	# A cel list shorter than the layer list would index past its end. Reading a
+	# frame the node cannot describe is "no image", not a crash.
+	if layer_index >= frame.cels.size():
+		return null
+	var cel = frame.cels[layer_index]
 	if cel is BaseCel:
 		return cel
 	return null

@@ -3666,7 +3666,13 @@ func _add_source_preview(node: Dictionary, region: Rect2i) -> void:
 	var image: Image = graph.source_image(node)
 	if image == null or image.is_empty() or region.size.x <= 0 or region.size.y <= 0:
 		return
-	var cropped := image.get_region(region)
+	# The crop numbers can outlive the picture they were set against — a layer that
+	# shrank, a frame the node now reads instead — so the region is clipped to what
+	# is actually there before it is cut out.
+	var safe := region.intersection(Rect2i(Vector2i.ZERO, image.get_size()))
+	if safe.size.x <= 0 or safe.size.y <= 0:
+		return
+	var cropped := image.get_region(safe)
 	var preview := TextureRect.new()
 	preview.texture = ImageTexture.create_from_image(cropped)
 	preview.texture_filter = CanvasItem.TEXTURE_FILTER_NEAREST
