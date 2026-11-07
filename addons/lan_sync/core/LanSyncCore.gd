@@ -231,6 +231,12 @@ var _reconnect_failures := 0
 ## path -> {size, mtime, hash, checked}. Rounds run every three seconds; reading
 ## every file that often would make an idle link cost as much as a busy one.
 var _hash_cache: Dictionary = {}
+## path -> {size, mtime, h}: what this side's file contains, kept until its
+## timestamp or size changes. The file list asks for it whenever two timestamps
+## disagree, and a pair a sync has made identical goes on disagreeing for ever —
+## that question must not cost a fresh read on every redraw, and it must not
+## depend on a record that only the side which pressed the button ever got.
+var _local_hashes: Dictionary = {}
 ## How many files each side offered in the last round, and whether a person asked
 ## for it — a round somebody asked for has to say what came of it, even "nothing".
 var _local_file_count := 0
@@ -794,6 +800,14 @@ func _row_for(key: String, remote_mtime: int, remote_hash: String) -> Dictionary
 		return row
 	if _known_same_holds(key, local, remote_hash):
 		row["state"] = FileState.SAME
+	elif not remote_hash.is_empty() and _local_hash_matches(key, remote_hash):
+		# A timestamp says when a file was written, not what is in it. Writing on
+		# the other side stamps "now" on a copy of the same bytes, so the two
+		# timestamps stay apart for ever — and a side that never handed the file
+		# over has no record to cover it. Comparing the bytes the other side
+		# already reported is what lets that side say 「内容一致」 too, on 刷新
+		# and after a restart.
+		row["state"] = FileState.SAME
 	elif remote_mtime > local_mtime:
 		row["state"] = FileState.REMOTE_NEWER
 	else:
@@ -817,6 +831,36 @@ func _known_same_holds(key: String, local: Dictionary, remote_hash: String) -> b
 	if bool(record.get("pending", false)):
 		return true
 	return not remote_hash.is_empty() and remote_hash == str(record.get("h", ""))
+
+
+## Whether this side's copy holds the bytes the other side just listed. Uses the
+## timestamp and the size to decide whether the remembered hash is still the
+## hash of the file on disk, so a file that was saved again is read again; a file
+## nobody touched costs one read per session, not one per redraw.
+func _local_hash_matches(key: String, remote_hash: String) -> bool:
+	var path := _absolute(key)
+	if path.is_empty():
+		return false
+	var local: Variant = local_entries.get(key)
+	if not local is Dictionary:
+		return false
+	var entry: Dictionary = local
+	var mtime := int(entry.get("mtime", 0))
+	var size := int(entry.get("size", -1))
+	if mtime <= 0:
+		return false
+	var cached: Variant = _local_hashes.get(path)
+	if cached is Dictionary:
+		var record: Dictionary = cached
+		if int(record.get("mtime", -1)) == mtime and int(record.get("size", -2)) == size:
+			return str(record.get("h", "")) == remote_hash
+	var described := _describe_file(path)
+	_local_hashes[path] = {
+		"mtime": int(described.get("mtime", mtime)),
+		"size": int(described.get("size", size)),
+		"h": str(described.get("h", "")),
+	}
+	return str(described.get("h", "")) == remote_hash
 
 
 ## Notes that both copies now hold the same bytes, so the row can show a tick
@@ -886,6 +930,7 @@ func set_folder(folder_name: String, path: String) -> void:
 	folders[folder_name] = path
 	# Hashes are keyed by absolute path, and the folders just changed.
 	_hash_cache.clear()
+	_local_hashes.clear()
 	_known_same.clear()
 	save_config()
 
@@ -893,6 +938,7 @@ func set_folder(folder_name: String, path: String) -> void:
 func remove_folder(folder_name: String) -> void:
 	folders.erase(folder_name)
 	_hash_cache.clear()
+	_local_hashes.clear()
 	_known_same.clear()
 	save_config()
 
@@ -2023,6 +2069,7 @@ func _handle_file_end(message: Dictionary) -> void:
 		_finish_received()
 		return
 	_hash_cache.erase(path)
+	_local_hashes.erase(path)
 	_remember_same(key, path)
 	file_synced.emit(path, "in")
 	received_files += 1
