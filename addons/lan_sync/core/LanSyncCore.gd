@@ -49,6 +49,9 @@ const TRANSFER_SILENCE := 15.0
 ## filesystem timestamp only has one second of resolution, so the cache expires
 ## instead of being trusted forever.
 const HASH_CACHE_TTL := 10.0
+## How long to wait before asking the other side for a fresh list once a round has
+## moved files: both sides write, and the list has to describe the end of that.
+const RELIST_DELAY := 0.6
 ## Most files read from one folder. A pasted music library is not what this is for.
 const MAX_FILES := 4000
 const CONFIG_PATH := "user://lan_sync.cfg"
@@ -145,6 +148,17 @@ var local_entries: Dictionary = {}
 ## Seconds until the marks are checked again, and how long that check took.
 var _marks_left := 0.0
 var _marks_cost := 0
+## Keys whose two copies are known to hold the same bytes even though their
+## timestamps differ: a sync just moved one of them, and writing a file stamps it
+## with the current time, so a pair a sync has just made equal can never show two
+## equal timestamps again. key -> {h, mtime, size, pending}; valid only while this
+## side's own file is untouched, `pending` meaning the other side has not been
+## re-asked since and the bytes are believed to be the ones that were just moved.
+var _known_same: Dictionary = {}
+## Whether the other side's list should be asked for again once a transfer is over,
+## and how long to wait first.
+var _relist_wanted := false
+var _relist_left := 0.0
 
 var _udp := PacketPeerUDP.new()
 var _server := TCPServer.new()
@@ -308,6 +322,7 @@ func _process(delta: float) -> void:
 	_poll_watchdog()
 	_poll_timeouts()
 	_poll_marks(delta)
+	_poll_relist(delta)
 
 
 # Public API.
@@ -736,11 +751,11 @@ func compare_entries() -> Array[Dictionary]:
 		if key.is_empty():
 			continue
 		remote_keys[key] = true
-		rows.append(_row_for(key, int(entry.get("mtime", 0))))
+		rows.append(_row_for(key, int(entry.get("mtime", 0)), str(entry.get("h", ""))))
 	for key: String in local_entries:
 		if remote_keys.has(key):
 			continue
-		rows.append(_row_for(key, -1))
+		rows.append(_row_for(key, -1, ""))
 	rows.sort_custom(
 		func(a: Dictionary, b: Dictionary) -> bool: return str(a["key"]) < str(b["key"])
 	)
@@ -749,7 +764,12 @@ func compare_entries() -> Array[Dictionary]:
 
 ## One row of [method compare_entries]. A negative [param remote_mtime] means the
 ## other side does not have the file at all.
-func _row_for(key: String, remote_mtime: int) -> Dictionary:
+##
+## Equal timestamps are the cheap case and the usual one, but they cannot cover a
+## pair a sync has just made identical: writing the file stamps it with "now", so
+## the two timestamps stay apart for ever. That is what [member _known_same] is
+## for, and the hash it remembers is what keeps it honest.
+func _row_for(key: String, remote_mtime: int, remote_hash: String) -> Dictionary:
 	var row := {
 		"key": key,
 		"remote_mtime": remote_mtime,
@@ -763,7 +783,11 @@ func _row_for(key: String, remote_mtime: int) -> Dictionary:
 	row["local_mtime"] = local_mtime
 	if remote_mtime < 0:
 		row["state"] = FileState.LOCAL_ONLY
-	elif local_mtime == remote_mtime:
+		return row
+	if local_mtime == remote_mtime:
+		row["state"] = FileState.SAME
+		return row
+	if _known_same_holds(key, local, remote_hash):
 		row["state"] = FileState.SAME
 	elif remote_mtime > local_mtime:
 		row["state"] = FileState.REMOTE_NEWER
@@ -772,16 +796,75 @@ func _row_for(key: String, remote_mtime: int) -> Dictionary:
 	return row
 
 
+## Whether this key is one a sync has just made identical. The record only counts
+## while this side's file is still the one that was written — same timestamp, same
+## size — and while the other side either has not been asked since ([code]pending[/code])
+## or still reports the very hash that was moved.
+func _known_same_holds(key: String, local: Dictionary, remote_hash: String) -> bool:
+	var known: Variant = _known_same.get(key)
+	if not known is Dictionary:
+		return false
+	var record: Dictionary = known
+	if int(record.get("mtime", -1)) != int(local.get("mtime", -2)):
+		return false
+	if int(record.get("size", -1)) != int(local.get("size", -2)):
+		return false
+	if bool(record.get("pending", false)):
+		return true
+	return not remote_hash.is_empty() and remote_hash == str(record.get("h", ""))
+
+
+## Notes that both copies now hold the same bytes, so the row can show a tick
+## without waiting for two timestamps to agree — they never will.
+func _remember_same(key: String, path: String) -> void:
+	if key.is_empty() or path.is_empty():
+		return
+	if not FileAccess.file_exists(path):
+		return
+	var described := _describe_file(path)
+	_known_same[key] = {
+		"h": str(described.get("h", "")),
+		"mtime": int(described.get("mtime", 0)),
+		"size": int(described.get("size", 0)),
+		"pending": true,
+	}
+
+
+## A fresh list from the other side either confirms "these two copies are those
+## bytes" or shows that they are not any more, and the record has to follow: it is
+## the only thing standing between a just-synced pair and a row that stays red.
+func _reconcile_known_same(remote: Dictionary) -> void:
+	if _known_same.is_empty():
+		return
+	var stale: Array[String] = []
+	for key: String in _known_same:
+		if not remote.has(key):
+			stale.append(key)
+			continue
+		var entry: Variant = remote[key]
+		var hash := ""
+		if entry is Dictionary:
+			hash = str((entry as Dictionary).get("h", ""))
+		if not hash.is_empty() and hash == str(_known_same[key].get("h", "")):
+			_known_same[key]["pending"] = false
+		else:
+			stale.append(key)
+	for key: String in stale:
+		_known_same.erase(key)
+
+
 func set_folder(folder_name: String, path: String) -> void:
 	folders[folder_name] = path
 	# Hashes are keyed by absolute path, and the folders just changed.
 	_hash_cache.clear()
+	_known_same.clear()
 	save_config()
 
 
 func remove_folder(folder_name: String) -> void:
 	folders.erase(folder_name)
 	_hash_cache.clear()
+	_known_same.clear()
 	save_config()
 
 
@@ -935,11 +1018,47 @@ func _refresh_known_mtimes() -> bool:
 		if int(entry.get("mtime", 0)) != mtime or int(entry.get("size", -1)) != size:
 			entry["mtime"] = mtime
 			entry["size"] = size
+			# Edited here, so whatever a sync left behind is no longer these bytes.
+			_known_same.erase(key)
 			changed = true
 	for key: String in gone:
 		local_entries.erase(key)
+		_known_same.erase(key)
 		changed = true
 	return changed
+
+
+## A round that moved something leaves the other side's list wrong in exactly the
+## details the marks are made of — a file it now has, a timestamp it no longer
+## uses — so one fresh list is asked for shortly after the round instead of leaving
+## the panel describing the moment before it.
+func _queue_relist() -> void:
+	_relist_wanted = true
+	_relist_left = RELIST_DELAY
+
+
+func _poll_relist(delta: float) -> void:
+	if not _relist_wanted:
+		return
+	_relist_left -= delta
+	if _relist_left > 0.0:
+		return
+	if _peer == null:
+		_relist_wanted = false
+		return
+	if _awaiting_manifest or _phase == "manifest":
+		# A list is already on its way, which is what this was going to ask for.
+		_relist_wanted = false
+		return
+	if _phase == "transfer":
+		# The peer is still writing files, so its list would be about a folder it
+		# is in the middle of changing.
+		_relist_left = RELIST_DELAY
+		return
+	_relist_wanted = false
+	list_peer_files()
+	refresh_local_entries()
+	peer_files_changed.emit()
 
 
 func _poll_timeouts() -> void:
@@ -1677,6 +1796,14 @@ func _plan_pull(remote: Dictionary) -> void:
 		if local.has(key):
 			if str(local[key].get("h", "")) == str(remote[key].get("h", "-")):
 				identical += 1
+				# Same bytes with different timestamps is exactly what the
+				# timestamps cannot describe: a tick, not an exclamation.
+				_known_same[key] = {
+					"h": str(local[key].get("h", "")),
+					"mtime": int(local[key].get("mtime", 0)),
+					"size": int(local[key].get("size", 0)),
+					"pending": false,
+				}
 				continue
 			# An identical modification time means both copies come from the same
 			# write, so neither is newer and a sync has no business replacing one
@@ -1787,6 +1914,10 @@ func _finish_file() -> void:
 	_outbox.append({"t": "file_end", "key": key})
 	sent_files += 1
 	_sending = {}
+	# The other side is writing these exact bytes, so its row can be a tick without
+	# waiting for two timestamps to agree; the next list it sends confirms the
+	# record, and drops it if it no longer matches.
+	_remember_same(key, _absolute(key))
 	# No summary here: several files are served one after another, and a line per
 	# file would read like several separate syncs. The summary comes with `done`.
 	# The panels do get told, one file at a time: on the side that handed a file
@@ -1859,6 +1990,7 @@ func _handle_file_end(message: Dictionary) -> void:
 		_finish_received()
 		return
 	_hash_cache.erase(path)
+	_remember_same(key, path)
 	file_synced.emit(path, "in")
 	received_files += 1
 	log_line.emit("收到 %s（%s）" % [key, _size_text(written)])
@@ -1975,6 +2107,10 @@ func _report_round() -> void:
 		return
 	_reported_sent = sent_files
 	_reported_received = received_files
+	# Both sides have just written files, and the marks compare this side's
+	# timestamps against the other side's list: without asking for it again the
+	# panel would keep describing the state from before the sync.
+	_queue_relist()
 	if not planned:
 		# The side that only answered: it has no manifest of its own to compare,
 		# so it reports what it handed over and nothing else.
