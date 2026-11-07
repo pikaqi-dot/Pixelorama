@@ -142,6 +142,10 @@ var peer_files: Array[String] = []
 var peer_entries: Array[Dictionary] = []
 ## Keys a pull is narrowed to. Empty means "everything on the other side".
 var _pull_keys: Array[String] = []
+## A folder a pull is narrowed to, e.g. "art/" — everything under it, at any
+## depth. Empty means "not narrowed by folder". A click on a folder row sets
+## this instead of listing every key underneath it.
+var _pull_prefix := ""
 ## This side's files, key -> {mtime, size}. Timestamps only: the panel needs to
 ## know what is newer, not what the bytes are, and hashing is the expensive part.
 var local_entries: Dictionary = {}
@@ -614,6 +618,7 @@ func request_sync_now() -> void:
 		log_line.emit("还没连上，稍后再点")
 		return
 	_pull_keys.clear()
+	_pull_prefix = ""
 	_outbox.append({"t": "pull"})
 	_awaiting_manifest = true
 	_manifest_since = Time.get_ticks_msec()
@@ -639,6 +644,7 @@ func request_file(key: String) -> void:
 		log_line.emit("正在同步，稍等")
 		return
 	_pull_keys = [key]
+	_pull_prefix = ""
 	_outbox.append({"t": "pull"})
 	_awaiting_manifest = true
 	_manifest_since = Time.get_ticks_msec()
@@ -648,6 +654,34 @@ func request_file(key: String) -> void:
 	_manual_round = true
 	_phase = "manifest"
 	log_line.emit("准备同步 %s…" % key)
+
+
+## Pulls everything under one folder of the shared tree — a double-click on a
+## folder row. Matched by prefix, so "art/" also takes "art/bg/sky.png"; a click
+## is a deliberate choice, so an equal timestamp does not block the copy either.
+func request_folder(prefix: String) -> void:
+	if prefix.is_empty():
+		return
+	if not prefix.ends_with("/"):
+		prefix += "/"
+	var shown := prefix.trim_suffix("/")
+	if _peer == null:
+		log_line.emit("还没连上：先点「扫描」或按地址连接")
+		return
+	if _phase == "manifest" or _phase == "transfer":
+		log_line.emit("正在同步，稍等")
+		return
+	_pull_keys.clear()
+	_pull_prefix = prefix
+	_outbox.append({"t": "pull"})
+	_awaiting_manifest = true
+	_manifest_since = Time.get_ticks_msec()
+	_manifest_retries = 0
+	_manifest_hinted = false
+	_pulling = true
+	_manual_round = true
+	_phase = "manifest"
+	log_line.emit("准备同步 %s 下的文件…" % shown)
 
 
 ## Asks for the other side's file list without taking anything. Called once a link
@@ -1861,11 +1895,11 @@ func _plan_pull(remote: Dictionary) -> void:
 	var unshared := 0
 	var identical := 0
 	var same_time := 0
-	# A single-file pull is a deliberate click on one row, so it overrides the
-	# timestamp rule below; a whole-folder sync obeys it.
-	var forced := not _pull_keys.is_empty()
+	# A click on one row — a file or a folder — is a deliberate choice, so it
+	# overrides the timestamp rule below; a whole-folder sync obeys it.
+	var forced := not _pull_keys.is_empty() or not _pull_prefix.is_empty()
 	for key: String in remote:
-		if forced and not _pull_keys.has(key):
+		if forced and not _wanted_key(key):
 			continue
 		# A key whose folder this side does not share would be asked for and then
 		# dropped on arrival, leaving the pull waiting for a file that never lands.
@@ -1909,6 +1943,15 @@ func _plan_pull(remote: Dictionary) -> void:
 	# The narrow pull is spent once it has been turned into a get queue; leaving
 	# it set would silently narrow the next full sync to the same single file.
 	_pull_keys.clear()
+	_pull_prefix = ""
+
+
+## Whether a narrowed round asked for this key: an explicit list of keys, or a
+## folder prefix, which takes everything under it at any depth.
+func _wanted_key(key: String) -> bool:
+	if not _pull_prefix.is_empty():
+		return key.begins_with(_pull_prefix)
+	return _pull_keys.has(key)
 
 
 ## Puts a file on the outgoing list. Nothing is read here: the bytes are taken

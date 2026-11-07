@@ -127,6 +127,102 @@ static func tooltip(row: Dictionary) -> String:
 			]
 
 
+## The row text inside a tree: the mark, the file name alone (the folders it sits
+## in are ancestor items now), and the time that matters for that mark.
+static func short_text(row: Dictionary) -> String:
+	var state := int(row.get("state", 0))
+	var key := str(row.get("key", ""))
+	if state == LanSyncCore.FileState.SAME and _times_differ(row):
+		return "%s %s · 内容一致" % [symbol(state), key.get_file()]
+	var mtime := int(row.get("remote_mtime", -1))
+	if mtime < 0:
+		mtime = int(row.get("local_mtime", -1))
+	return "%s %s · %s" % [symbol(state), key.get_file(), mtime_text(mtime)]
+
+
+## Fills [param tree] with one item per row, folding the folder part of each key
+## into folder items, so "art/ui/button.png" is a file under "art/" → "ui/".
+##
+## A file item's metadata is [code]{"index": i}[/code], an index into
+## [param rows]; a folder item's is [code]{"folder": "art/ui/"}[/code], which is
+## the prefix a double-click asks the core to pull. A folder takes the strongest
+## mark of the files under it — red ("this side must act") wins over yellow, grey
+## over green — so a collapsed folder stays informative.
+##
+## Returns the file items, one per entry of [param rows] and in the same order, so
+## a panel can put the selection back after a redraw.
+static func fill_tree(tree: Tree, rows: Array, empty_hint := "") -> Array[TreeItem]:
+	var items: Array[TreeItem] = []
+	tree.clear()
+	var root := tree.create_item()
+	if rows.is_empty():
+		if not empty_hint.is_empty():
+			var empty := tree.create_item(root)
+			empty.set_text(0, empty_hint)
+			empty.set_selectable(0, false)
+			empty.set_custom_color(0, COLOR_NEUTRAL)
+		return items
+	var folders := {}
+	var folder_states := {}
+	for index in rows.size():
+		var row: Dictionary = rows[index]
+		var key := str(row.get("key", ""))
+		var parts := key.split("/")
+		var parent := root
+		var path := ""
+		for depth in parts.size() - 1:
+			path = parts[depth] if path.is_empty() else "%s/%s" % [path, parts[depth]]
+			if folders.has(path):
+				parent = folders[path]
+				continue
+			var folder_item := tree.create_item(parent)
+			folder_item.set_text(0, "%s/" % parts[depth])
+			folder_item.set_metadata(0, {"folder": "%s/" % path})
+			folder_item.set_tooltip_text(
+				0, "%s/\n双击同步这个文件夹下的全部文件" % path
+			)
+			folder_item.set_custom_color(0, COLOR_NEUTRAL)
+			folders[path] = folder_item
+			parent = folder_item
+		var item := tree.create_item(parent)
+		item.set_text(0, short_text(row))
+		item.set_custom_color(0, color(int(row.get("state", 0))))
+		item.set_tooltip_text(0, tooltip(row))
+		item.set_metadata(0, {"index": index})
+		items.append(item)
+		# Every ancestor folder remembers this mark, so its colour can answer
+		# "is there anything in here for me to do" without being expanded.
+		path = ""
+		for depth in parts.size() - 1:
+			path = parts[depth] if path.is_empty() else "%s/%s" % [path, parts[depth]]
+			if not folder_states.has(path):
+				folder_states[path] = []
+			(folder_states[path] as Array).append(int(row.get("state", 0)))
+	for path: String in folder_states:
+		if folders.has(path):
+			(folders[path] as TreeItem).set_custom_color(0, _group_color(folder_states[path]))
+	return items
+
+
+## The strongest mark among the rows under one folder.
+static func _group_color(states: Array) -> Color:
+	var waiting := false
+	var neutral := false
+	for value: Variant in states:
+		match int(value):
+			LanSyncCore.FileState.REMOTE_NEWER, LanSyncCore.FileState.REMOTE_ONLY:
+				return COLOR_MINE
+			LanSyncCore.FileState.REMOTE_OLDER:
+				waiting = true
+			LanSyncCore.FileState.LOCAL_ONLY:
+				neutral = true
+	if waiting:
+		return COLOR_THEIRS
+	if neutral:
+		return COLOR_NEUTRAL
+	return COLOR_SAME
+
+
 ## A modification time as it reads in a file manager.
 static func mtime_text(mtime: int) -> String:
 	if mtime <= 0:

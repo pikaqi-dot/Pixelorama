@@ -23,8 +23,10 @@ const RESCAN_DELAY := 0.5
 var _core: Node
 var _folders: ItemList
 var _peers: ItemList
-var _remote_files: ItemList
-## What the file list is currently showing, so a double-click knows which row it
+## A tree rather than a list: the shared folders can be nested, and one item per
+## folder keeps a deep share readable.
+var _file_tree: Tree
+## What the file tree is currently showing, so a double-click knows which row it
 ## was: the other side's copies, this side's own, and which is newer.
 var _rows: Array[Dictionary] = []
 var _log: RichTextLabel
@@ -204,7 +206,9 @@ func _build() -> void:
 	var files_title := _heading("两边的文件")
 	files_title.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	files_title.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
-	files_title.tooltip_text = FileMarks.LEGEND + "\n双击一行只同步这一个"
+	files_title.tooltip_text = (
+		FileMarks.LEGEND + "\n双击文件只同步它；双击文件夹同步整段（含子文件夹）"
+	)
 	files_head.add_child(files_title)
 	# Checking again is cheap and never transfers anything, so it gets a button
 	# instead of asking anybody to remember that the list also updates itself.
@@ -213,11 +217,16 @@ func _build() -> void:
 	refresh_button.tooltip_text = "重读本机文件时间戳，并向对方要一次最新清单"
 	refresh_button.pressed.connect(_on_refresh_files)
 	files_head.add_child(refresh_button)
-	_remote_files = ItemList.new()
-	_remote_files.size_flags_vertical = Control.SIZE_EXPAND_FILL
-	_remote_files.custom_minimum_size = Vector2(0, 90)
-	_remote_files.item_activated.connect(_on_remote_file_activated)
-	files_box.add_child(_remote_files)
+	# A tree, not a flat list: the shared folders can be nested, and a nested
+	# file name alone says nothing about where it lives.
+	_file_tree = Tree.new()
+	_file_tree.hide_root = true
+	_file_tree.columns = 1
+	_file_tree.select_mode = Tree.SELECT_ROW
+	_file_tree.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	_file_tree.custom_minimum_size = Vector2(0, 90)
+	_file_tree.item_activated.connect(_on_file_activated)
+	files_box.add_child(_file_tree)
 
 	var log_box := VBoxContainer.new()
 	log_box.size_flags_horizontal = Control.SIZE_EXPAND_FILL
@@ -306,23 +315,13 @@ func _refresh_peers() -> void:
 
 
 func _refresh_remote_files() -> void:
-	if not is_instance_valid(_remote_files):
+	if not is_instance_valid(_file_tree):
 		return
-	_remote_files.clear()
 	# Both sides, each row marked: same time, one side newer, or missing over
-	# there. The core does the comparing so the phone shows the same marks.
+	# there. The core does the comparing so the phone shows the same marks, and
+	# FileMarks folds the folder part of each key into ancestor items.
 	_rows = _core.call("compare_entries")
-	if _rows.is_empty():
-		# Which of the three it is decides what to do about it, so the box says it
-		# instead of one sentence covering all of them.
-		_remote_files.add_item(_empty_remote_text())
-		_remote_files.set_item_disabled(0, true)
-		return
-	for index in _rows.size():
-		var row: Dictionary = _rows[index]
-		_remote_files.add_item(FileMarks.text(row))
-		_remote_files.set_item_custom_fg_color(index, FileMarks.color(int(row["state"])))
-		_remote_files.set_item_tooltip(index, FileMarks.tooltip(row))
+	FileMarks.fill_tree(_file_tree, _rows, _empty_remote_text())
 
 
 ## Why the other side's list is empty: no link, a link still waiting for the list
@@ -348,11 +347,24 @@ func _on_refresh_files() -> void:
 	_refresh_remote_files()
 
 
-## Double-clicking one row takes that file and nothing else, so a single stale
-## project can be replaced without touching the rest of the folder. A row the
-## other side does not have cannot be pulled — the click says so instead of asking
-## for a file that is not there.
-func _on_remote_file_activated(index: int) -> void:
+## Double-clicking a file takes that file and nothing else, so a single stale
+## project can be replaced without touching the rest of the folder. Double-clicking
+## a folder takes everything under it, at any depth — the cheap way to refresh one
+## section of a nested share. A row the other side does not have cannot be pulled,
+## and says so instead of asking for a file that is not there.
+func _on_file_activated() -> void:
+	var item := _file_tree.get_selected()
+	if item == null:
+		return
+	var meta: Variant = item.get_metadata(0)
+	if not meta is Dictionary:
+		return
+	var info: Dictionary = meta
+	if info.has("folder"):
+		_core.call("request_folder", str(info["folder"]))
+		_refresh_status()
+		return
+	var index := int(info.get("index", -1))
 	if index < 0 or index >= _rows.size():
 		return
 	var row: Dictionary = _rows[index]

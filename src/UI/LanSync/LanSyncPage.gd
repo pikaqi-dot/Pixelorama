@@ -23,12 +23,17 @@ const SEPARATION := 5
 ## The line under the lists. Its colour follows the mark of the selected row, so
 ## the message and the row it is about read as one thing.
 const COLOR_HINT := Color(0.68, 0.72, 0.8)
-const HINT_NO_SELECTION := "点选上面的文件看它的详情；双击一行只同步这一个"
+const HINT_NO_SELECTION := "点选上面的文件看详情；双击文件同步它，双击文件夹同步整段"
 
 var _core: Node
 var _folders: ItemList
 var _peers: ItemList
-var _remote_files: ItemList
+## A tree, not a flat list: nested folders in the share would otherwise read as
+## one long file name, and a folder row is what "sync this whole section" needs.
+var _file_tree: Tree
+## The file items of the last fill, in row order, so the selection survives a
+## redraw.
+var _file_items: Array[TreeItem] = []
 ## What the file list is showing, so a double-click knows which row it was: the
 ## other side's copies, this side's own, and which of them is newer.
 var _rows: Array[Dictionary] = []
@@ -308,20 +313,25 @@ func _build() -> void:
 	var files_title := _heading("两边的文件")
 	files_title.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	files_title.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
-	files_title.tooltip_text = FileMarks.LEGEND + "\n双击一行只同步这一个"
+	files_title.tooltip_text = (
+		FileMarks.LEGEND + "\n双击文件只同步它；双击文件夹同步整段（含子文件夹）"
+	)
 	files_head.add_child(files_title)
 	# Reads both halves of the marks again and transfers nothing, so it is always
 	# safe to press — the phone equivalent of "did it really update?".
 	var refresh_button := _button("刷新", _on_refresh_files)
 	refresh_button.tooltip_text = "重读本机文件时间戳，并向对方要一次最新清单"
 	files_head.add_child(refresh_button)
-	_remote_files = ItemList.new()
-	_remote_files.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	_remote_files.size_flags_vertical = Control.SIZE_EXPAND_FILL
-	_remote_files.custom_minimum_size = Vector2(0, 96)
-	_remote_files.item_activated.connect(_on_remote_file_activated)
-	_remote_files.item_selected.connect(_on_remote_file_selected)
-	files_panel.add_child(_remote_files)
+	_file_tree = Tree.new()
+	_file_tree.hide_root = true
+	_file_tree.columns = 1
+	_file_tree.select_mode = Tree.SELECT_ROW
+	_file_tree.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_file_tree.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	_file_tree.custom_minimum_size = Vector2(0, 96)
+	_file_tree.item_activated.connect(_on_remote_file_activated)
+	_file_tree.item_selected.connect(_on_remote_file_selected)
+	files_panel.add_child(_file_tree)
 
 	var log_panel := VBoxContainer.new()
 	log_panel.size_flags_horizontal = Control.SIZE_EXPAND_FILL
@@ -412,39 +422,54 @@ func _refresh_peers() -> void:
 
 
 func _refresh_remote_files() -> void:
-	if not is_instance_valid(_remote_files):
+	if not is_instance_valid(_file_tree):
 		return
-	_remote_files.clear()
 	# Both sides, each row marked: same time, one side newer, or missing over
 	# there. The comparing happens in the core, so the phone and the editor dock
-	# cannot show different marks for the same folder.
+	# cannot show different marks for the same folder; FileMarks folds the folder
+	# part of each key into ancestor items.
 	_rows = _core.call("compare_entries")
-	if _rows.is_empty():
-		# Which of the three it is decides what to do about it, so the box says it
-		# instead of one sentence covering all of them.
-		_remote_files.add_item(_empty_remote_text())
-		_remote_files.set_item_disabled(0, true)
-		_selected_key = ""
-		_show_file_info(-1)
-		return
-	for index in _rows.size():
-		var row: Dictionary = _rows[index]
-		# The mark and the colour carry the whole message; the timestamp next to
-		# them is what a person checks before deciding.
-		_remote_files.add_item(FileMarks.text(row))
-		_remote_files.set_item_custom_fg_color(index, FileMarks.color(int(row["state"])))
-		_remote_files.set_item_tooltip(index, FileMarks.tooltip(row))
+	_file_items = FileMarks.fill_tree(_file_tree, _rows, _empty_remote_text())
 	_restore_selection()
 
 
-## A tap on a row: the line below spells out what the one-line mark could not.
-func _on_remote_file_selected(index: int) -> void:
+## A tap on a row: the line below spells out what the one-line mark could not. A
+## folder says how many files a double-click would take.
+func _on_remote_file_selected() -> void:
+	var item := _file_tree.get_selected()
+	# get_selected() keeps answering with the last item after deselect_all(), so
+	# the selected flag is what says whether the person is really looking at one.
+	if item == null or not item.is_selected(0):
+		_selected_key = ""
+		_show_file_info(-1)
+		return
+	var meta: Variant = item.get_metadata(0)
+	if not meta is Dictionary:
+		return
+	var info: Dictionary = meta
+	if info.has("folder"):
+		_selected_key = ""
+		_show_folder_info(str(info["folder"]))
+		return
+	var index := int(info.get("index", -1))
 	if index < 0 or index >= _rows.size():
 		_selected_key = ""
 		_show_file_info(-1)
 		return
 	_selected_key = str(_rows[index].get("key", ""))
 	_show_file_info(index)
+
+
+## What the line says for a folder row: how much a double-click would take.
+func _show_folder_info(prefix: String) -> void:
+	if not is_instance_valid(_selection_info):
+		return
+	var count := 0
+	for row: Dictionary in _rows:
+		if str(row.get("key", "")).begins_with(prefix):
+			count += 1
+	_selection_info.text = "%s\n%d 个文件 · 双击同步这一段（含子文件夹）" % [prefix, count]
+	_selection_info.add_theme_color_override("default_color", COLOR_HINT)
 
 
 ## The list was rebuilt from a fresh compare (a manifest arrived, 刷新 was pressed,
@@ -455,10 +480,12 @@ func _restore_selection() -> void:
 		_show_file_info(-1)
 		return
 	for index in _rows.size():
-		if str(_rows[index].get("key", "")) == _selected_key:
-			_remote_files.select(index)
-			_show_file_info(index)
-			return
+		if str(_rows[index].get("key", "")) != _selected_key:
+			continue
+		if index < _file_items.size() and _file_items[index] != null:
+			_file_items[index].select(0)
+		_show_file_info(index)
+		return
 	# The file is gone from both sides since it was selected: nothing to describe.
 	_selected_key = ""
 	_show_file_info(-1)
@@ -534,11 +561,23 @@ func _on_refresh_files() -> void:
 	_refresh_remote_files()
 
 
-## One row was double-clicked: take that file and nothing else. A whole-folder
-## sync is the button; this is for replacing the one project or image that is
-## out of date without disturbing the rest. A row the other side does not have
-## cannot be pulled, and says so instead of asking for a file that is not there.
-func _on_remote_file_activated(index: int) -> void:
+## A double-click on a file takes that file and nothing else; on a folder it takes
+## everything under it, at any depth — the cheap way to refresh one section of a
+## nested share. A file the other side does not have cannot be pulled, and says so
+## instead of asking for something that is not there.
+func _on_remote_file_activated() -> void:
+	var item := _file_tree.get_selected()
+	if item == null:
+		return
+	var meta: Variant = item.get_metadata(0)
+	if not meta is Dictionary:
+		return
+	var info: Dictionary = meta
+	if info.has("folder"):
+		_core.call("request_folder", str(info["folder"]))
+		_refresh_status()
+		return
+	var index := int(info.get("index", -1))
 	if index < 0 or index >= _rows.size():
 		return
 	var row: Dictionary = _rows[index]
