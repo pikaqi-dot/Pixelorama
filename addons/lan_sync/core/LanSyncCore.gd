@@ -122,6 +122,12 @@ enum FileState {
 	REMOTE_ONLY,
 	## Only this side has it; the other side never sees it.
 	LOCAL_ONLY,
+	## Both sides have it, the timestamps fall in the same second but the copies
+	## are not the same file. Two writes landed inside one tick of a one-second
+	## clock, so the timestamps say nothing about which is newer — but they used to
+	## be read as "same write", and both panels showed a tick on a pair that
+	## differs, with no way to act on it.
+	SAME_TIME_DIFFERS,
 }
 
 ## Folder name to absolute path. The name is what the two peers match on.
@@ -775,7 +781,11 @@ func refresh_file_list() -> void:
 		log_line.emit("还没连上：只重读了本机这 %d 个文件的时间戳" % count)
 		return
 	if _awaiting_manifest or _phase == "manifest" or _phase == "transfer":
-		log_line.emit("本机 %d 个文件已重读；对方的清单正在路上，回来就显示" % count)
+		# A list is already in flight, but the press must not be lost: one more is
+		# asked for as soon as the first lands, so the panel ends up describing the
+		# folders as they are *now* rather than dropping a 「刷新」 on the floor.
+		_queue_relist()
+		log_line.emit("本机 %d 个文件已重读；对方的清单正在路上，它回来后再要一份最新的" % count)
 		return
 	list_peer_files()
 	log_line.emit("本机 %d 个文件已重读；正在向对方要最新清单…" % count)
@@ -796,7 +806,14 @@ func compare_entries() -> Array[Dictionary]:
 		if key.is_empty():
 			continue
 		remote_keys[key] = true
-		rows.append(_row_for(key, int(entry.get("mtime", 0)), str(entry.get("h", ""))))
+		rows.append(
+			_row_for(
+				key,
+				int(entry.get("mtime", 0)),
+				str(entry.get("h", "")),
+				int(entry.get("size", -1)),
+			)
+		)
 	for key: String in local_entries:
 		if remote_keys.has(key):
 			continue
@@ -814,7 +831,9 @@ func compare_entries() -> Array[Dictionary]:
 ## pair a sync has just made identical: writing the file stamps it with "now", so
 ## the two timestamps stay apart for ever. That is what [member _known_same] is
 ## for, and the hash it remembers is what keeps it honest.
-func _row_for(key: String, remote_mtime: int, remote_hash: String) -> Dictionary:
+func _row_for(
+	key: String, remote_mtime: int, remote_hash: String, remote_size := -1
+) -> Dictionary:
 	var row := {
 		"key": key,
 		"remote_mtime": remote_mtime,
@@ -829,7 +848,16 @@ func _row_for(key: String, remote_mtime: int, remote_hash: String) -> Dictionary
 	if remote_mtime < 0:
 		row["state"] = FileState.LOCAL_ONLY
 		return row
+	# A shared timestamp only means "same write" when the two copies are also the
+	# same length. Timestamps have one-second resolution, so two different files
+	# written in the same second — a save right after a sync, or a file put there
+	# by a script — used to be called identical for ever, on both sides at once,
+	# and no amount of 「刷新」 could change the verdict. A different length is
+	# proof they are not the same file, so the row says so instead of ticking.
 	if local_mtime == remote_mtime:
+		if remote_size >= 0 and remote_size != int(local.get("size", -2)):
+			row["state"] = FileState.SAME_TIME_DIFFERS
+			return row
 		row["state"] = FileState.SAME
 		return row
 	if _known_same_holds(key, local, remote_hash):
@@ -889,11 +917,15 @@ func _local_hash_matches(key: String, remote_hash: String) -> bool:
 		if int(record.get("mtime", -1)) == mtime and int(record.get("size", -2)) == size:
 			return str(record.get("h", "")) == remote_hash
 	var described := _describe_file(path)
-	_local_hashes[path] = {
-		"mtime": int(described.get("mtime", mtime)),
-		"size": int(described.get("size", size)),
-		"h": str(described.get("h", "")),
-	}
+	# Only remember the hash of a file that is no longer being written: a
+	# modification time is a whole second, so a hash taken inside the file's own
+	# second may describe the bytes from before that write.
+	if mtime < int(Time.get_unix_time_from_system()):
+		_local_hashes[path] = {
+			"mtime": int(described.get("mtime", mtime)),
+			"size": int(described.get("size", size)),
+			"h": str(described.get("h", "")),
+		}
 	return str(described.get("h", "")) == remote_hash
 
 
@@ -1104,6 +1136,12 @@ func _poll_marks(delta: float) -> void:
 		2.0 + float(local_entries.size()) / 400.0 + float(_marks_cost) / 200.0, 2.0, 30.0
 	)
 	if _refresh_known_mtimes():
+		# One of this side's files just changed, which means the other side's list
+		# is now describing the moment before the save. Asking for one fresh list
+		# turns the row into the current verdict within a second, instead of
+		# leaving a stale ❗ on screen until somebody presses 「刷新」 — and the
+		# side that saved is exactly the side that cannot otherwise know.
+		_queue_relist()
 		peer_files_changed.emit()
 
 
@@ -1920,9 +1958,12 @@ func _plan_pull(remote: Dictionary) -> void:
 				continue
 			# An identical modification time means both copies come from the same
 			# write, so neither is newer and a sync has no business replacing one
-			# with the other. Only a real edit moves the timestamp.
+			# with the other. Only a real edit moves the timestamp — and a length
+			# that differs proves it was not the same write, so that pair is taken
+			# instead of being counted as unchanged.
 			if not forced \
-					and int(local[key].get("mtime", -1)) == int(remote[key].get("mtime", -2)):
+					and int(local[key].get("mtime", -1)) == int(remote[key].get("mtime", -2)) \
+					and int(local[key].get("size", -3)) == int(remote[key].get("size", -4)):
 				same_time += 1
 				continue
 		_get_queue.append(key)
@@ -2331,12 +2372,17 @@ func _describe_file(path: String) -> Dictionary:
 			and Time.get_ticks_msec() - int(cached["checked"]) < int(HASH_CACHE_TTL * 1000.0):
 		return {"mtime": mtime, "size": size, "h": str(cached["hash"])}
 	var described := _hash_and_size(path)
-	_hash_cache[path] = {
-		"mtime": mtime,
-		"size": int(described["size"]),
-		"hash": str(described["hash"]),
-		"checked": Time.get_ticks_msec(),
-	}
+	# A file that was written in the current second may still be changing, and its
+	# timestamp cannot tell the two versions apart. Such a hash is returned but not
+	# remembered, so the next look reads the file again instead of handing the
+	# other side the version from before the write for the rest of the cache life.
+	if mtime < int(Time.get_unix_time_from_system()):
+		_hash_cache[path] = {
+			"mtime": mtime,
+			"size": int(described["size"]),
+			"hash": str(described["hash"]),
+			"checked": Time.get_ticks_msec(),
+		}
 	return {"mtime": mtime, "size": int(described["size"]), "h": str(described["hash"])}
 
 

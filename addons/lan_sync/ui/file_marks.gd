@@ -11,6 +11,7 @@ extends RefCounted
 ## [codeblock]
 ## ✓  green:      the two copies hold the same bytes — nothing to do
 ## ❗ red:        the other side is newer — this side has to update
+## ❗ red:        same timestamp but different bytes — a double click picks
 ## ❗ yellow:     this side is newer — nothing to do here, the other side pulls
 ## ✗  red:        this side has no copy — a sync creates it here
 ## ✗  grey:       the other side has no copy — nothing to do here, it pulls
@@ -36,6 +37,7 @@ const SYMBOL_MISSING := "✗"
 ## One line for the heading's tooltip, so the marks are explained where they are.
 const LEGEND := (
 	"✓ 一致｜❗ 时间不同（红=对方更新，本机点「同步」才会更新；黄=本机较新，等对方来拉）"
+	+ "｜❗ 红「时间相同 内容不同」=同一秒里各写了一次，双击这一行用对方的覆盖"
 	+ "｜✗ 只有一个（红=本机缺，同步会补上；灰=对方缺，对方同步才有）"
 )
 
@@ -54,9 +56,11 @@ static func color(state: int) -> Color:
 	match state:
 		LanSyncCore.FileState.SAME:
 			return COLOR_SAME
-		# Both of these are "this side must act": the other side is newer, or this
-		# side has no copy at all.
-		LanSyncCore.FileState.REMOTE_NEWER, LanSyncCore.FileState.REMOTE_ONLY:
+		# All of these are "this side must act": the other side is newer, this side
+		# has no copy at all, or the two copies differ and the clock cannot say
+		# which is which.
+		LanSyncCore.FileState.REMOTE_NEWER, LanSyncCore.FileState.REMOTE_ONLY, \
+			LanSyncCore.FileState.SAME_TIME_DIFFERS:
 			return COLOR_MINE
 		# The other side is behind, or lacks the file. Waiting is all this side can
 		# do, because a sync only pulls.
@@ -79,6 +83,8 @@ static func text(row: Dictionary) -> String:
 	var key := str(row.get("key", ""))
 	if state == LanSyncCore.FileState.SAME and _times_differ(row):
 		return "%s %s · 内容一致" % [symbol(state), key]
+	if state == LanSyncCore.FileState.SAME_TIME_DIFFERS:
+		return "%s %s · 时间相同 内容不同" % [symbol(state), key]
 	var mtime := int(row.get("remote_mtime", -1))
 	if mtime < 0:
 		mtime = int(row.get("local_mtime", -1))
@@ -109,6 +115,12 @@ static func tooltip(row: Dictionary) -> String:
 				+ "\n→ 时间不同是正常的：同步写文件会用「写入那一刻」当修改时间，"
 				+ "两边的写入时刻不一样，内容却是同一份（哈希相同）"
 			)
+		LanSyncCore.FileState.SAME_TIME_DIFFERS:
+			return (
+				"%s\n两边修改时间相同（%s），内容却不同：两边在同一个「秒」里各写过一次，"
+				% [key, local_time]
+				+ "时间戳分不出谁新\n→ 双击这一行（或右键）用对方的覆盖本机"
+			)
 		LanSyncCore.FileState.REMOTE_NEWER:
 			return "%s\n对方更新：对方 %s，本机 %s\n→ 本机要更新：点「同步」用对方的覆盖本地" % [
 				key, remote_time, local_time
@@ -134,6 +146,8 @@ static func short_text(row: Dictionary) -> String:
 	var key := str(row.get("key", ""))
 	if state == LanSyncCore.FileState.SAME and _times_differ(row):
 		return "%s %s · 内容一致" % [symbol(state), key.get_file()]
+	if state == LanSyncCore.FileState.SAME_TIME_DIFFERS:
+		return "%s %s · 时间相同 内容不同" % [symbol(state), key.get_file()]
 	var mtime := int(row.get("remote_mtime", -1))
 	if mtime < 0:
 		mtime = int(row.get("local_mtime", -1))
@@ -210,7 +224,8 @@ static func _group_color(states: Array) -> Color:
 	var neutral := false
 	for value: Variant in states:
 		match int(value):
-			LanSyncCore.FileState.REMOTE_NEWER, LanSyncCore.FileState.REMOTE_ONLY:
+			LanSyncCore.FileState.REMOTE_NEWER, LanSyncCore.FileState.REMOTE_ONLY, \
+				LanSyncCore.FileState.SAME_TIME_DIFFERS:
 				return COLOR_MINE
 			LanSyncCore.FileState.REMOTE_OLDER:
 				waiting = true
