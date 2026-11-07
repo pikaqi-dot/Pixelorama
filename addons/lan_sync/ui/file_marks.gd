@@ -67,12 +67,31 @@ static func color(state: int) -> Color:
 
 
 ## The row text: the mark, the key, and the time that matters for that mark.
+##
+## A tick usually means the two timestamps are the same, and then the time is
+## worth showing. A tick that came from "a sync just moved these bytes" does not:
+## writing a file stamps it with the current time on whichever side received it,
+## so the two copies legitimately read different times while holding the same
+## content. Printing one of them next to the tick would only look like a lie, so
+## such a row says 内容一致 and leaves both times to the tooltip.
 static func text(row: Dictionary) -> String:
 	var state := int(row.get("state", 0))
+	var key := str(row.get("key", ""))
+	if state == LanSyncCore.FileState.SAME and _times_differ(row):
+		return "%s %s · 内容一致" % [symbol(state), key]
 	var mtime := int(row.get("remote_mtime", -1))
 	if mtime < 0:
 		mtime = int(row.get("local_mtime", -1))
-	return "%s %s · %s" % [symbol(state), str(row.get("key", "")), mtime_text(mtime)]
+	return "%s %s · %s" % [symbol(state), key, mtime_text(mtime)]
+
+
+## Both sides have a timestamp and they are not the same one.
+static func _times_differ(row: Dictionary) -> bool:
+	var local_mtime := int(row.get("local_mtime", -1))
+	var remote_mtime := int(row.get("remote_mtime", -1))
+	if local_mtime <= 0 or remote_mtime <= 0:
+		return false
+	return local_mtime != remote_mtime
 
 
 ## The sentence behind the mark, for the row's tooltip.
@@ -82,7 +101,14 @@ static func tooltip(row: Dictionary) -> String:
 	var remote_time := mtime_text(int(row.get("remote_mtime", -1)))
 	match int(row.get("state", 0)):
 		LanSyncCore.FileState.SAME:
-			return "%s\n两端内容一致（%s），同步会跳过" % [key, local_time]
+			if not _times_differ(row):
+				return "%s\n两端内容一致，修改时间也相同（%s），同步会跳过" % [key, local_time]
+			return (
+				"%s\n两端内容一致：本机 %s，对方 %s"
+				% [key, local_time, remote_time]
+				+ "\n→ 时间不同是正常的：同步写文件会用「写入那一刻」当修改时间，"
+				+ "两边的写入时刻不一样，内容却是同一份（哈希相同）"
+			)
 		LanSyncCore.FileState.REMOTE_NEWER:
 			return "%s\n对方更新：对方 %s，本机 %s\n→ 本机要更新：点「同步」用对方的覆盖本地" % [
 				key, remote_time, local_time
