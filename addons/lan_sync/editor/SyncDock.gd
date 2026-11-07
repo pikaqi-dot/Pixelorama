@@ -9,7 +9,13 @@ const LogStyle := preload("res://addons/lan_sync/ui/log_style.gd")
 ## Folder shared out of the box. Both sides default to the same name, so a fresh
 ## install on either end lines up without any setup at all.
 const DEFAULT_NAME := "shared"
+## The editor side puts it inside the project: the files are then real project
+## files, visible in the FileSystem dock and in the project's own history.
 const DEFAULT_DIR := "res://lan_shared"
+## Where the in-app page puts the same folder — it has no project to write into.
+## Only used to recognise a config the game wrote first, because the two sides
+## share one config file on a desktop.
+const PAGE_DIR := "user://lan_shared"
 ## After a file lands, the editor needs a moment before a scan picks it up.
 const RESCAN_DELAY := 0.5
 
@@ -41,8 +47,10 @@ func _ready() -> void:
 	_core.file_synced.connect(_on_file_synced)
 	_core.peer_files_changed.connect(_refresh_remote_files)
 	add_child(_core)
-	if _core.folders.is_empty():
-		_ensure_default_folder()
+	# Always checked, not only when there is nothing yet: the default folder is
+	# also where a project expects its synced files, so a mapping left behind by
+	# a run of the game itself is corrected instead of trusted.
+	_ensure_default_folder()
 	_refresh_folders()
 	_refresh_peers()
 	_refresh_remote_files()
@@ -207,9 +215,34 @@ func _heading(text: String) -> Label:
 
 
 func _ensure_default_folder() -> void:
-	var absolute := ProjectSettings.globalize_path(DEFAULT_DIR)
-	DirAccess.make_dir_recursive_absolute(absolute)
-	_core.set_folder(DEFAULT_NAME, absolute)
+	DirAccess.make_dir_recursive_absolute(ProjectSettings.globalize_path(DEFAULT_DIR))
+	var current := str(_core.folders.get(DEFAULT_NAME, ""))
+	if current == DEFAULT_DIR:
+		return
+	if current.is_empty():
+		_core.set_folder(DEFAULT_NAME, DEFAULT_DIR)
+		_on_log("%s → %s（编辑器版默认放项目里）" % [DEFAULT_NAME, DEFAULT_DIR])
+		return
+	# The two sides share one config file on a desktop, so `shared` can be left
+	# pointing at whatever the game — or an earlier setup — wrote: the page's own
+	# `user://` default, or a folder that no longer exists. The dock is the editor,
+	# so a mapping that leads nowhere goes back inside the project, where the
+	# FileSystem dock shows it and where the project's own files live. A mapping
+	# the person made on purpose, to a folder that is still there, is left alone.
+	var page_default := ProjectSettings.globalize_path(PAGE_DIR)
+	if current == page_default:
+		_remap_default_folder(PAGE_DIR)
+		return
+	if not DirAccess.dir_exists_absolute(LanSyncCore.real_path(current)):
+		_remap_default_folder(current)
+
+
+## Points `shared` back at the project folder and says where it came from.
+func _remap_default_folder(was: String) -> void:
+	_core.set_folder(DEFAULT_NAME, DEFAULT_DIR)
+	_on_log("同步文件夹 %s：%s → %s（编辑器版默认放项目里）" % [
+		DEFAULT_NAME, was, DEFAULT_DIR
+	])
 
 
 func _refresh_folders() -> void:
@@ -334,17 +367,18 @@ func _on_add_folder() -> void:
 		_on_log("先选一个目录，或在「名称」里起个名字")
 		return
 	if path.is_empty():
-		path = DEFAULT_DIR.path_join(folder_name)
-	var absolute := path
-	if path.begins_with("res://"):
-		absolute = ProjectSettings.globalize_path(path)
-	DirAccess.make_dir_recursive_absolute(absolute)
-	_core.set_folder(folder_name, absolute)
+		# The shared folder itself is `res://lan_shared`; anything else gets a
+		# folder of its own name next to it, so one .pxo project can hold several.
+		path = DEFAULT_DIR if folder_name == DEFAULT_NAME else DEFAULT_DIR.path_join(folder_name)
+	DirAccess.make_dir_recursive_absolute(ProjectSettings.globalize_path(path))
+	# The project path is what gets stored, so the panel reads "shared →
+	# res://lan_shared" and the files stay where the project can see them.
+	_core.set_folder(folder_name, path)
 	_name_edit.clear()
 	_path_edit.clear()
 	_refresh_folders()
 	_refresh_status()
-	_on_log("已添加 %s → %s" % [folder_name, absolute])
+	_on_log("已添加 %s → %s" % [folder_name, path])
 
 
 func _on_browse_folder() -> void:

@@ -1630,7 +1630,9 @@ func _handle_file_begin(message: Dictionary) -> void:
 	var path := _absolute(key)
 	if path.is_empty():
 		return
-	var directory := path.get_base_dir()
+	# A folder may be stored as a project path ("res://lan_shared"), and the
+	# directory APIs here only understand real filesystem paths.
+	var directory := real_path(path.get_base_dir())
 	if not DirAccess.dir_exists_absolute(directory):
 		DirAccess.make_dir_recursive_absolute(directory)
 	var handle := FileAccess.open(path, FileAccess.WRITE)
@@ -1833,7 +1835,7 @@ func _build_manifest() -> Dictionary:
 		if root.is_empty():
 			log_line.emit("%s：还没有设置路径" % folder_name)
 			continue
-		if not DirAccess.dir_exists_absolute(root):
+		if not DirAccess.dir_exists_absolute(real_path(root)):
 			log_line.emit("%s：读不到这个目录 %s" % [folder_name, root])
 			continue
 		var added := _scan(root, folder_name, manifest)
@@ -1931,6 +1933,15 @@ func _size_of(path: String) -> int:
 	return size
 
 
+
+
+## The real filesystem path of a folder setting. The editor side keeps `shared`
+## as "res://lan_shared" so the files land inside the project and show up in the
+## FileSystem dock; the few APIs that insist on an absolute path go through here.
+static func real_path(path: String) -> String:
+	if path.begins_with("res://") or path.begins_with("user://"):
+		return ProjectSettings.globalize_path(path)
+	return path
 
 
 ## Turns a manifest key back into a real path. The first segment is the folder
