@@ -718,5 +718,3 @@ func _on_file_synced(path: String, direction: String) -> void:
 	# what just arrived is no longer "missing here", and what just left is no
 	# longer "missing over there".
 	_refresh_remote_files()
-
-
